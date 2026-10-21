@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # macos-26 ships Xcode 26, the toolchain the app is developed and
+    # validated with (Swift 6 language mode, strict concurrency). The older
+    # macos-14 image defaults to Xcode 15, which cannot build Swift 6 targets.
+    runs-on: macos-26
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Tests isolate themselves (BTP_DATA_DIR in a temp dir). CI never sets
+      # CLAUDE_CONFIG_DIR; fail loudly if the runner image ever does.
+      - name: No Claude env
+        run: |
+          if [ -n "${CLAUDE_CONFIG_DIR+x}" ]; then
+            echo "::error::CLAUDE_CONFIG_DIR is set on the runner"
+            exit 1
+          fi
+
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustup component add rustfmt clippy
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          rustc --version
+          cargo --version
+
+      # libproc runs bindgen: point it at the SDK and Xcode's libclang (same as
+      # scripts/build-xcframework.sh).
+      - name: bindgen env
+        run: |
+          SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          {
+            echo "SDKROOT=$SDKROOT"
+            echo "BINDGEN_EXTRA_CLANG_ARGS=-isysroot $SDKROOT"
+            echo "LIBCLANG_PATH=$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib"
+          } >> "$GITHUB_ENV"
+          xcodebuild -version
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # Also builds target/debug/btp, which the Swift tests call.
+      - name: cargo test
+        run: cargo test --locked
+
+      - name: Build xcframework
+        run: scripts/build-xcframework.sh
+
+      - name: Generate Xcode project
+        run: |
+          brew install xcodegen
+          (cd app && xcodegen generate)
+
+      - name: Swift tests
+        run: |
+          xcodebuild -project app/BalanceTonPort.xcodeproj -scheme BalanceTonPort \
+            -destination 'platform=macOS' -derivedDataPath target/xcode-ci test

@@ -1,0 +1,200 @@
+name: Release
+
+# Cut a release with: git tag v0.1.0 && git push --tags
+# The tag must match the btp-cli crate version and the app's
+# CFBundleShortVersionString in app/project.yml.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-26
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+      CARGO_TERM_COLOR: always
+      APP_NAME: Balance ton port
+      BUNDLE_ID: com.matthieuh.balancetonport
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          CLI_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/btp-cli/Cargo.toml | head -1)"
+          APP_VERSION="$(sed -n 's/^ *CFBundleShortVersionString: "\(.*\)"$/\1/p' app/project.yml)"
+          echo "tag $VERSION, btp-cli $CLI_VERSION, app $APP_VERSION"
+          if [ "$VERSION" != "$CLI_VERSION" ] || [ "$VERSION" != "$APP_VERSION" ]; then
+            echo "::error::tag v$VERSION does not match btp-cli ($CLI_VERSION) and app ($APP_VERSION) versions"
+            exit 1
+          fi
+          {
+            echo "VERSION=$VERSION"
+            echo "DIST=$RUNNER_TEMP/dist"
+            echo "KEYCHAIN=$RUNNER_TEMP/btp-signing.keychain-db"
+          } >> "$GITHUB_ENV"
+
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          rustc --version
+
+      - name: bindgen env
+        run: |
+          SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          {
+            echo "SDKROOT=$SDKROOT"
+            echo "BINDGEN_EXTRA_CLANG_ARGS=-isysroot $SDKROOT"
+            echo "LIBCLANG_PATH=$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib"
+          } >> "$GITHUB_ENV"
+          xcodebuild -version
+
+      - name: Build universal btp
+        run: |
+          for t in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --locked --release -p btp-cli --bin btp --target "$t"
+          done
+          mkdir -p "$DIST"
+          lipo -create \
+            target/aarch64-apple-darwin/release/btp \
+            target/x86_64-apple-darwin/release/btp \
+            -output "$DIST/btp"
+          lipo -info "$DIST/btp"
+          "$DIST/btp" --version
+
+      - name: Build app (Release, unsigned)
+        run: |
+          scripts/build-xcframework.sh
+          brew install xcodegen
+          (cd app && xcodegen generate)
+          xcodebuild -project app/BalanceTonPort.xcodeproj -scheme BalanceTonPort \
+            -configuration Release -destination 'generic/platform=macOS' \
+            -derivedDataPath target/xcode-release CODE_SIGNING_ALLOWED=NO build
+          ditto "target/xcode-release/Build/Products/Release/$APP_NAME.app" "$DIST/$APP_NAME.app"
+          lipo -info "$DIST/$APP_NAME.app/Contents/MacOS/$APP_NAME"
+          BUILT="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$DIST/$APP_NAME.app/Contents/Info.plist")"
+          test "$BUILT" = "$VERSION" || { echo "::error::built app is $BUILT, tag is $VERSION"; exit 1; }
+
+      - name: Import signing certificate
+        env:
+          APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+          CERT="$RUNNER_TEMP/cert.p12"
+          printf '%s' "$APPLE_CERT_P12_BASE64" | base64 --decode > "$CERT"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$CERT" -k "$KEYCHAIN" -P "$APPLE_CERT_PASSWORD" \
+            -f pkcs12 -T /usr/bin/codesign
+          rm -f "$CERT"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          # Prepend the temporary keychain to the search list so codesign finds it.
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+      - name: Sign
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          IDENTITY="Developer ID Application: HAPPYSOLVERS SAS ($APPLE_TEAM_ID)"
+          codesign --force --options runtime --timestamp \
+            --keychain "$KEYCHAIN" --sign "$IDENTITY" \
+            --identifier com.matthieuh.btp "$DIST/btp"
+          # No nested code in the bundle (the Rust core is a static library),
+          # so one signature covers it; no entitlements are needed.
+          codesign --force --options runtime --timestamp \
+            --keychain "$KEYCHAIN" --sign "$IDENTITY" "$DIST/$APP_NAME.app"
+          codesign --verify --strict --verbose=2 "$DIST/btp"
+          codesign --verify --deep --strict --verbose=2 "$DIST/$APP_NAME.app"
+          codesign -dvv "$DIST/$APP_NAME.app" 2>&1 | grep -E 'Authority|TeamIdentifier|flags'
+
+      - name: Notarize
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          # One submission covers both the app and the CLI binary.
+          SUBMIT="$RUNNER_TEMP/notarize"
+          mkdir -p "$SUBMIT"
+          ditto "$DIST/$APP_NAME.app" "$SUBMIT/$APP_NAME.app"
+          cp "$DIST/btp" "$SUBMIT/btp"
+          ditto -c -k --keepParent "$SUBMIT" "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" \
+            --wait --timeout 30m --output-format json | tee "$RUNNER_TEMP/notary.json"
+          STATUS="$(jq -r .status "$RUNNER_TEMP/notary.json")"
+          if [ "$STATUS" != "Accepted" ]; then
+            ID="$(jq -r .id "$RUNNER_TEMP/notary.json")"
+            xcrun notarytool log "$ID" \
+              --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" || true
+            echo "::error::notarization $STATUS"
+            exit 1
+          fi
+          # A bare Mach-O cannot be stapled: btp is checked online by Gatekeeper.
+          xcrun stapler staple "$DIST/$APP_NAME.app"
+          xcrun stapler validate "$DIST/$APP_NAME.app"
+          spctl -a -vv -t exec "$DIST/$APP_NAME.app"
+
+      - name: Package
+        run: |
+          cd "$DIST"
+          BTP_TGZ="btp-$VERSION-macos-universal.tar.gz"
+          APP_ZIP="BalanceTonPort-$VERSION.zip"
+          cp "$GITHUB_WORKSPACE/LICENSE" "$GITHUB_WORKSPACE/README.md" .
+          tar -czf "$BTP_TGZ" btp LICENSE README.md
+          ditto -c -k --keepParent "$APP_NAME.app" "$APP_ZIP"
+          shasum -a 256 "$BTP_TGZ" > "$BTP_TGZ.sha256"
+          shasum -a 256 "$APP_ZIP" > "$APP_ZIP.sha256"
+          cat ./*.sha256
+          "$GITHUB_WORKSPACE/scripts/render-homebrew.sh" "$VERSION" \
+            "$(cut -d' ' -f1 "$BTP_TGZ.sha256")" "$(cut -d' ' -f1 "$APP_ZIP.sha256")" homebrew
+          {
+            echo "BTP_TGZ=$BTP_TGZ"
+            echo "APP_ZIP=$APP_ZIP"
+          } >> "$GITHUB_ENV"
+
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd "$DIST"
+          {
+            echo "## Install"
+            echo
+            echo '```bash'
+            echo "brew install matthieuh/tap/btp"
+            echo "brew install --cask matthieuh/tap/balance-ton-port"
+            echo '```'
+            echo
+            echo "## SHA-256"
+            echo
+            echo '```'
+            cat "$BTP_TGZ.sha256" "$APP_ZIP.sha256"
+            echo '```'
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" --notes-file notes.md --verify-tag \
+            "$BTP_TGZ" "$BTP_TGZ.sha256" "$APP_ZIP" "$APP_ZIP.sha256" \
+            homebrew/btp.rb homebrew/balance-ton-port.rb
+
+      - name: Clean up keychain
+        if: always()
+        run: |
+          if [ -n "${KEYCHAIN:-}" ] && [ -f "$KEYCHAIN" ]; then
+            security delete-keychain "$KEYCHAIN" || true
+          fi
+          rm -f "$RUNNER_TEMP/cert.p12"
