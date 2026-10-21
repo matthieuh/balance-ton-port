@@ -20,7 +20,7 @@ impl Default for Config {
             alert_after_s: 1800,
             kill_grace_s: 5,
             scan_interval_s: 5,
-            claude_config_dirs: Vec::new(),
+            claude_config_dirs: crate::sessions::default_config_dirs(),
             exclude_commands: [
                 "mcp",
                 "argent",
