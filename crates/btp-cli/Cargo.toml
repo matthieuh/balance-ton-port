@@ -4,4 +4,20 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "btp"
+path = "src/main.rs"
+
 [dependencies]
+btp-core = { path = "../btp-core" }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+ctrlc = { version = "3", features = ["termination"] }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+tempfile = "3"
+predicates = "3"
+serde_json = "1"
