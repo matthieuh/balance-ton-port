@@ -71,6 +71,12 @@ pub fn save_config(dir: &Path, c: &Config) -> io::Result<()> {
 }
 
 impl Config {
+    /// The scan interval, never below one second (a 0 in the file would
+    /// otherwise busy-loop the watcher).
+    pub fn scan_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.scan_interval_s.max(1))
+    }
+
     pub fn set(&mut self, key: &str, value: &str) -> Result<(), String> {
         let field = match key {
             "dead_session_idle_s" => &mut self.dead_session_idle_s,
@@ -142,6 +148,14 @@ mod tests {
         assert_eq!(c, Config::default());
         c.set("kill_grace_s", "9").unwrap();
         assert_eq!(c.kill_grace_s, 9);
+    }
+
+    #[test]
+    fn scan_interval_is_at_least_one_second() {
+        let mut c = Config::default();
+        assert_eq!(c.scan_interval(), std::time::Duration::from_secs(5));
+        c.scan_interval_s = 0;
+        assert_eq!(c.scan_interval(), std::time::Duration::from_secs(1));
     }
 
     #[test]

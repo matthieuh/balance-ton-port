@@ -197,8 +197,11 @@ mod fake {
         }
 
         fn descendants(&self, pid: i32) -> Vec<i32> {
-            let st = self.st();
             let mut out = Vec::new();
+            if pid <= 0 {
+                return out;
+            }
+            let st = self.st();
             let mut seen = HashSet::from([pid]);
             let mut queue = vec![pid];
             while let Some(parent) = queue.pop() {
@@ -321,6 +324,13 @@ mod tests {
         let f = chain_platform();
         assert_eq!(f.descendants(30), vec![40, 41, 50]);
         assert!(f.descendants(50).is_empty());
+    }
+
+    #[test]
+    fn fake_descendants_empty_for_nonpositive_pid() {
+        let f = chain_platform();
+        assert!(f.descendants(0).is_empty());
+        assert!(f.descendants(-1).is_empty());
     }
 
     #[test]

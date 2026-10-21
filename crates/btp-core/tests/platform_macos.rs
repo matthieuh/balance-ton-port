@@ -256,6 +256,41 @@ fn proc_start_matches_ps() {
     assert_eq!(MacOs.proc_start_string(h.pid()), Some(ps));
 }
 
+/// `sleep` started with an empty argv[0] and a secret in its environment.
+/// Killed and reaped on drop.
+struct Sleeper(Child);
+
+impl Drop for Sleeper {
+    fn drop(&mut self) {
+        // Only ever touches the child this test spawned.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn empty_argv0_keeps_the_environment_out_of_the_command() {
+    use std::os::unix::process::CommandExt;
+    let child = Command::new("/bin/sleep")
+        .arg0("")
+        .arg("30")
+        .env("BTP_TEST_SECRET", "hunter2")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let s = Sleeper(child);
+    let pid = s.0.id() as i32;
+    let mut command = String::new();
+    assert!(wait_until(|| {
+        command = MacOs.proc_info(pid).map(|i| i.command).unwrap_or_default();
+        command.contains("30")
+    }));
+    assert!(!command.contains("hunter2"), "env leaked: {command:?}");
+    assert_eq!(command, " 30");
+}
+
 #[test]
 #[ignore = "benchmark: cargo test -p btp-core --release --test platform_macos -- --ignored --nocapture"]
 fn bench_full_scan() {

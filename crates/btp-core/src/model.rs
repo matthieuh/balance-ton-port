@@ -15,6 +15,11 @@ pub struct TrackedServer {
     pub worktree: PathBuf,
     pub session_id: String,
     pub session_pid: i32,
+    /// The session process start time as Claude Code writes it (`procStart`),
+    /// captured at link time. The session is alive while a process with
+    /// `session_pid` has this exact start time.
+    #[serde(default)]
+    pub session_proc_start: String,
     pub first_seen_ms: u64,
     pub last_active_ms: u64,
     pub kept: bool,

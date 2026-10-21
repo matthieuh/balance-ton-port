@@ -75,6 +75,7 @@ mod tests {
             worktree: "/tmp/wt".into(),
             session_id: "s".into(),
             session_pid: 99,
+            session_proc_start: "x".into(),
             first_seen_ms: 0,
             last_active_ms: 0,
             kept: false,

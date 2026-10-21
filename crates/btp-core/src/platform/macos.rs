@@ -132,7 +132,9 @@ fn arg_max() -> usize {
 }
 
 /// argv joined by spaces, from `sysctl(KERN_PROCARGS2)`. Layout: `int argc`,
-/// the exec path, NUL padding, then `argc` NUL-terminated arguments.
+/// the exec path, its NUL terminator padded with NULs so argv starts on an
+/// 8-byte boundary of the string area (which begins right after argc), then
+/// `argc` NUL-terminated arguments, then the environment.
 fn command_line(pid: i32) -> Option<String> {
     let mut buf = vec![0u8; arg_max()];
     let mut len = buf.len();
@@ -156,17 +158,24 @@ fn command_line(pid: i32) -> Option<String> {
 }
 
 fn parse_procargs2(data: &[u8]) -> Option<String> {
+    const ALIGN: usize = 8;
     let argc = i32::from_ne_bytes(data.get(..4)?.try_into().ok()?);
     if argc <= 0 {
         return None;
     }
-    let rest = &data[4..];
-    let exec_end = rest.iter().position(|&b| b == 0)?;
-    let mut rest = &rest[exec_end..];
-    while let [0, tail @ ..] = rest {
-        rest = tail;
+    let strings = &data[4..];
+    let exec_end = strings.iter().position(|&b| b == 0)?;
+    // Skip exactly the terminator and the alignment padding, never "every
+    // NUL": an empty argv[0] is one more NUL, and swallowing it would shift
+    // argv by one and pull an environment string (maybe a secret) into the
+    // command. Padding that is not all NULs means a layout we do not know:
+    // give up and let the caller fall back to the process name.
+    let args_start = (exec_end + 1).div_ceil(ALIGN) * ALIGN;
+    let padding = strings.get(exec_end..args_start)?;
+    if padding.iter().any(|&b| b != 0) {
+        return None;
     }
-    let args: Vec<String> = rest
+    let args: Vec<String> = strings[args_start..]
         .split(|&b| b == 0)
         .take(argc as usize)
         .map(|a| String::from_utf8_lossy(a).into_owned())
@@ -299,31 +308,64 @@ impl Platform for MacOs {
 mod tests {
     use super::*;
 
-    fn procargs(argc: i32, exec: &str, pad: usize, args: &[&str]) -> Vec<u8> {
+    /// A KERN_PROCARGS2 buffer laid out like the kernel does: argc, exec
+    /// path, NUL terminator padded so the arguments start on an 8-byte
+    /// boundary of the string area, the arguments, then the environment.
+    fn procargs(argc: i32, exec: &str, args: &[&str]) -> Vec<u8> {
         let mut v = argc.to_ne_bytes().to_vec();
         v.extend_from_slice(exec.as_bytes());
+        let pad = (8 - (exec.len() + 1) % 8) % 8;
         v.extend(std::iter::repeat_n(0, pad + 1));
         for a in args {
             v.extend_from_slice(a.as_bytes());
             v.push(0);
         }
-        v.extend_from_slice(b"PATH=/bin\0HOME=/x\0");
+        v.extend_from_slice(b"PATH=/bin\0SECRET_TOKEN=hunter2\0");
         v
     }
 
     #[test]
     fn parses_procargs2_args_not_env() {
-        let data = procargs(3, "/usr/bin/node", 5, &["node", "vite", "--port=5173"]);
+        let data = procargs(3, "/usr/bin/node", &["node", "vite", "--port=5173"]);
         assert_eq!(
             parse_procargs2(&data).as_deref(),
             Some("node vite --port=5173")
         );
+        // Exec path already aligned: no padding at all.
+        let data = procargs(1, "/bin/sh", &["sh"]);
+        assert_eq!(parse_procargs2(&data).as_deref(), Some("sh"));
+    }
+
+    #[test]
+    fn empty_argv0_does_not_pull_in_the_environment() {
+        let data = procargs(2, "/bin/sleep", &["", "30"]);
+        assert_eq!(parse_procargs2(&data).as_deref(), Some(" 30"));
+        let data = procargs(3, "/bin/sh", &["", "", "x"]);
+        assert_eq!(parse_procargs2(&data).as_deref(), Some("  x"));
+    }
+
+    #[test]
+    fn matches_a_real_kernel_buffer() {
+        // Captured from `exec -a "" /bin/sleep 30` (argv0 empty): 5 padding
+        // NULs after the terminator, then argv0's own terminator.
+        let mut data = 2i32.to_ne_bytes().to_vec();
+        data.extend_from_slice(b"/bin/sleep\0\0\0\0\0\0\x0030\0HOME=/x\0");
+        assert_eq!(parse_procargs2(&data).as_deref(), Some(" 30"));
+    }
+
+    #[test]
+    fn unexpected_padding_is_rejected() {
+        // Fewer NULs than the alignment requires: the layout is not the one
+        // we know, so give up rather than guess where argv starts.
+        let mut data = 2i32.to_ne_bytes().to_vec();
+        data.extend_from_slice(b"/bin/sleep\0\x0030\0SECRET=1\0");
+        assert_eq!(parse_procargs2(&data), None);
     }
 
     #[test]
     fn rejects_empty_or_short_procargs2() {
         assert_eq!(parse_procargs2(&[]), None);
-        assert_eq!(parse_procargs2(&procargs(0, "/bin/x", 0, &[])), None);
+        assert_eq!(parse_procargs2(&procargs(0, "/bin/x", &[])), None);
         assert_eq!(parse_procargs2(&1i32.to_ne_bytes()), None);
     }
 }
