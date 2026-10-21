@@ -4,4 +4,25 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "btp_ffi"
+crate-type = ["staticlib", "lib"]
+
+[[bin]]
+# The in-repo bindings generator (`scripts/build-xcframework.sh` runs it).
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
 [dependencies]
+btp-core = { path = "../btp-core" }
+uniffi = "=0.32.2"
+thiserror = "2"
+
+[features]
+# Only the generator binary needs UniFFI's CLI; keeping it out of the default
+# build keeps the bindgen code out of the static library.
+bindgen = ["uniffi/cli"]
+
+[dev-dependencies]
+tempfile = "3"

@@ -3,6 +3,7 @@
 //! held, 2 internal error.
 
 use btp_core::config::{data_dir, load_config, save_config};
+use btp_core::display::{format_idle, server_state as state_label};
 use btp_core::model::{KillReason, KillTarget};
 use btp_core::platform::MacOs;
 use btp_core::state::KillRecord;
@@ -14,9 +15,6 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-/// A server with no port activity for less than this counts as `active`.
-const ACTIVE_WINDOW_MS: u64 = 60_000;
 
 #[derive(Parser)]
 #[command(
@@ -266,30 +264,6 @@ fn describe_kill(r: &KillRecord) -> String {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| r.worktree.display().to_string())
     )
-}
-
-/// `12 min`, `2 h`, `3 d`; under a minute `<1 min`.
-fn format_idle(ms: u64) -> String {
-    let min = ms / 60_000;
-    if min < 1 {
-        "<1 min".to_string()
-    } else if min < 60 {
-        format!("{min} min")
-    } else if min < 60 * 24 {
-        format!("{} h", min / 60)
-    } else {
-        format!("{} d", min / (60 * 24))
-    }
-}
-
-fn state_label(s: &ServerView) -> &'static str {
-    if !s.session_alive {
-        "session dead"
-    } else if s.idle_ms < ACTIVE_WINDOW_MS {
-        "active"
-    } else {
-        "idle"
-    }
 }
 
 /// Cuts to `max` characters with a trailing `...` (plain output only; JSON
