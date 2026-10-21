@@ -53,8 +53,8 @@ pub struct ServerView {
 pub struct TickReport {
     /// Servers still tracked after this pass.
     pub servers: Vec<ServerView>,
-    /// Servers to notify about (`tick`), or that `tick` would notify about
-    /// (`observe`). Always empty for `sweep`.
+    /// Servers due an alert (`tick` and `observe`), reported on every pass
+    /// until `mark_alerted` records the delivery. Always empty for `sweep`.
     pub alerts: Vec<ServerView>,
     /// Kills done (`tick`, `sweep`) or planned (`observe`).
     pub killed: Vec<KillRecord>,
@@ -71,10 +71,18 @@ fn is_excluded(command: &str, cfg: &Config) -> bool {
         .any(|e| !e.is_empty() && command.contains(&e))
 }
 
-/// The Claude Code CLI itself: argv[0] named `claude`, or the npm package.
+/// The Claude Code CLI itself: argv[0] named `claude`, a runtime running a
+/// script named `claude` (`node /opt/homebrew/bin/claude`), or the npm
+/// package (`node …/@anthropic-ai/claude-code/cli.js`).
 fn is_claude_cli(command: &str) -> bool {
-    let argv0 = command.split_whitespace().next().unwrap_or("");
-    argv0.rsplit('/').next() == Some("claude") || command.contains("@anthropic-ai/claude-code")
+    let base = |w: &str| w.rsplit('/').next().unwrap_or("").to_string();
+    let mut words = command.split_whitespace();
+    let argv0 = base(words.next().unwrap_or(""));
+    if argv0 == "claude" || command.contains("@anthropic-ai/claude-code") {
+        return true;
+    }
+    let runtime = matches!(argv0.as_str(), "node" | "nodejs" | "bun" | "deno");
+    runtime && words.find(|w| !w.starts_with('-')).map(base).as_deref() == Some("claude")
 }
 
 /// Links a new listener to the live Claude Code session it descends from.
@@ -191,7 +199,8 @@ fn signal_checked(p: &dyn Platform, pid: i32, start_time: u64, sig: i32) -> bool
         && p.signal(pid, sig)
 }
 
-/// SIGTERM to the server and its descendants, then SIGKILL to whatever
+/// SIGTERM to the server and its descendants (except a Claude Code process
+/// and its subtree), then SIGKILL to whatever
 /// survives `grace` (polled every 100 ms). Every target is snapshotted as
 /// (pid, start time) up front and re-checked right before each signal, so a
 /// reused pid is never hit. Returns `false`, sending nothing, when `key` is
@@ -201,10 +210,22 @@ pub fn kill_tree(p: &dyn Platform, key: ServerKey, grace: Duration) -> bool {
         return false;
     }
     let mut targets = vec![(key.pid, key.start_time)];
+    // A Claude Code process started from the server (and whatever it runs)
+    // is a live session of its own: never signalled.
+    let mut spared = HashSet::new();
     for pid in p.descendants(key.pid) {
-        if let Some(info) = p.proc_info(pid) {
-            targets.push((pid, info.start_time));
+        if spared.contains(&pid) {
+            continue;
         }
+        let Some(info) = p.proc_info(pid) else {
+            continue;
+        };
+        if is_claude_cli(&info.command) {
+            spared.insert(pid);
+            spared.extend(p.descendants(pid));
+            continue;
+        }
+        targets.push((pid, info.start_time));
     }
     if !signal_checked(p, key.pid, key.start_time, libc::SIGTERM) {
         return false;
@@ -285,7 +306,8 @@ pub fn now_ms() -> u64 {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
-    /// Executes kills, alerts (sets `alerted`) and forgets.
+    /// Executes kills and forgets, reports alerts (marked only through
+    /// `mark_alerted`, once delivered).
     Tick,
     /// Like `Tick` but alerts are ignored, not consumed.
     Sweep,
@@ -375,7 +397,8 @@ impl<P: Platform> Watcher<P> {
         }
     }
 
-    /// One watch pass: link, observe, decide, then kill, alert and forget.
+    /// One watch pass: link, observe, decide, then kill and forget. Alerts
+    /// are reported, not consumed: call `mark_alerted` once delivered.
     pub fn tick(&mut self, now_ms: u64) -> io::Result<TickReport> {
         self.run(now_ms, Mode::Tick)
     }
@@ -427,6 +450,17 @@ impl<P: Platform> Watcher<P> {
             .execute(vec![(server, KillReason::Manual)], &scan.cfg, now)?
             .0
             .pop())
+    }
+
+    /// Records that the alert for this exact server was delivered (the app
+    /// calls it once the notification is posted): no more alerts until it
+    /// restarts. A pass never marks alerts itself.
+    pub fn mark_alerted(&mut self, key: ServerKey) -> io::Result<()> {
+        with_state(&self.data_dir, |state| {
+            for s in state.servers.iter_mut().filter(|s| s.key == key) {
+                s.alerted = true;
+            }
+        })
     }
 
     /// No more alerts for this server until it restarts.
@@ -633,11 +667,16 @@ impl<P: Platform> Watcher<P> {
                 if forget.contains(&s.key) {
                     continue;
                 }
-                let view = view(s, o, t, now_ms, &scan.cfg);
+                let session = scan
+                    .live
+                    .iter()
+                    .find(|l| {
+                        l.session.pid == s.session_pid
+                            && l.session.proc_start == s.session_proc_start
+                    })
+                    .map(|l| session_display_name(Some(&l.session.name), &l.session.cwd));
+                let view = view(s, o, t, session.as_deref(), now_ms, &scan.cfg);
                 if alerted.contains(&s.key) {
-                    if mode == Mode::Tick {
-                        s.alerted = true;
-                    }
                     report.alerts.push(view.clone());
                 }
                 report.servers.push(view);
@@ -725,7 +764,16 @@ fn record(s: &TrackedServer, reason: KillReason, now_ms: u64) -> KillRecord {
     }
 }
 
-fn view(s: &TrackedServer, o: &Observation, tree: &Tree, now_ms: u64, cfg: &Config) -> ServerView {
+/// `live_session` is the display name of the server's session when it is
+/// alive; it names servers tracked before session names were recorded.
+fn view(
+    s: &TrackedServer,
+    o: &Observation,
+    tree: &Tree,
+    live_session: Option<&str>,
+    now_ms: u64,
+    cfg: &Config,
+) -> ServerView {
     let port_idle = now_ms.saturating_sub(s.last_active_ms);
     let idle_ms = if o.session_alive {
         port_idle.max(o.session_idle_ms.unwrap_or(0))
@@ -756,10 +804,12 @@ fn view(s: &TrackedServer, o: &Observation, tree: &Tree, now_ms: u64, cfg: &Conf
         tool_label: tool_label(&s.command),
         worktree: s.worktree.clone(),
         location_label: location_label(&s.worktree),
-        session_name: if s.session_name.is_empty() {
-            worktree_name.clone()
-        } else {
+        session_name: if !s.session_name.is_empty() {
             s.session_name.clone()
+        } else if let Some(name) = live_session.filter(|_| o.session_alive) {
+            name.to_string()
+        } else {
+            "Claude session".to_string()
         },
         worktree_name,
         // Process start times are Unix microseconds.
@@ -966,23 +1016,23 @@ mod tests {
     }
 
     #[test]
-    fn view_of_a_legacy_server_names_the_session_after_its_worktree() {
-        let f = fx();
-        let mut s = link_pid(&f, 30, 3000).expect("linked");
-        s.session_name = String::new();
-        let o = Observation {
-            key: s.key,
-            alive: true,
-            established: 0,
-            worktree_exists: true,
-            session_alive: true,
-            session_idle_ms: None,
-            shared_with_live_session: false,
-        };
-        assert_eq!(
-            view(&s, &o, &Tree::default(), T0, &f.cfg()).session_name,
-            "wt"
-        );
+    fn legacy_server_is_named_after_its_live_session_else_generic() {
+        let mut f = fx();
+        let other = f.repo.path().join("other");
+        fs::create_dir_all(&other).unwrap();
+        f.w.tick(T0).unwrap();
+        // Tracked before session names existed, in another directory than
+        // the session's.
+        with_state(f.data.path(), |s| {
+            s.servers[0].session_name = String::new();
+            s.servers[0].worktree = other.clone();
+        })
+        .unwrap();
+        let r = f.w.tick(T0 + 1_000).unwrap();
+        assert_eq!(r.servers[0].session_name, "wt");
+        f.p().remove_proc(20);
+        let r = f.w.tick(T0 + 2_000).unwrap();
+        assert_eq!(r.servers[0].session_name, "Claude session");
     }
 
     #[test]
@@ -1165,7 +1215,7 @@ mod tests {
     }
 
     #[test]
-    fn tick_alerts_once() {
+    fn tick_reports_an_alert_until_it_is_marked() {
         let mut f = fx();
         f.w.tick(T0).unwrap();
         assert!(f.w.tick(T0 + 29 * MIN).unwrap().alerts.is_empty());
@@ -1173,11 +1223,23 @@ mod tests {
         assert_eq!(r.alerts.len(), 1);
         assert_eq!(r.alerts[0].key, key30());
         assert_eq!(r.alerts[0].idle_ms, 30 * MIN);
+        // Not consumed by the pass: the notification may not have been shown.
+        assert!(!f.state_servers()[0].alerted);
+        assert_eq!(f.w.tick(T0 + 31 * MIN).unwrap().alerts.len(), 1);
+        // Marked once the app has actually posted it.
+        f.w.mark_alerted(key30()).unwrap();
         assert!(f.state_servers()[0].alerted);
-        let r = f.w.tick(T0 + 31 * MIN).unwrap();
+        let r = f.w.tick(T0 + 32 * MIN).unwrap();
         assert!(r.alerts.is_empty());
         assert!(r.killed.is_empty());
         assert!(f.p().is_alive(30));
+        // Another process with the same pid is not marked.
+        f.w.mark_alerted(ServerKey {
+            pid: 30,
+            start_time: 1,
+        })
+        .unwrap();
+        assert_eq!(f.state_servers().len(), 1);
     }
 
     #[test]
@@ -1580,6 +1642,61 @@ mod tests {
         let e = w.tick(T0).unwrap().config_error.expect("reported");
         assert!(e.contains("defaults"), "{e}");
         assert_eq!(w.config_error(), Some(e.as_str()));
+    }
+
+    #[test]
+    fn manual_kill_by_key_needs_the_exact_process() {
+        let mut f = fx();
+        let other = ServerKey {
+            pid: 30,
+            start_time: START,
+        };
+        assert_eq!(f.w.kill(KillTarget::Key(other)).unwrap(), None);
+        assert!(f.p().is_alive(30));
+        assert!(f.w.kill(KillTarget::Key(key30())).unwrap().is_some());
+        assert!(!f.p().is_alive(30));
+    }
+
+    #[test]
+    fn node_installed_claude_blocks_the_link() {
+        let mut f = fx();
+        let wt = f.wt.to_str().unwrap().to_string();
+        f.p().spawn(
+            80,
+            20,
+            START + 80 * SEC,
+            "node /opt/homebrew/bin/claude -p x",
+            &wt,
+        );
+        f.p().spawn(81, 80, START + 81 * SEC, "vite", &wt);
+        f.p().add_listener(81, 5175);
+        assert_eq!(link_pid(&f, 81, 5175), None);
+        f.p().add_listener(80, 7400);
+        assert_eq!(link_pid(&f, 80, 7400), None);
+        let r = f.w.tick(T0).unwrap();
+        let ports: Vec<u16> = r.servers.iter().map(|v| v.port).collect();
+        assert_eq!(ports, vec![3000]);
+    }
+
+    #[test]
+    fn kill_tree_spares_a_claude_process_and_its_children() {
+        let p = FakePlatform::new();
+        p.spawn(30, 1, 100, "srv", "/");
+        p.spawn(31, 30, 101, "worker", "/");
+        p.spawn(32, 30, 102, "node /usr/local/bin/claude", "/");
+        p.spawn(33, 32, 103, "vite", "/");
+        p.spawn(34, 30, 104, "/Users/me/.local/bin/claude --resume", "/");
+        let key = ServerKey {
+            pid: 30,
+            start_time: 100,
+        };
+        assert!(kill_tree(&p, key, Duration::from_millis(100)));
+        assert!(!p.is_alive(30));
+        assert!(!p.is_alive(31));
+        for pid in [32, 33, 34] {
+            assert!(p.is_alive(pid), "pid {pid} was signalled");
+        }
+        assert!(p.signals().iter().all(|&(pid, _)| pid == 30 || pid == 31));
     }
 
     #[test]

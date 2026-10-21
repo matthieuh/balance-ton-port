@@ -239,6 +239,12 @@ fn watch(dir: std::path::PathBuf) -> Result<u8, Failure> {
                 }
                 print!("{}", render_events(&report));
                 let _ = io::Write::flush(&mut io::stdout());
+                // Printed is delivered: no repeat on the next pass.
+                for a in &report.alerts {
+                    if let Err(e) = w.mark_alerted(a.key) {
+                        eprintln!("btp: could not record the alert: {e}");
+                    }
+                }
             }
             Err(e) => eprintln!("btp: scan failed: {e}"),
         }

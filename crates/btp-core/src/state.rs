@@ -32,13 +32,17 @@ impl State {
     }
 }
 
-fn load(dir: &Path) -> State {
+/// The saved state. Missing: empty. Unparsable: moved aside, empty. Any
+/// other read error (permissions, I/O) is returned, so the caller never
+/// writes over a state it could not read.
+fn load(dir: &Path) -> io::Result<State> {
     let path = dir.join("state.json");
     let bytes = match fs::read(&path) {
         Ok(b) => b,
-        Err(_) => return State::default(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(State::default()),
+        Err(e) => return Err(e),
     };
-    match serde_json::from_slice(&bytes) {
+    Ok(match serde_json::from_slice(&bytes) {
         Ok(s) => s,
         Err(e) => {
             let corrupt = dir.join("state.json.corrupt");
@@ -49,7 +53,7 @@ fn load(dir: &Path) -> State {
             );
             State::default()
         }
-    }
+    })
 }
 
 fn write_atomic(dir: &Path, state: &State) -> io::Result<()> {
@@ -77,7 +81,13 @@ pub fn with_state<T>(dir: &Path, f: impl FnOnce(&mut State) -> T) -> io::Result<
         .write(true)
         .open(dir.join("state.lock"))?;
     FileExt::lock(&lock)?;
-    let mut state = load(dir);
+    let mut state = match load(dir) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = FileExt::unlock(&lock);
+            return Err(e);
+        }
+    };
     let out = f(&mut state);
     let written = write_atomic(dir, &state);
     let _ = FileExt::unlock(&lock);
@@ -146,6 +156,19 @@ mod tests {
             fs::read_to_string(d.path().join("state.json.corrupt")).unwrap(),
             "{not json"
         );
+    }
+
+    #[test]
+    fn unreadable_state_is_an_error_and_never_overwritten() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("state.json");
+        fs::write(&path, "{\"servers\": []}").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        let r = with_state(d.path(), |s| s.servers.push(server(1)));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(r.is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"servers\": []}");
     }
 
     #[test]

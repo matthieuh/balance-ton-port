@@ -78,7 +78,7 @@ pub struct KillRecordFfi {
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct TickReportFfi {
     pub servers: Vec<ServerViewFfi>,
-    /// Servers to notify about now (each reported once).
+    /// Servers due an alert, reported on every pass until `mark_alerted`.
     pub alerts: Vec<ServerViewFfi>,
     pub killed: Vec<KillRecordFfi>,
     /// Why `config.toml` could not be used, if it could not (the pass ran on
@@ -279,9 +279,22 @@ impl Core {
         self.kill(KillTarget::Port(port))
     }
 
-    /// Kills the tracked server with `pid`. `nil` when nothing tracked matches.
-    pub fn kill_pid(&self, pid: i32) -> Result<Option<KillRecordFfi>, BtpError> {
-        self.kill(KillTarget::Pid(pid))
+    /// Kills exactly this tracked server (pid and start time, as a row or a
+    /// notification identifies it). `nil` when it is no longer tracked or
+    /// running: a process that reused the pid is never touched.
+    pub fn kill_server(
+        &self,
+        pid: i32,
+        start_time: u64,
+    ) -> Result<Option<KillRecordFfi>, BtpError> {
+        self.kill(KillTarget::Key(ServerKey { pid, start_time }))
+    }
+
+    /// Records that this server's alert was delivered (call it once the
+    /// notification is added): no more alerts until it restarts. `tick`
+    /// reports a due alert on every pass until then.
+    pub fn mark_alerted(&self, pid: i32, start_time: u64) -> Result<(), BtpError> {
+        Ok(lock(&self.watcher).mark_alerted(ServerKey { pid, start_time })?)
     }
 
     /// No more alerts for this server until it restarts.
@@ -467,6 +480,16 @@ mod tests {
         assert!(core.config().is_err());
         let report = core.observe().unwrap();
         assert!(report.config_error.unwrap().contains("using defaults"));
+    }
+
+    #[test]
+    fn kill_server_and_mark_alerted_ignore_an_unknown_server() {
+        let d = tempfile::tempdir().unwrap();
+        let core = Core::at(d.path().to_path_buf(), Vec::new);
+        let me = std::process::id() as i32;
+        assert_eq!(core.kill_server(me, 1).unwrap(), None);
+        core.mark_alerted(me, 1).unwrap();
+        assert!(core.observe().unwrap().servers.is_empty());
     }
 
     #[test]

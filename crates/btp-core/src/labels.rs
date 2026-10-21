@@ -14,8 +14,9 @@ pub fn tool_label(command: &str) -> String {
     // The first program naming a known tool wins, so
     // `node …/node_modules/.bin/expo start` reads as Expo, not Node. A word
     // is a program when it is the first one, follows a launcher (`node`,
-    // `npx`, `python`…) or is a path; a plain argument such as the `serve`
-    // in `workerd serve` is not.
+    // `npx`, `python`…) or is a `node_modules/.bin/` entry; a plain argument
+    // such as the `serve` in `workerd serve`, or a path argument such as
+    // `--directory /x/astro`, is not.
     let mut program_pos = true;
     for (i, w) in words.iter().enumerate() {
         if is_flag(w) {
@@ -26,7 +27,7 @@ pub fn tool_label(command: &str) -> String {
             "cli" if w.contains("/react-native/") => "react-native".to_string(),
             n => n.to_string(),
         };
-        if program_pos || w.contains('/') {
+        if program_pos || w.contains("node_modules/.bin/") {
             if let Some(label) = known_tool(&name, &words[i + 1..]) {
                 return label;
             }
@@ -304,6 +305,15 @@ mod tests {
         );
         assert_eq!(tool_label("python3 -m uvicorn app:app"), "Python uvicorn");
         assert_eq!(tool_label("python3 -u /srv/app.py"), "Python app.py");
+        // A tool name inside a path argument is not the program.
+        assert_eq!(
+            tool_label("python3 -m http.server --directory /x/astro"),
+            "Python http.server"
+        );
+        assert_eq!(
+            tool_label("node server.js --root /srv/vite"),
+            "Node server.js"
+        );
         assert_eq!(tool_label("ruby bin/rails server -p 3000"), "Rails");
         assert_eq!(tool_label("bin/rails s"), "Rails");
     }
