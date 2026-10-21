@@ -103,7 +103,8 @@ struct SettingsView: View {
 /// Whether notifications reach the user, and the one step that fixes it.
 private struct NotificationsSection: View {
     @EnvironmentObject private var model: CoreModel
-    @State private var testSent = false
+    @State private var testResult = TestNotificationResult.none
+    @State private var testResetTask: Task<Void, Never>?
 
     var body: some View {
         Section("Notifications") {
@@ -127,13 +128,8 @@ private struct NotificationsSection: View {
                             Button(button.title) { perform(button) }
                         }
                         if setup.canSendTest {
-                            Button(testSent ? "Test sent" : "Send a test notification") {
-                                Task {
-                                    await model.sendTestNotification()
-                                    testSent = true
-                                }
-                            }
-                            .controlSize(.small)
+                            Button(testNotificationButtonTitle(testResult)) { sendTest() }
+                                .controlSize(.small)
                         }
                     }
                 }
@@ -144,6 +140,17 @@ private struct NotificationsSection: View {
         .task { await model.refreshNotificationPermission() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             Task { await model.refreshNotificationPermission() }
+        }
+    }
+
+    /// Shows whether the test was added, then the plain title again after
+    /// a few seconds.
+    private func sendTest() {
+        testResetTask?.cancel()
+        testResetTask = Task {
+            testResult = TestNotificationResult(added: await model.sendTestNotification())
+            try? await Task.sleep(for: .seconds(testNotificationResetDelay))
+            if !Task.isCancelled { testResult = .none }
         }
     }
 

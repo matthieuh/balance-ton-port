@@ -391,3 +391,21 @@ final class NotificationSetupTests: XCTestCase {
         XCTAssertFalse(sampleNotificationBody.contains("\u{2014}"))
     }
 }
+
+final class TestNotificationButtonTests: XCTestCase {
+    func testTitleSaysSentOnlyOnSuccess() {
+        XCTAssertEqual(testNotificationButtonTitle(.none), "Send a test notification")
+        XCTAssertEqual(testNotificationButtonTitle(.sent), "Test sent")
+        XCTAssertEqual(testNotificationButtonTitle(.failed), "Could not send the test")
+    }
+
+    func testResultFollowsTheAdd() {
+        XCTAssertEqual(TestNotificationResult(added: true), .sent)
+        XCTAssertEqual(TestNotificationResult(added: false), .failed)
+    }
+
+    func testLabelResetsAfterAFewSeconds() {
+        XCTAssertGreaterThanOrEqual(testNotificationResetDelay, 2)
+        XCTAssertLessThanOrEqual(testNotificationResetDelay, 10)
+    }
+}

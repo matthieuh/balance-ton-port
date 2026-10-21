@@ -54,7 +54,8 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
 
     /// A made-up idle-server notification with the real Kill and Keep
     /// buttons. Its userInfo names no server, so both buttons do nothing.
-    func postSample() async {
+    /// `true` once Notification Center accepted it.
+    func postSample() async -> Bool {
         let content = UNMutableNotificationContent()
         content.title = "Balance ton port"
         content.body = sampleNotificationBody
@@ -64,8 +65,10 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         let request = UNNotificationRequest(identifier: "sample", content: content, trigger: nil)
         do {
             try await center.add(request)
+            return true
         } catch {
             log.error("could not post the test: \(error.localizedDescription, privacy: .public)")
+            return false
         }
     }
 

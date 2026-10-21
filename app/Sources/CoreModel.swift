@@ -70,7 +70,8 @@ final class CoreModel: ObservableObject {
         await refreshNotificationPermission()
     }
 
-    func sendTestNotification() async {
+    /// `true` once Notification Center accepted the test.
+    func sendTestNotification() async -> Bool {
         await notifier.postSample()
     }
 

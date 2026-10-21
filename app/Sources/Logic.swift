@@ -237,6 +237,31 @@ func isSampleNotification(_ info: [AnyHashable: Any]) -> Bool {
     info["sample"] as? Bool == true
 }
 
+/// What the last "Send a test notification" did.
+enum TestNotificationResult: Equatable, Sendable {
+    case none
+    /// Notification Center accepted it.
+    case sent
+    /// Notification Center refused it.
+    case failed
+
+    init(added: Bool) {
+        self = added ? .sent : .failed
+    }
+}
+
+/// The test button's title: "Test sent" only once the notification was added.
+func testNotificationButtonTitle(_ result: TestNotificationResult) -> String {
+    switch result {
+    case .none: return "Send a test notification"
+    case .sent: return "Test sent"
+    case .failed: return "Could not send the test"
+    }
+}
+
+/// Seconds before the test button's title goes back to "Send a test notification".
+let testNotificationResetDelay: TimeInterval = 4
+
 // MARK: - Settings
 
 /// Whole minutes in `seconds`, rounded down.
