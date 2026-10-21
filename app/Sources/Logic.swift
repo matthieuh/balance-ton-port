@@ -262,11 +262,16 @@ func testNotificationButtonTitle(_ result: TestNotificationResult) -> String {
 /// Seconds before the test button's title goes back to "Send a test notification".
 let testNotificationResetDelay: TimeInterval = 4
 
-/// The menu's note after a manual kill that found nothing for `id`: "already
-/// gone" only when no tracked server has that pid; `nil` while one does (the
-/// server is still there under another identity, its row stays).
-func missedKillNotice(_ id: ServerID, tracked: [ServerID]) -> String? {
-    tracked.contains { $0.pid == id.pid } ? nil : "That server was already gone."
+/// The menu's note after a manual kill that found nothing for `id`. From a
+/// notification: the server changed since it was posted (merged into the
+/// server that started it, restarted, or gone). From the menu: "already
+/// gone" only when no tracked server has that pid; `nil` while one does (its
+/// row stays).
+func missedKillNotice(_ id: ServerID, tracked: [ServerID], fromNotification: Bool) -> String? {
+    if fromNotification {
+        return "Nothing to kill: this server changed since the notification"
+    }
+    return tracked.contains { $0.pid == id.pid } ? nil : "That server was already gone."
 }
 
 // MARK: - Settings

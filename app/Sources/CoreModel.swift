@@ -41,7 +41,7 @@ final class CoreModel: ObservableObject {
         notifier.onAction = { [weak self] action, id in
             guard let self else { return }
             switch action {
-            case .kill: self.kill(id)
+            case .kill: self.kill(id, fromNotification: true)
             case .keep: self.keep(id)
             }
         }
@@ -89,9 +89,8 @@ final class CoreModel: ObservableObject {
     /// that exact process; when it is not tracked under that identity
     /// (already gone, its pid now another process, or merged into the server
     /// that started it), nothing is signalled, the row is no longer held
-    /// hidden, and the menu says "already gone" only when no tracked server
-    /// has that pid.
-    func kill(_ id: ServerID) {
+    /// hidden, and the menu says why (`missedKillNotice`).
+    func kill(_ id: ServerID, fromNotification: Bool = false) {
         killedByHand[id] = Date()
         servers.removeAll { $0.id == id }
         Task {
@@ -103,7 +102,9 @@ final class CoreModel: ObservableObject {
                 recentKills = kills
                 if record == nil {
                     killedByHand[id] = nil
-                    killNotice = missedKillNotice(id, tracked: lastPassServers.map(\.id))
+                    killNotice = missedKillNotice(
+                        id, tracked: lastPassServers.map(\.id), fromNotification: fromNotification
+                    )
                     killNoticeAt = killNotice == nil ? nil : Date()
                 } else {
                     killNotice = nil

@@ -412,17 +412,22 @@ final class TestNotificationButtonTests: XCTestCase {
 
 final class MissedKillTests: XCTestCase {
     private let id = ServerID(pid: 4242, startTime: 1)
+    private let changed = "Nothing to kill: this server changed since the notification"
 
-    func testGoneWhenNoServerHasThePid() {
-        let other = ServerID(pid: 7, startTime: 1)
-        XCTAssertEqual(missedKillNotice(id, tracked: [other]), "That server was already gone.")
-        XCTAssertEqual(missedKillNotice(id, tracked: []), "That server was already gone.")
+    func testNotificationKillThatFindsNothingSaysTheServerChanged() {
+        let same = ServerID(pid: 4242, startTime: 2)
+        for tracked in [[], [same], [ServerID(pid: 7, startTime: 1)]] {
+            XCTAssertEqual(missedKillNotice(id, tracked: tracked, fromNotification: true), changed)
+        }
     }
 
-    func testNoNoticeWhileAServerWithThePidIsTracked() {
-        // Same pid, another identity (for example the key changed since the
-        // notification): the row is still there, nothing is "gone".
+    func testMenuKillSaysGoneOnlyWhenNoServerHasThePid() {
+        let other = ServerID(pid: 7, startTime: 1)
+        XCTAssertEqual(
+            missedKillNotice(id, tracked: [other], fromNotification: false),
+            "That server was already gone."
+        )
         let same = ServerID(pid: 4242, startTime: 2)
-        XCTAssertNil(missedKillNotice(id, tracked: [same]))
+        XCTAssertNil(missedKillNotice(id, tracked: [same], fromNotification: false))
     }
 }
