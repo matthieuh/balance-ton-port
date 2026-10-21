@@ -12,7 +12,7 @@ Every 5 seconds it links new listening servers to the Claude Code session that s
 2. **Session dead and port idle for 20 min**: the server is killed.
 3. **Session alive but idle for 30 min**: a notification with Kill and Keep buttons (app only).
 
-Kill is SIGTERM on the server and its children (for example wrangler's `workerd`), then SIGKILL after 5 s for survivors. The menu bar lists running servers and the last 5 kills with their reason.
+A server is a process tree: the listening process started under the session plus its children (for example Astro or wrangler with their `workerd` workers). A child listening on its own port is part of its parent's server, and "idle" means no established connection on any port of the whole tree. Kill is SIGTERM on that tree, then SIGKILL after 5 s for survivors; a Claude Code process found in the tree, and what it runs, is never signalled. The menu bar lists running servers and the last 5 kills with their reason.
 
 ## Install
 
@@ -45,7 +45,7 @@ btp config get           # print the effective configuration
 btp config set <key> <n> # set a numeric key
 ```
 
-Only servers Balance ton port tracks can be killed; an unknown port or pid exits 1. `btp watch` refuses to start while the app is already watching. Without the app, `btp sweep` applies triggers 1 and 2 only (no alerts).
+Only servers Balance ton port tracks can be killed; an unknown port or pid exits 1. `btp kill <port>` accepts any port of a server's process tree. `btp watch` refuses to start while the app is already watching, and prints each alert once instead of notifying. Without the app, `btp sweep` applies triggers 1 and 2 only (no alerts).
 
 ## Configuration
 
@@ -53,14 +53,17 @@ Only servers Balance ton port tracks can be killed; an unknown port or pid exits
 
 | Key | Default | Meaning |
 |---|---|---|
-| `dead_session_idle_s` | 1200 | Idle time before a dead session's server is killed |
-| `alert_after_s` | 1800 | Idle time before the Kill / Keep alert |
-| `kill_grace_s` | 5 | Delay between SIGTERM and SIGKILL |
-| `scan_interval_s` | 5 | Scan period |
+| `dead_session_idle_s` | 1200 | Idle time before a dead session's server is killed (at least 60) |
+| `alert_after_s` | 1800 | Idle time before the Kill / Keep alert (at least 60) |
+| `kill_grace_s` | 5 | Delay between SIGTERM and SIGKILL (at least 1) |
+| `scan_interval_s` | 5 | Scan period (at least 1) |
 | `claude_config_dirs` | `[]` | Extra Claude config dirs only. `~/.claude`, `$CLAUDE_CONFIG_DIR` and every `~/.claude-*` with a `sessions/` folder are found automatically |
-| `exclude_commands` | `mcp`, `argent`, `postgres`, `redis-server`, `mysqld`, `mongod` | Never tracked when the command line contains one of these (case-insensitive) |
+| `exclude_commands` | `mcp`, `argent`, `postgres`, `redis-server`, `mysqld`, `mongod` | Never tracked or killed when the command line contains one of these (case-insensitive) |
+| `exclude_ports` | `[]` | Never tracked or killed when the server, or one of its child processes, listens on one of these ports |
 
-An exclusion matches the whole command line, paths included: a project path containing "mcp" excludes its servers. That errs on the safe side.
+An exclusion matches the whole command line, paths included: a project path containing "mcp" excludes its servers. That errs on the safe side. Exclusions are checked on every scan, not only when a server is first seen: adding one stops tracking a server that matches, it is never killed.
+
+Values below their minimum are refused by `btp config set` and the Settings window, and raised to the minimum when read from the file (with a note on stderr). If `config.toml` cannot be parsed (one mistyped value is enough), nothing falls back to the defaults silently: a running watcher keeps its last valid settings (a fresh start uses the defaults), the app shows the error in its menu, the CLI prints it, and `btp config get` / `set` refuse to touch the file until it is fixed. Saves are atomic. The app and `btp config set` both write the whole file: the last one to save wins.
 
 ## Agent skill
 
@@ -76,9 +79,19 @@ If you use a custom `CLAUDE_CONFIG_DIR`, copy it into that directory's `skills/`
 
 - Never kills a process that was not started from a live Claude Code session.
 - A server whose worktree is used by another live session is never touched.
-- Claude Code processes themselves are never tracked.
+- Claude Code processes themselves are never tracked, and never signalled when found inside a server's process tree.
+- Excluded commands and ports are re-checked on every scan and right before each kill.
 - Start times are re-checked before every signal, so a reused pid is never hit.
 - `btp sweep --dry-run` prints what would be killed.
+
+## Notifications
+
+The idle alert (trigger 3) needs notifications allowed for Balance ton port. The app asks once, at its first launch; if that prompt was dismissed or refused, macOS refuses every later notification without asking again. The app then says "notifications off" on the row of each server due an alert, and keeps the alert pending (it is sent once notifications are allowed). To allow them: System Settings > Notifications > Balance ton port > Allow notifications (Settings also has a button that opens that page). Launch the app from Finder or with `open "Balance ton port.app"`, ideally from `/Applications`, so macOS registers it and lists it there.
+
+## Known limitations
+
+- A Claude Code process that has no session file in a watched config dir (for example a `CLAUDE_CONFIG_DIR` whose `sessions/` folder is shared with another dir, or an older Claude Code) is not watched: the servers it starts are not tracked and never killed. That is the safe direction: nothing is killed, but nothing is cleaned up for that session either.
+- A server started in the background (`cmd &`) inside one shell command is reparented to launchd before the first scan and is not tracked.
 
 ## Releasing
 

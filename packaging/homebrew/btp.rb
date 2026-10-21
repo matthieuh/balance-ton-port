@@ -8,7 +8,8 @@ class Btp < Formula
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "MIT"
 
-  depends_on :macos
+  # The binary is built with MACOSX_DEPLOYMENT_TARGET=14.0.
+  depends_on macos: ">= :sonoma"
 
   def install
     bin.install "btp"
