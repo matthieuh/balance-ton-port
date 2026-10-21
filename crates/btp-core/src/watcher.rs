@@ -516,7 +516,7 @@ impl<P: Platform> Watcher<P> {
     /// - links new listeners, except those inside a tracked server's tree
     ///   (a server is a process tree: its children's ports are its ports);
     /// - folds a tracked server into a tracked ancestor (a child that started
-    ///   listening before its parent did).
+    ///   listening before its parent did), on every pass.
     fn refresh(
         &self,
         state: &mut State,
@@ -526,7 +526,6 @@ impl<P: Platform> Watcher<P> {
     ) -> Vec<Tree> {
         state.servers.retain(|s| !s.session_proc_start.is_empty());
         let sessions = scan.sessions();
-        let mut linked = false;
         for l in listeners {
             // A tracked pid (same process, or a reused pid that this pass
             // forgets) is not linked again; extra ports of one process too.
@@ -541,11 +540,10 @@ impl<P: Platform> Watcher<P> {
                 continue;
             }
             state.servers.push(new);
-            linked = true;
         }
-        if linked {
-            self.fold(state);
-        }
+        // Every pass, not only when something new links: a state written
+        // before servers were trees may still hold a separate child row.
+        self.fold(state);
         let mut trees: Vec<Tree> = state
             .servers
             .iter()
@@ -1771,6 +1769,25 @@ mod tests {
         for pid in [30, 31, 40, 41] {
             assert!(f.p().is_alive(pid), "pid {pid} was killed");
         }
+    }
+
+    #[test]
+    fn a_child_row_from_an_old_state_folds_without_a_new_listener() {
+        let mut f = fx();
+        f.p().add_listener(31, 63055);
+        f.w.tick(T0).unwrap();
+        // state.json written before server groups: the child has its own row.
+        let mut child = f.state_servers()[0].clone();
+        child.key = ServerKey {
+            pid: 31,
+            start_time: START + 31 * SEC,
+        };
+        child.port = 63055;
+        with_state(f.data.path(), |s| s.servers.push(child)).unwrap();
+        let r = f.w.tick(T0 + MIN).unwrap();
+        let rows: Vec<i32> = r.servers.iter().map(|v| v.key.pid).collect();
+        assert_eq!(rows, vec![30]);
+        assert_eq!(f.state_servers().len(), 1);
     }
 
     #[test]
