@@ -4,7 +4,7 @@
 
 uniffi::setup_scaffolding!();
 
-use btp_core::config::{data_dir, load_config, save_config, Config};
+use btp_core::config::{data_dir, read_config, save_config, Config};
 use btp_core::display::{format_idle, server_state, started_label};
 use btp_core::labels::tool_label;
 use btp_core::model::{KillReason, KillTarget, ServerKey};
@@ -81,6 +81,9 @@ pub struct TickReportFfi {
     /// Servers to notify about now (each reported once).
     pub alerts: Vec<ServerViewFfi>,
     pub killed: Vec<KillRecordFfi>,
+    /// Why `config.toml` could not be used, if it could not (the pass ran on
+    /// the last valid config, or the defaults).
+    pub config_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -161,6 +164,7 @@ impl From<&TickReport> for TickReportFfi {
             servers: t.servers.iter().map(Into::into).collect(),
             alerts: t.alerts.iter().map(Into::into).collect(),
             killed: t.killed.iter().map(Into::into).collect(),
+            config_error: t.config_error.clone(),
         }
     }
 }
@@ -295,12 +299,18 @@ impl Core {
     }
 
     /// The saved config; `claude_config_dirs` holds only the extras.
-    pub fn config(&self) -> ConfigFfi {
-        load_config(&self.dir).into()
+    pub fn config(&self) -> Result<ConfigFfi, BtpError> {
+        read_config(&self.dir)
+            .map(Into::into)
+            .map_err(|message| BtpError::Io { message })
     }
 
+    /// Saves the config. Refuses a value below its minimum (delays in
+    /// minutes >= 60 s, grace and scan >= 1 s).
     pub fn set_config(&self, c: ConfigFfi) -> Result<(), BtpError> {
-        Ok(save_config(&self.dir, &c.into())?)
+        let c: Config = c.into();
+        c.validate().map_err(|message| BtpError::Io { message })?;
+        Ok(save_config(&self.dir, &c)?)
     }
 
     /// The last kills, newest first.
@@ -413,13 +423,13 @@ mod tests {
     fn config_roundtrips_through_disk() {
         let d = tempfile::tempdir().unwrap();
         let core = Core::at(d.path().to_path_buf(), Vec::new);
-        let mut c = core.config();
+        let mut c = core.config().unwrap();
         assert_eq!(c.dead_session_idle_s, 1200);
         c.alert_after_s = 60;
         c.claude_config_dirs = vec!["/tmp/claude-x".into()];
         core.set_config(c.clone()).unwrap();
-        assert_eq!(core.config(), c);
-        assert_eq!(load_config(d.path()).alert_after_s, 60);
+        assert_eq!(core.config().unwrap(), c);
+        assert_eq!(read_config(d.path()).unwrap().alert_after_s, 60);
     }
 
     #[test]
@@ -430,13 +440,33 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let core = Core::at(d.path().to_path_buf(), found);
         assert_eq!(core.discovered_claude_dirs(), vec!["/tmp/found-claude"]);
-        let mut c = core.config();
+        let mut c = core.config().unwrap();
         assert!(c.claude_config_dirs.is_empty());
         c.alert_after_s = 60;
         core.set_config(c).unwrap();
         let text = std::fs::read_to_string(d.path().join("config.toml")).unwrap();
         assert!(!text.contains("found-claude"), "{text}");
         assert!(text.contains("claude_config_dirs = []"), "{text}");
+    }
+
+    #[test]
+    fn set_config_rejects_values_below_minimum() {
+        let d = tempfile::tempdir().unwrap();
+        let core = Core::at(d.path().to_path_buf(), Vec::new);
+        let mut c = core.config().unwrap();
+        c.kill_grace_s = 0;
+        assert!(core.set_config(c).is_err());
+        assert!(!d.path().join("config.toml").exists());
+    }
+
+    #[test]
+    fn broken_config_is_an_error_and_reaches_the_report() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("config.toml"), "alert_after_s = [").unwrap();
+        let core = Core::at(d.path().to_path_buf(), Vec::new);
+        assert!(core.config().is_err());
+        let report = core.observe().unwrap();
+        assert!(report.config_error.unwrap().contains("using defaults"));
     }
 
     #[test]
@@ -451,7 +481,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let sessions = tempfile::tempdir().unwrap();
         let holder = Core::at(d.path().to_path_buf(), Vec::new);
-        let mut c = holder.config();
+        let mut c = holder.config().unwrap();
         c.claude_config_dirs = vec![sessions.path().display().to_string()];
         holder.set_config(c).unwrap();
         assert!(holder.acquire_watch().unwrap());

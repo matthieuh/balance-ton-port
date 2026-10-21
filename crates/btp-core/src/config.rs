@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -72,47 +72,117 @@ pub fn data_dir() -> PathBuf {
         .join("Library/Application Support/balance-ton-port")
 }
 
-pub fn load_config(dir: &Path) -> Config {
-    let path = dir.join(CONFIG_FILE);
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Config::default();
-    };
-    match toml::from_str(&text) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!(
-                "btp: invalid config {}: {e}; using defaults",
-                path.display()
-            );
-            Config::default()
-        }
+/// Minimum for the two delays counted in minutes (`dead_session_idle_s`,
+/// `alert_after_s`): a 0 there would kill or alert at once.
+pub const MIN_DELAY_S: u64 = 60;
+/// Minimum for `kill_grace_s` (0 means SIGKILL at once) and
+/// `scan_interval_s` (0 would busy-loop).
+pub const MIN_SECONDS_S: u64 = 1;
+
+/// The minimum for a numeric key, `None` for an unknown key.
+fn minimum(key: &str) -> Option<u64> {
+    match key {
+        "dead_session_idle_s" | "alert_after_s" => Some(MIN_DELAY_S),
+        "kill_grace_s" | "scan_interval_s" => Some(MIN_SECONDS_S),
+        _ => None,
     }
 }
 
+fn below_minimum(key: &str, value: u64, min: u64) -> String {
+    format!("{key} must be at least {min}, got {value}")
+}
+
+/// The saved config. A missing file gives the defaults. A file that cannot
+/// be read or parsed (one mistyped field included) is an error, never
+/// silently the defaults: the caller decides what to run on. Values below
+/// their minimum are raised to it, with a note on stderr.
+pub fn read_config(dir: &Path) -> Result<Config, String> {
+    let path = dir.join(CONFIG_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Config::default()),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    let mut c: Config = toml::from_str(&text)
+        .map_err(|e| format!("invalid {}: {}", path.display(), e.message()))?;
+    for note in c.clamp() {
+        eprintln!("btp: {}: {note}", path.display());
+    }
+    Ok(c)
+}
+
+/// Writes the config through a temp file and a rename, so a reader never
+/// sees a half-written file.
 pub fn save_config(dir: &Path, c: &Config) -> io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let text = toml::to_string_pretty(c).map_err(io::Error::other)?;
-    std::fs::write(dir.join(CONFIG_FILE), text)
+    let tmp = dir.join(format!("{CONFIG_FILE}.tmp.{}", std::process::id()));
+    let result = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, dir.join(CONFIG_FILE))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 impl Config {
     /// The scan interval, never below one second (a 0 in the file would
     /// otherwise busy-loop the watcher).
     pub fn scan_interval(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.scan_interval_s.max(1))
+        std::time::Duration::from_secs(self.scan_interval_s.max(MIN_SECONDS_S))
+    }
+
+    fn numeric_mut(&mut self) -> [(&'static str, &mut u64); 4] {
+        [
+            ("dead_session_idle_s", &mut self.dead_session_idle_s),
+            ("alert_after_s", &mut self.alert_after_s),
+            ("kill_grace_s", &mut self.kill_grace_s),
+            ("scan_interval_s", &mut self.scan_interval_s),
+        ]
+    }
+
+    /// `Err` naming the first value below its minimum.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut c = self.clone();
+        for (key, v) in c.numeric_mut() {
+            let min = minimum(key).unwrap_or(0);
+            if *v < min {
+                return Err(below_minimum(key, *v, min));
+            }
+        }
+        Ok(())
+    }
+
+    /// Raises every value below its minimum to it; one note per change.
+    pub fn clamp(&mut self) -> Vec<String> {
+        let mut notes = Vec::new();
+        for (key, v) in self.numeric_mut() {
+            let min = minimum(key).unwrap_or(0);
+            if *v < min {
+                notes.push(format!("{}, using {min}", below_minimum(key, *v, min)));
+                *v = min;
+            }
+        }
+        notes
     }
 
     pub fn set(&mut self, key: &str, value: &str) -> Result<(), String> {
-        let field = match key {
-            "dead_session_idle_s" => &mut self.dead_session_idle_s,
-            "alert_after_s" => &mut self.alert_after_s,
-            "kill_grace_s" => &mut self.kill_grace_s,
-            "scan_interval_s" => &mut self.scan_interval_s,
-            _ => return Err(format!("unknown key: {key}")),
-        };
-        *field = value
+        let min = minimum(key).ok_or_else(|| format!("unknown key: {key}"))?;
+        let v = value
             .parse::<u64>()
             .map_err(|_| format!("{key} expects a non-negative integer, got {value:?}"))?;
+        if v < min {
+            return Err(below_minimum(key, v, min));
+        }
+        for (k, field) in self.numeric_mut() {
+            if k == key {
+                *field = v;
+            }
+        }
         Ok(())
     }
 }
@@ -149,7 +219,7 @@ mod tests {
         let text = std::fs::read_to_string(d.path().join(CONFIG_FILE)).unwrap();
         assert!(text.contains("claude_config_dirs = []"), "{text}");
         // Loading and saving again still writes no discovered dir.
-        save_config(d.path(), &load_config(d.path())).unwrap();
+        save_config(d.path(), &read_config(d.path()).unwrap()).unwrap();
         let again = std::fs::read_to_string(d.path().join(CONFIG_FILE)).unwrap();
         assert_eq!(text, again);
     }
@@ -175,21 +245,96 @@ mod tests {
     #[test]
     fn missing_file_gives_defaults() {
         let d = tempfile::tempdir().unwrap();
-        assert_eq!(load_config(d.path()), Config::default());
+        assert_eq!(read_config(d.path()).unwrap(), Config::default());
     }
 
     #[test]
-    fn invalid_toml_gives_defaults() {
+    fn invalid_toml_is_reported_not_replaced_by_defaults() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("config.toml"), "not = [valid").unwrap();
-        assert_eq!(load_config(d.path()), Config::default());
+        let e = read_config(d.path()).unwrap_err();
+        assert!(e.contains("config.toml"), "{e}");
+        // One mistyped field is an error too, not a silent reset.
+        std::fs::write(d.path().join("config.toml"), "alert_after_s = \"abc\"\n").unwrap();
+        assert!(read_config(d.path()).is_err());
+    }
+
+    #[test]
+    fn set_enforces_minimums() {
+        let mut c = Config::default();
+        for (key, low, ok) in [
+            ("dead_session_idle_s", "59", "60"),
+            ("alert_after_s", "0", "60"),
+            ("kill_grace_s", "0", "1"),
+            ("scan_interval_s", "0", "1"),
+        ] {
+            let e = c.set(key, low).unwrap_err();
+            assert!(e.contains("at least"), "{key}: {e}");
+            c.set(key, ok).unwrap();
+        }
+        assert_eq!(c.dead_session_idle_s, 60);
+        assert_eq!(c.kill_grace_s, 1);
+    }
+
+    #[test]
+    fn validate_reports_the_first_value_below_its_minimum() {
+        assert_eq!(Config::default().validate(), Ok(()));
+        let c = Config {
+            kill_grace_s: 0,
+            ..Config::default()
+        };
+        assert!(c.validate().unwrap_err().contains("kill_grace_s"));
+    }
+
+    #[test]
+    fn values_below_minimum_in_the_file_are_clamped_on_load() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("config.toml"),
+            "dead_session_idle_s = 0\nalert_after_s = 5\nkill_grace_s = 0\nscan_interval_s = 0\n",
+        )
+        .unwrap();
+        let c = read_config(d.path()).unwrap();
+        assert_eq!(
+            (
+                c.dead_session_idle_s,
+                c.alert_after_s,
+                c.kill_grace_s,
+                c.scan_interval_s
+            ),
+            (60, 60, 1, 1)
+        );
+    }
+
+    #[test]
+    fn save_replaces_the_file_atomically() {
+        let d = tempfile::tempdir().unwrap();
+        save_config(d.path(), &Config::default()).unwrap();
+        // A hard link keeps the old inode: an in-place truncate and write
+        // would change it too, a temp file + rename does not.
+        let old = d.path().join("old.toml");
+        std::fs::hard_link(d.path().join("config.toml"), &old).unwrap();
+        let c = Config {
+            alert_after_s: 120,
+            ..Config::default()
+        };
+        save_config(d.path(), &c).unwrap();
+        assert_eq!(read_config(d.path()).unwrap(), c);
+        assert!(std::fs::read_to_string(&old)
+            .unwrap()
+            .contains("alert_after_s = 1800"));
+        let names: Vec<String> = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2, "no temp file left: {names:?}");
     }
 
     #[test]
     fn partial_file_keeps_other_defaults() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("config.toml"), "alert_after_s = 60\n").unwrap();
-        let c = load_config(d.path());
+        let c = read_config(d.path()).unwrap();
         assert_eq!(c.alert_after_s, 60);
         assert_eq!(c.dead_session_idle_s, 1200);
         assert_eq!(c.exclude_commands, Config::default().exclude_commands);
@@ -223,6 +368,6 @@ mod tests {
             ..Config::default()
         };
         save_config(d.path(), &c).unwrap();
-        assert_eq!(load_config(d.path()), c);
+        assert_eq!(read_config(d.path()).unwrap(), c);
     }
 }

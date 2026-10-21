@@ -2,7 +2,7 @@
 //! sessions. Exit codes: 0 success, 1 user error / nothing matched / lock
 //! held, 2 internal error.
 
-use btp_core::config::{data_dir, effective_claude_dirs, load_config, save_config};
+use btp_core::config::{data_dir, effective_claude_dirs, read_config, save_config};
 use btp_core::display::{format_idle, server_state as state_label};
 use btp_core::model::{KillReason, KillTarget};
 use btp_core::platform::MacOs;
@@ -128,6 +128,7 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
     match cmd {
         Cmd::List { json } => {
             let report = Watcher::new(MacOs, dir.clone()).observe(now_ms())?;
+            warn_config(report.config_error.as_deref());
             let kills = btp_core::state::with_state(&dir, |s| s.recent_kills.clone())?;
             if json {
                 let out = ListOutput {
@@ -157,7 +158,10 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
                 (None, Some(p)) => KillTarget::Pid(p),
                 _ => return Err(Failure::User("give a port or --pid <pid>".into())),
             };
-            match Watcher::new(MacOs, dir).kill(target)? {
+            let mut w = Watcher::new(MacOs, dir);
+            let killed = w.kill(target)?;
+            warn_config(w.config_error());
+            match killed {
                 Some(r) => {
                     println!("killed {}", describe_kill(&r));
                     Ok(0)
@@ -176,6 +180,7 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
             } else {
                 w.sweep(now_ms())?
             };
+            warn_config(report.config_error.as_deref());
             if report.killed.is_empty() {
                 println!("nothing to kill");
             }
@@ -187,7 +192,13 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
         }
         Cmd::Watch => watch(dir),
         Cmd::Config { action } => {
-            let mut cfg = load_config(&dir);
+            // A broken file is reported, never shown or saved as defaults
+            // (saving would erase what the user wrote).
+            let mut cfg = read_config(&dir).map_err(|e| {
+                Failure::User(format!(
+                    "{e}; fix or delete it (the watcher keeps its last valid config)"
+                ))
+            })?;
             match action.unwrap_or(ConfigCmd::Get) {
                 ConfigCmd::Get => {
                     let text = toml::to_string_pretty(&cfg)
@@ -216,23 +227,35 @@ fn watch(dir: std::path::PathBuf) -> Result<u8, Failure> {
     let flag = stop.clone();
     ctrlc::set_handler(move || flag.store(true, Ordering::SeqCst))
         .map_err(|e| Failure::Internal(e.to_string()))?;
-    let mut w = Watcher::new(MacOs, dir.clone());
+    let mut w = Watcher::new(MacOs, dir);
     println!("watching (Ctrl-C to stop)");
+    let mut last_config_error = None;
     while !stop.load(Ordering::SeqCst) {
         match w.tick(now_ms()) {
             Ok(report) => {
+                if report.config_error != last_config_error {
+                    warn_config(report.config_error.as_deref());
+                    last_config_error = report.config_error.clone();
+                }
                 print!("{}", render_events(&report));
                 let _ = io::Write::flush(&mut io::stdout());
             }
             Err(e) => eprintln!("btp: scan failed: {e}"),
         }
-        let wait = load_config(&dir).scan_interval();
+        let wait = w.config().scan_interval();
         let start = Instant::now();
         while start.elapsed() < wait && !stop.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(100).min(wait));
         }
     }
     Ok(0)
+}
+
+/// Reports a `config.toml` that could not be used (stderr).
+fn warn_config(error: Option<&str>) {
+    if let Some(e) = error {
+        eprintln!("btp: {e}");
+    }
 }
 
 /// One line per kill and per alert.

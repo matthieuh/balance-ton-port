@@ -6,7 +6,7 @@
 //! is ever tracked, and only tracked servers are ever signalled, each signal
 //! guarded by a fresh start-time check (a pid can be reused at any moment).
 
-use crate::config::{effective_claude_dirs_with, load_config, Config};
+use crate::config::{effective_claude_dirs_with, read_config, Config};
 use crate::decide::{decide, touch};
 use crate::labels::{location_label, session_display_name, tool_label};
 use crate::model::{Action, KillReason, KillTarget, Observation, ServerKey, TrackedServer};
@@ -58,6 +58,9 @@ pub struct TickReport {
     pub alerts: Vec<ServerView>,
     /// Kills done (`tick`, `sweep`) or planned (`observe`).
     pub killed: Vec<KillRecord>,
+    /// Set while `config.toml` cannot be read or parsed (the pass then ran
+    /// on the last valid config, or the defaults if there never was one).
+    pub config_error: Option<String>,
 }
 
 fn is_excluded(command: &str, cfg: &Config) -> bool {
@@ -313,6 +316,10 @@ pub struct Watcher<P: Platform> {
     data_dir: PathBuf,
     /// Finds the Claude config dirs on its own; the config's dirs are extras.
     discover: fn() -> Vec<PathBuf>,
+    /// The last config read successfully: kept while `config.toml` is broken.
+    last_good: Option<Config>,
+    /// Why the last read of `config.toml` failed, cleared once it parses.
+    config_error: Option<String>,
 }
 
 impl<P: Platform> Watcher<P> {
@@ -321,6 +328,8 @@ impl<P: Platform> Watcher<P> {
             platform,
             data_dir,
             discover: default_config_dirs,
+            last_good: None,
+            config_error: None,
         }
     }
 
@@ -333,6 +342,37 @@ impl<P: Platform> Watcher<P> {
 
     pub fn platform(&self) -> &P {
         &self.platform
+    }
+
+    /// Why `config.toml` could not be used on the last read, if it could not.
+    pub fn config_error(&self) -> Option<&str> {
+        self.config_error.as_deref()
+    }
+
+    /// The config the watcher runs on: the last valid one read, else the
+    /// defaults.
+    pub fn config(&self) -> Config {
+        self.last_good.clone().unwrap_or_default()
+    }
+
+    /// Reads `config.toml`. When it cannot be read or parsed, keeps running
+    /// on the last valid config (defaults on a fresh start) and records why.
+    fn load_config(&mut self) -> Config {
+        match read_config(&self.data_dir) {
+            Ok(c) => {
+                self.last_good = Some(c.clone());
+                self.config_error = None;
+                c
+            }
+            Err(e) => {
+                let fallback = match self.last_good {
+                    Some(_) => "using the last valid config",
+                    None => "using defaults",
+                };
+                self.config_error = Some(format!("{e}; {fallback}"));
+                self.config()
+            }
+        }
     }
 
     /// One watch pass: link, observe, decide, then kill, alert and forget.
@@ -398,8 +438,8 @@ impl<P: Platform> Watcher<P> {
         })
     }
 
-    fn scan(&self) -> Scan {
-        let cfg = load_config(&self.data_dir);
+    fn scan(&mut self) -> Scan {
+        let cfg = self.load_config();
         let live = read_sessions(&effective_claude_dirs_with((self.discover)(), &cfg))
             .into_iter()
             .filter(|s| self.process_matches(s.pid, &s.proc_start))
@@ -565,7 +605,10 @@ impl<P: Platform> Watcher<P> {
                     touch(s, o, now_ms);
                 }
             }
-            let mut report = TickReport::default();
+            let mut report = TickReport {
+                config_error: self.config_error.clone(),
+                ..TickReport::default()
+            };
             let mut to_kill = Vec::new();
             let mut alerted = HashSet::new();
             let mut forget = HashSet::new();
@@ -635,7 +678,7 @@ impl<P: Platform> Watcher<P> {
         for (s, reason) in &targets {
             // Kills can wait seconds each: an exclusion saved meanwhile
             // still protects the next target.
-            let fresh = load_config(&self.data_dir);
+            let fresh = read_config(&self.data_dir).unwrap_or_else(|_| cfg.clone());
             if is_excluded(&s.command, &fresh) || fresh.exclude_ports.contains(&s.port) {
                 dropped.insert(s.key);
                 continue;
@@ -769,7 +812,7 @@ mod tests {
         }
 
         fn cfg(&self) -> Config {
-            crate::config::load_config(self.data.path())
+            crate::config::read_config(self.data.path()).unwrap()
         }
 
         fn state_servers(&self) -> Vec<TrackedServer> {
@@ -1489,6 +1532,54 @@ mod tests {
         assert!(r.killed.is_empty());
         assert!(r.servers.is_empty());
         assert!(f.p().is_alive(30));
+    }
+
+    #[test]
+    fn zero_delay_in_the_file_is_clamped_and_spares_an_active_server() {
+        let mut f = fx();
+        let mut c = f.cfg();
+        assert!(c.set("dead_session_idle_s", "0").is_err());
+        c.dead_session_idle_s = 0; // written by hand
+        save_config(f.data.path(), &c).unwrap();
+        f.p().set_established(30, 3000, 2);
+        f.w.tick(T0).unwrap();
+        f.p().remove_proc(20);
+        assert!(f.w.tick(T0 + 5_000).unwrap().killed.is_empty());
+        assert!(f.p().is_alive(30));
+    }
+
+    #[test]
+    fn unparsable_config_keeps_the_last_good_one_and_is_reported() {
+        let mut f = fx();
+        let mut c = f.cfg();
+        c.dead_session_idle_s = 3600;
+        save_config(f.data.path(), &c).unwrap();
+        let r = f.w.tick(T0).unwrap();
+        assert_eq!(r.config_error, None);
+        fs::write(f.data.path().join("config.toml"), "dead_session_idle_s = [").unwrap();
+        f.p().remove_proc(20);
+        // Defaults would kill at 20 min; the last good config says 60.
+        let r = f.w.tick(T0 + 20 * MIN).unwrap();
+        assert!(r.killed.is_empty());
+        let e = r.config_error.expect("reported");
+        assert!(e.contains("last valid config"), "{e}");
+        assert!(f.p().is_alive(30));
+        // The bad file is left as the user wrote it.
+        assert_eq!(
+            fs::read_to_string(f.data.path().join("config.toml")).unwrap(),
+            "dead_session_idle_s = ["
+        );
+    }
+
+    #[test]
+    fn unparsable_config_at_start_uses_defaults_and_is_reported() {
+        let f = fx();
+        fs::write(f.data.path().join("config.toml"), "nope = [").unwrap();
+        let mut w =
+            Watcher::new(FakePlatform::new(), f.data.path().to_path_buf()).with_discovery(Vec::new);
+        let e = w.tick(T0).unwrap().config_error.expect("reported");
+        assert!(e.contains("defaults"), "{e}");
+        assert_eq!(w.config_error(), Some(e.as_str()));
     }
 
     #[test]

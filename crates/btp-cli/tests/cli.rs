@@ -31,12 +31,13 @@ fn btp(data: &tempfile::TempDir) -> Command {
 fn config_set_then_get() {
     let (data, _e) = sandbox();
     btp(&data)
-        .args(["config", "set", "alert_after_s", "42"])
+        .args(["config", "set", "alert_after_s", "120"])
         .assert()
         .success();
     let out = btp(&data).args(["config", "get"]).assert().success();
     let text = String::from_utf8(out.get_output().stdout.clone()).unwrap();
-    assert!(text.contains("alert_after_s = 42"), "{text}");
+    assert!(text.contains("alert_after_s = 120"), "{text}");
+    assert!(text.contains("exclude_ports = []"), "{text}");
     // Discovered dirs are never written; the read list is a comment.
     assert!(text.contains("# Session dirs read"), "{text}");
     // bare `config` behaves like `config get`
@@ -50,6 +51,38 @@ fn config_set_unknown_key_fails() {
         .args(["config", "set", "nope", "1"])
         .assert()
         .code(1);
+}
+
+#[test]
+fn config_set_below_minimum_fails() {
+    let (data, _e) = sandbox();
+    let out = btp(&data)
+        .args(["config", "set", "dead_session_idle_s", "0"])
+        .assert()
+        .code(1);
+    let err = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(err.contains("at least 60"), "{err}");
+}
+
+#[test]
+fn broken_config_is_reported_and_never_overwritten() {
+    let (data, _e) = sandbox();
+    let path = data.path().join("config.toml");
+    std::fs::write(&path, "alert_after_s = \"soon\"\n").unwrap();
+    let out = btp(&data)
+        .args(["config", "set", "kill_grace_s", "3"])
+        .assert()
+        .code(1);
+    let err = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(err.contains("invalid"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "alert_after_s = \"soon\"\n"
+    );
+    btp(&data).args(["config", "get"]).assert().code(1);
+    let out = btp(&data).args(["list", "--json"]).assert().success();
+    let err = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(err.contains("using defaults"), "{err}");
 }
 
 #[test]
