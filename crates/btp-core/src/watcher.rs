@@ -152,6 +152,10 @@ fn same_process(p: &dyn Platform, pid: i32, start_time: u64) -> bool {
 struct Tree {
     pids: Vec<i32>,
     ports: Vec<u16>,
+    /// Every (pid, port) whose established connections count as the
+    /// server's use: every process of the tree and every port they listen
+    /// on, a nested Claude Code subtree included (errs safe).
+    activity: Vec<(i32, u16)>,
 }
 
 /// The descendants of `pid` that belong to its server, as (pid, start time):
@@ -197,7 +201,24 @@ fn tree_of(p: &dyn Platform, s: &TrackedServer, listeners: &[Listener]) -> Tree 
         .collect();
     ports.sort_unstable();
     ports.dedup();
-    Tree { pids, ports }
+    let mut all = vec![s.key.pid];
+    all.extend(p.descendants(s.key.pid));
+    let mut all_ports: Vec<u16> = listeners
+        .iter()
+        .filter(|l| all.contains(&l.pid))
+        .map(|l| l.port)
+        .collect();
+    all_ports.sort_unstable();
+    all_ports.dedup();
+    let activity = all
+        .iter()
+        .flat_map(|&pid| all_ports.iter().map(move |&port| (pid, port)))
+        .collect();
+    Tree {
+        pids,
+        ports,
+        activity,
+    }
 }
 
 /// The tracked server (index into `servers`) that owns a process whose
@@ -621,12 +642,12 @@ impl<P: Platform> Watcher<P> {
             key: s.key,
             alive,
             // Activity of the whole tree: any established connection on any
-            // port the server or one of its descendants listens on.
+            // port the server or one of its descendants listens on, a
+            // nested Claude Code subtree included.
             established: tree
-                .pids
+                .activity
                 .iter()
-                .flat_map(|&pid| tree.ports.iter().map(move |&port| (pid, port)))
-                .map(|(pid, port)| self.platform.established(pid, port))
+                .map(|&(pid, port)| self.platform.established(pid, port))
                 .sum(),
             // Only a definite "does not exist" counts; an unreadable path
             // (permissions, unmounted volume) must not trigger a kill.
@@ -1755,6 +1776,23 @@ mod tests {
         assert_eq!(rec.port, 4000);
         assert!(!f.p().is_alive(41));
         for pid in [30, 31, 40] {
+            assert!(f.p().is_alive(pid), "pid {pid} was killed");
+        }
+    }
+
+    #[test]
+    fn a_busy_server_under_an_inner_claude_keeps_the_outer_server() {
+        let mut f = fx();
+        // No session file for the inner Claude: a live inner session in the
+        // same worktree would already spare the outer server (sharing).
+        claude_inside_server(&f, false);
+        // The outer server's own port is idle; the inner Claude's server is
+        // in use.
+        f.p().set_established(41, 4000, 1);
+        f.w.tick(T0).unwrap();
+        f.p().remove_proc(20); // the outer session exits
+        assert!(tick_minutes(&mut f, T0, T0 + 25 * MIN).is_empty());
+        for pid in [30, 31, 40, 41] {
             assert!(f.p().is_alive(pid), "pid {pid} was killed");
         }
     }
