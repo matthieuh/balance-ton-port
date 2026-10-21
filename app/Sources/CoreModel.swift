@@ -32,6 +32,8 @@ final class CoreModel: ObservableObject {
     /// kill was requested can still report them; they stay hidden until
     /// `killedHoldTime` has passed.
     private var killedByHand: [ServerID: Date] = [:]
+    /// Every server the last pass reported, hidden ones included.
+    private var lastPassServers: [ServerViewFfi] = []
     private let killedHoldTime: TimeInterval = 30
     private let notifier = Notifier()
 
@@ -84,8 +86,11 @@ final class CoreModel: ObservableObject {
     /// Kills by identity (pid and start time), from the menu or a
     /// notification's Kill button. Asks the core directly, not the last pass:
     /// right after a relaunch the list is still empty. The core kills only
-    /// that exact process; when it is already gone (or its pid now belongs to
-    /// another process), nothing is signalled and the menu says so.
+    /// that exact process; when it is not tracked under that identity
+    /// (already gone, its pid now another process, or merged into the server
+    /// that started it), nothing is signalled, the row is no longer held
+    /// hidden, and the menu says "already gone" only when no tracked server
+    /// has that pid.
     func kill(_ id: ServerID) {
         killedByHand[id] = Date()
         servers.removeAll { $0.id == id }
@@ -97,8 +102,9 @@ final class CoreModel: ObservableObject {
                 }
                 recentKills = kills
                 if record == nil {
-                    killNotice = "That server was already gone."
-                    killNoticeAt = Date()
+                    killedByHand[id] = nil
+                    killNotice = missedKillNotice(id, tracked: lastPassServers.map(\.id))
+                    killNoticeAt = killNotice == nil ? nil : Date()
                 } else {
                     killNotice = nil
                 }
@@ -173,6 +179,7 @@ final class CoreModel: ObservableObject {
                 killNotice = nil
                 killNoticeAt = nil
             }
+            lastPassServers = result.servers
             servers = result.servers.filter { killedByHand[$0.id] == nil }
             recentKills = result.kills
             // Only the watching app alerts; a read-only pass leaves them to

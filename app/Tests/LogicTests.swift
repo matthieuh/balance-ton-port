@@ -409,3 +409,20 @@ final class TestNotificationButtonTests: XCTestCase {
         XCTAssertLessThanOrEqual(testNotificationResetDelay, 10)
     }
 }
+
+final class MissedKillTests: XCTestCase {
+    private let id = ServerID(pid: 4242, startTime: 1)
+
+    func testGoneWhenNoServerHasThePid() {
+        let other = ServerID(pid: 7, startTime: 1)
+        XCTAssertEqual(missedKillNotice(id, tracked: [other]), "That server was already gone.")
+        XCTAssertEqual(missedKillNotice(id, tracked: []), "That server was already gone.")
+    }
+
+    func testNoNoticeWhileAServerWithThePidIsTracked() {
+        // Same pid, another identity (for example the key changed since the
+        // notification): the row is still there, nothing is "gone".
+        let same = ServerID(pid: 4242, startTime: 2)
+        XCTAssertNil(missedKillNotice(id, tracked: [same]))
+    }
+}
