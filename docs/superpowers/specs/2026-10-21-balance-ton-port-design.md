@@ -50,7 +50,7 @@ Anti-goals
 Menu as agreed:
 
 ```
-⚓ Balance ton port
+🐽 Balance ton port
 ──────────────────────────────────
 ● 4322  astro dev   web-itinerairer   active      [Kill]
 ● 3010  wrangler    web-itinerairer   idle 12 min [Kill]

@@ -9,8 +9,15 @@ struct MenuView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("\u{2693} Balance ton port")
-                .font(.headline)
+            HStack(spacing: 4) {
+                Image("MenuIcon")
+                    .renderingMode(.template)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 16, height: 16)
+                Text("Balance ton port")
+            }
+            .font(.headline)
 
             if model.watchedElsewhere {
                 Text("Watching is done by another process")
