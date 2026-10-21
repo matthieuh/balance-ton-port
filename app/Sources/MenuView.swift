@@ -9,7 +9,7 @@ struct MenuView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Balance ton port")
+            Text("\u{2693} Balance ton port")
                 .font(.headline)
 
             if model.watchedElsewhere {
@@ -31,7 +31,7 @@ struct MenuView: View {
                     .foregroundStyle(.secondary)
             } else {
                 Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 4) {
-                    ForEach(model.servers, id: \.self) { server in
+                    ForEach(model.servers, id: \.id) { server in
                         ServerRow(server: server) { model.kill(server) }
                     }
                 }

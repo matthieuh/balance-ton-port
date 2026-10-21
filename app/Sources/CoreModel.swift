@@ -1,5 +1,15 @@
 import Foundation
 
+/// A server's identity: a pid alone can be reused by a later process.
+struct ServerID: Hashable, Sendable {
+    let pid: Int32
+    let startTime: UInt64
+}
+
+extension ServerViewFfi {
+    var id: ServerID { ServerID(pid: pid, startTime: startTime) }
+}
+
 /// Owns the Rust `Core` for the app's lifetime and publishes what the menu
 /// shows. Every `Core` call can block (kills wait up to `kill_grace_s` while
 /// holding the core's lock, a tick may run several kills), so all of them run
@@ -16,6 +26,11 @@ final class CoreModel: ObservableObject {
     private let core = Core()
     private let queue = DispatchQueue(label: "com.matthieuh.balancetonport.core", qos: .utility)
     private var timer: Timer?
+    /// Servers killed by hand, with when. A pass already queued when the
+    /// kill was requested can still report them; they stay hidden until
+    /// `killedHoldTime` has passed.
+    private var killedByHand: [ServerID: Date] = [:]
+    private let killedHoldTime: TimeInterval = 30
 
     init() {
         scheduleNextPass(after: 0)
@@ -24,7 +39,8 @@ final class CoreModel: ObservableObject {
     /// Kills one server by hand. The row leaves the list at once; the next
     /// pass confirms it.
     func kill(_ server: ServerViewFfi) {
-        servers.removeAll { $0.pid == server.pid && $0.startTime == server.startTime }
+        killedByHand[server.id] = Date()
+        servers.removeAll { $0.id == server.id }
         let pid = server.pid
         Task {
             do {
@@ -55,7 +71,9 @@ final class CoreModel: ObservableObject {
                 return PassResult(owner: owner, servers: report.servers, kills: kills, scanIntervalS: scan)
             }
             watchedElsewhere = !result.owner
-            servers = result.servers
+            let now = Date()
+            killedByHand = killedByHand.filter { now.timeIntervalSince($0.value) < killedHoldTime }
+            servers = result.servers.filter { killedByHand[$0.id] == nil }
             recentKills = result.kills
             interval = TimeInterval(max(1, result.scanIntervalS))
             lastError = nil
@@ -67,13 +85,17 @@ final class CoreModel: ObservableObject {
 
     private func scheduleNextPass(after interval: TimeInterval) {
         timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
-            // Scheduled on the main run loop, so the block runs on the main thread.
+        let next = Timer(timeInterval: interval, repeats: false) { [weak self] _ in
+            // Added to the main run loop, so the block runs on the main thread.
             MainActor.assumeIsolated {
                 guard let self else { return }
                 Task { await self.pass() }
             }
         }
+        // `.common` keeps passes running while the menu is open (event
+        // tracking mode), not only in the default mode.
+        RunLoop.main.add(next, forMode: .common)
+        timer = next
     }
 
     /// Runs `work` on the core's serial queue.

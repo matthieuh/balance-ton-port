@@ -18,6 +18,7 @@ targets:
     platform: macOS
     sources:
       - path: Sources
+      - path: Assets.xcassets
     dependencies:
       - framework: Frameworks/BtpCore.xcframework
         embed: false

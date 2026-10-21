@@ -5,13 +5,11 @@ struct BalanceTonPortApp: App {
     @StateObject private var model = CoreModel()
 
     var body: some Scene {
-        MenuBarExtra {
+        // MenuIcon is an anchor template image (Assets.xcassets), so it
+        // follows the menu bar's light and dark look.
+        MenuBarExtra("Balance ton port", image: "MenuIcon") {
             MenuView()
                 .environmentObject(model)
-        } label: {
-            // SF Symbol template image: follows the menu bar's light/dark look.
-            Image(systemName: "ferry")
-                .accessibilityLabel("Balance ton port")
         }
         .menuBarExtraStyle(.window)
 
