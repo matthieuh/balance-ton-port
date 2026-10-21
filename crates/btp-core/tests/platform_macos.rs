@@ -1,0 +1,282 @@
+//! Integration tests for the macOS platform layer, against real processes.
+//!
+//! The helper process is this very test binary, re-executed with
+//! `BTP_TEST_HELPER` set: it then runs `zz_helper` only, which acts as a tiny
+//! dev server (binds 127.0.0.1 and ::1 on one port, accepts and holds
+//! connections). Every test signals only the helper it spawned, and the
+//! `Helper` guard kills and reaps it on drop, so a failing assertion still
+//! cleans up. A grandchild (tree mode) exits by itself once its parent dies.
+#![cfg(target_os = "macos")]
+
+use btp_core::platform::{ancestry, Listener, MacOs, Platform};
+use std::io::{BufRead, BufReader};
+use std::net::{Ipv6Addr, TcpListener, TcpStream};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+const HELPER_ENV: &str = "BTP_TEST_HELPER";
+
+/// Spawned helper process. Killed (SIGKILL) and reaped on drop.
+struct Helper {
+    child: Child,
+    port: u16,
+    grandchild: Option<i32>,
+    _stdout: BufReader<std::process::ChildStdout>,
+}
+
+impl Helper {
+    fn pid(&self) -> i32 {
+        self.child.id() as i32
+    }
+}
+
+impl Drop for Helper {
+    fn drop(&mut self) {
+        // Only ever touches the child this test spawned.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn spawn_helper(mode: &str, cwd: &std::path::Path) -> Helper {
+    let exe = std::env::current_exe().unwrap();
+    let mut child = Command::new(exe)
+        .args(["--exact", "zz_helper", "--nocapture", "--test-threads=1"])
+        .env(HELPER_ENV, mode)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut port = 0;
+    let mut grandchild = None;
+    let mut line = String::new();
+    while port == 0 {
+        line.clear();
+        if stdout.read_line(&mut line).unwrap() == 0 {
+            panic!("helper exited before reporting its port");
+        }
+        // libtest prints "test zz_helper ... " before the marker on the same line.
+        if let Some(at) = line.find("BTP_PORT=") {
+            let rest = line[at + "BTP_PORT=".len()..].trim();
+            let mut parts = rest.split(' ');
+            port = parts.next().unwrap().parse().unwrap();
+            grandchild = parts.next().map(|g| g.parse().unwrap());
+        }
+    }
+    Helper {
+        child,
+        port,
+        grandchild,
+        _stdout: stdout,
+    }
+}
+
+/// Not a real test: the body of the helper process. A no-op in normal runs.
+#[test]
+fn zz_helper() {
+    let Ok(mode) = std::env::var(HELPER_ENV) else {
+        return;
+    };
+    if mode == "orphan-watch" {
+        // Grandchild: exit as soon as the parent helper is gone. The parent
+        // pid comes from the env, so a parent that died before this line ran
+        // is still noticed.
+        let parent: i32 = std::env::var("BTP_TEST_PARENT").unwrap().parse().unwrap();
+        loop {
+            if unsafe { libc::getppid() } != parent {
+                std::process::exit(0);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    let v4 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = v4.local_addr().unwrap().port();
+    // Same port on IPv6 too, to check that listeners() reports it once.
+    let v6 = TcpListener::bind((Ipv6Addr::LOCALHOST, port)).unwrap();
+    let mut grandchild = String::new();
+    if mode == "tree" {
+        let exe = std::env::current_exe().unwrap();
+        let g = Command::new(exe)
+            .args(["--exact", "zz_helper", "--test-threads=1"])
+            .env(HELPER_ENV, "orphan-watch")
+            .env("BTP_TEST_PARENT", std::process::id().to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        grandchild = format!(" {}", g.id());
+        std::mem::forget(g);
+    }
+    println!("BTP_PORT={port}{grandchild}");
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for s in v6.incoming().flatten() {
+            held.push(s);
+        }
+    });
+    let mut held = Vec::new();
+    for s in v4.incoming().flatten() {
+        held.push(s);
+    }
+}
+
+fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+#[test]
+fn finds_spawned_listener() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = spawn_helper("listen", dir.path());
+    let want = Listener {
+        pid: h.pid(),
+        port: h.port,
+    };
+    let found: Vec<Listener> = MacOs
+        .listeners()
+        .into_iter()
+        .filter(|l| l.pid == h.pid())
+        .collect();
+    assert_eq!(found, vec![want], "v4 + v6 on one port must appear once");
+}
+
+#[test]
+fn proc_info_reads_ppid_cwd_command_and_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = spawn_helper("listen", dir.path());
+    let info = MacOs.proc_info(h.pid()).expect("own child is inspectable");
+    assert_eq!(info.pid, h.pid());
+    assert_eq!(info.ppid, std::process::id() as i32);
+    assert_eq!(
+        info.cwd.map(|c| c.canonicalize().unwrap()),
+        Some(dir.path().canonicalize().unwrap())
+    );
+    assert!(
+        info.command.contains("zz_helper") && info.command.contains("--exact"),
+        "command line with args, got {:?}",
+        info.command
+    );
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64;
+    assert!(info.start_time <= now_us && now_us - info.start_time < 60_000_000);
+}
+
+#[test]
+fn proc_info_of_missing_pid_is_none() {
+    // pid_max on macOS is 99999.
+    assert_eq!(MacOs.proc_info(999_999), None);
+}
+
+#[test]
+fn ancestry_reaches_test_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = spawn_helper("listen", dir.path());
+    let chain = ancestry(&MacOs, h.pid());
+    let pids: Vec<i32> = chain.iter().map(|p| p.pid).collect();
+    assert_eq!(pids[0], h.pid());
+    assert_eq!(pids[1], std::process::id() as i32);
+    // The walk goes up to launchd, which a non-root user cannot inspect
+    // (skipped silently): the chain ends at pid 1 or at its child.
+    let top = chain.last().unwrap();
+    assert!(top.pid == 1 || top.ppid == 1, "chain {pids:?}");
+    assert!(pids.len() <= 64);
+}
+
+#[test]
+fn established_counts_a_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = spawn_helper("listen", dir.path());
+    assert_eq!(MacOs.established(h.pid(), h.port), 0);
+    let _c1 = TcpStream::connect(("127.0.0.1", h.port)).unwrap();
+    let _c2 = TcpStream::connect(("127.0.0.1", h.port)).unwrap();
+    assert!(
+        wait_until(|| MacOs.established(h.pid(), h.port) == 2),
+        "got {}",
+        MacOs.established(h.pid(), h.port)
+    );
+    // The client sockets belong to this process, not the helper.
+    assert_eq!(MacOs.established(h.pid(), h.port.wrapping_add(1)), 0);
+}
+
+#[test]
+fn descendants_include_grandchild() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = spawn_helper("tree", dir.path());
+    let g = h.grandchild.expect("tree mode reports its child");
+    assert_eq!(MacOs.descendants(h.pid()), vec![g]);
+    let mine = MacOs.descendants(std::process::id() as i32);
+    assert!(mine.contains(&h.pid()) && mine.contains(&g));
+}
+
+#[test]
+fn signal_terminates_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = spawn_helper("listen", dir.path());
+    assert!(MacOs.signal(h.pid(), 0), "alive check");
+    assert!(MacOs.signal(h.pid(), libc::SIGTERM));
+    let status = h.child.wait().unwrap();
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(status.signal(), Some(libc::SIGTERM));
+    assert!(!MacOs.signal(h.pid(), 0), "reaped pid is gone");
+}
+
+#[test]
+fn signal_refuses_non_positive_pids() {
+    // kill(0, ..) and kill(-1, ..) would hit a whole group or every process.
+    assert!(!MacOs.signal(0, 0));
+    assert!(!MacOs.signal(-1, 0));
+}
+
+#[test]
+fn proc_start_matches_ps() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = spawn_helper("listen", dir.path());
+    // Exactly what Claude Code runs to fill `procStart`.
+    let out = Command::new("ps")
+        .args(["-o", "lstart=", "-p", &h.pid().to_string()])
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .output()
+        .unwrap();
+    let ps = String::from_utf8(out.stdout).unwrap().trim().to_string();
+    assert!(!ps.is_empty());
+    assert_eq!(MacOs.proc_start_string(h.pid()), Some(ps));
+}
+
+#[test]
+#[ignore = "benchmark: cargo test -p btp-core --release --test platform_macos -- --ignored --nocapture"]
+fn bench_full_scan() {
+    let p = MacOs;
+    let _ = p.listeners();
+    let runs = 20;
+    let mut best = Duration::MAX;
+    let mut total = Duration::ZERO;
+    let mut n = 0;
+    for _ in 0..runs {
+        let t = Instant::now();
+        let ls = p.listeners();
+        let infos = ls.iter().filter_map(|l| p.proc_info(l.pid)).count();
+        let d = t.elapsed();
+        n = infos;
+        best = best.min(d);
+        total += d;
+    }
+    println!(
+        "full scan: {n} listeners, best {:?}, mean {:?} over {runs} runs",
+        best,
+        total / runs
+    );
+}
