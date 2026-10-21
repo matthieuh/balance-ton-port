@@ -160,8 +160,9 @@ struct Tree {
 
 /// The descendants of `pid` that belong to its server, as (pid, start time):
 /// a Claude Code process found among them is a session of its own, so it and
-/// its whole subtree are left out (never signalled, never its ports).
-fn own_descendants(p: &dyn Platform, pid: i32) -> Vec<(i32, u64)> {
+/// its whole subtree are left out (never signalled, never its ports); so is
+/// any process for which `spare` holds, with its subtree.
+fn own_descendants(p: &dyn Platform, pid: i32, spare: &dyn Fn(&str) -> bool) -> Vec<(i32, u64)> {
     let mut own = Vec::new();
     let mut spared = HashSet::new();
     for pid in p.descendants(pid) {
@@ -171,7 +172,7 @@ fn own_descendants(p: &dyn Platform, pid: i32) -> Vec<(i32, u64)> {
         let Some(info) = p.proc_info(pid) else {
             continue;
         };
-        if is_claude_cli(&info.command) {
+        if is_claude_cli(&info.command) || spare(&info.command) {
             spared.insert(pid);
             spared.extend(p.descendants(pid));
             continue;
@@ -190,7 +191,7 @@ fn tree_of(p: &dyn Platform, s: &TrackedServer, listeners: &[Listener]) -> Tree 
     }
     let mut pids = vec![s.key.pid];
     pids.extend(
-        own_descendants(p, s.key.pid)
+        own_descendants(p, s.key.pid, &|_| false)
             .into_iter()
             .map(|(pid, _)| pid),
     );
@@ -251,19 +252,21 @@ fn signal_checked(p: &dyn Platform, pid: i32, start_time: u64, sig: i32) -> bool
 }
 
 /// SIGTERM to the server and its descendants (except a Claude Code process
-/// and its subtree), then SIGKILL to whatever
+/// or a command `cfg` excludes, each with its subtree), then SIGKILL to whatever
 /// survives `grace` (polled every 100 ms). Every target is snapshotted as
 /// (pid, start time) up front and re-checked right before each signal, so a
 /// reused pid is never hit. Returns `false`, sending nothing, when `key` is
 /// no longer the running process.
-pub fn kill_tree(p: &dyn Platform, key: ServerKey, grace: Duration) -> bool {
+pub fn kill_tree(p: &dyn Platform, key: ServerKey, grace: Duration, cfg: &Config) -> bool {
     if !same_process(p, key.pid, key.start_time) {
         return false;
     }
     let mut targets = vec![(key.pid, key.start_time)];
     // A Claude Code process started from the server (and whatever it runs)
-    // is a live session of its own: never signalled.
-    targets.extend(own_descendants(p, key.pid));
+    // is a live session of its own, and an excluded command started by the
+    // server (a database, say) is the user's to keep: neither is signalled,
+    // nor anything they run.
+    targets.extend(own_descendants(p, key.pid, &|c| is_excluded(c, cfg)));
     if !signal_checked(p, key.pid, key.start_time, libc::SIGTERM) {
         return false;
     }
@@ -759,7 +762,7 @@ impl<P: Platform> Watcher<P> {
                 dropped.insert(s.key);
                 continue;
             }
-            if kill_tree(&self.platform, s.key, grace) {
+            if kill_tree(&self.platform, s.key, grace, &fresh) {
                 killed.push(record(s, reason.clone(), now_ms));
             } else if same_process(&self.platform, s.key.pid, s.key.start_time) {
                 // Still our process but the signal was refused (EPERM):
@@ -1380,7 +1383,12 @@ mod tests {
             pid: 30,
             start_time: 100,
         };
-        assert!(kill_tree(&p, key, Duration::from_millis(300)));
+        assert!(kill_tree(
+            &p,
+            key,
+            Duration::from_millis(300),
+            &Config::default()
+        ));
         assert_eq!(p.signals(), vec![(30, TERM), (31, TERM), (30, KILL)]);
         assert!(!p.is_alive(30));
         assert!(!p.is_alive(31));
@@ -1427,7 +1435,12 @@ mod tests {
             pid: 30,
             start_time: 99,
         };
-        assert!(!kill_tree(&p, stale, Duration::from_millis(100)));
+        assert!(!kill_tree(
+            &p,
+            stale,
+            Duration::from_millis(100),
+            &Config::default()
+        ));
         assert!(p.signals().is_empty());
         assert!(p.is_alive(30));
 
@@ -1443,7 +1456,12 @@ mod tests {
         // The swap happens synchronously right after 31 gets its SIGTERM,
         // before any poll: no timing involved.
         let swapping = SwapAfterTerm { inner: &p, pid: 31 };
-        assert!(kill_tree(&swapping, key, Duration::from_millis(200)));
+        assert!(kill_tree(
+            &swapping,
+            key,
+            Duration::from_millis(200),
+            &Config::default()
+        ));
         assert!(p.signals().contains(&(31, TERM)));
         assert!(!p.signals().contains(&(31, KILL)));
         assert!(p.is_alive(31));
@@ -1727,7 +1745,12 @@ mod tests {
             pid: 30,
             start_time: 100,
         };
-        assert!(kill_tree(&p, key, Duration::from_millis(100)));
+        assert!(kill_tree(
+            &p,
+            key,
+            Duration::from_millis(100),
+            &Config::default()
+        ));
         assert!(!p.is_alive(30));
         assert!(!p.is_alive(31));
         for pid in [32, 33, 34] {
@@ -1849,6 +1872,35 @@ mod tests {
         assert!(f.p().signals().is_empty());
         assert!(f.p().is_alive(30));
         assert!(f.p().is_alive(31));
+    }
+
+    #[test]
+    fn an_excluded_child_of_a_killed_server_is_spared() {
+        let mut f = fx();
+        let web = f.wt.join("apps/web");
+        let web = web.to_str().unwrap();
+        // The dev server started a database (excluded by default) that
+        // runs a worker of its own.
+        f.p()
+            .spawn(35, 30, START + 35 * SEC, "postgres -D /tmp/db", web);
+        f.p()
+            .spawn(36, 35, START + 36 * SEC, "postgres: checkpointer", web);
+        f.w.tick(T0).unwrap();
+        f.p().remove_proc(20);
+        let r = f.w.tick(T0 + 20 * MIN).unwrap();
+        assert_eq!(r.killed.len(), 1);
+        assert!(!f.p().is_alive(30));
+        assert!(!f.p().is_alive(31));
+        assert!(f.p().is_alive(35));
+        assert!(f.p().is_alive(36));
+        assert!(
+            f.p()
+                .signals()
+                .iter()
+                .all(|&(pid, _)| pid == 30 || pid == 31),
+            "{:?}",
+            f.p().signals()
+        );
     }
 
     #[test]

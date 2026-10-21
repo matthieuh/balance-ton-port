@@ -12,7 +12,7 @@ Every 5 seconds it links new listening servers to the Claude Code session that s
 2. **Session dead and port idle for 20 min**: the server is killed.
 3. **Session alive but idle for 30 min**: a notification with Kill and Keep buttons (app only).
 
-A server is a process tree: the listening process started under the session plus its children (for example Astro or wrangler with their `workerd` workers). A child listening on its own port is part of its parent's server, and "idle" means no established connection on any port of the whole tree. Kill is SIGTERM on that tree, then SIGKILL after 5 s for survivors; a Claude Code process found in the tree, and what it runs, is never signalled. The menu bar lists running servers and the last 5 kills with their reason.
+A server is a process tree: the listening process started under the session plus its children (for example Astro or wrangler with their `workerd` workers). A child listening on its own port is part of its parent's server, and "idle" means no established connection on any port of the whole tree. Kill is SIGTERM on that tree, then SIGKILL after 5 s for survivors; a Claude Code process found in the tree, or a process matching an excluded command (a `postgres` the dev server started, say), is never signalled, nor is anything it runs. The menu bar lists running servers and the last 5 kills with their reason.
 
 ## Install
 
@@ -80,6 +80,7 @@ If you use a custom `CLAUDE_CONFIG_DIR`, copy it into that directory's `skills/`
 - Never kills a process that was not started from a live Claude Code session.
 - A server whose worktree is used by another live session is never touched.
 - Claude Code processes themselves are never tracked, and never signalled when found inside a server's process tree.
+- A child matching an excluded command (a database started by the dev server) is never signalled when its server is killed.
 - Excluded commands and ports are re-checked on every scan and right before each kill.
 - Start times are re-checked before every signal, so a reused pid is never hit.
 - `btp sweep --dry-run` prints what would be killed.
