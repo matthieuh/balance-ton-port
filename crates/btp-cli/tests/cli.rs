@@ -101,3 +101,25 @@ fn watch_refuses_when_locked() {
             "Already watched by Balance ton port.app",
         ));
 }
+
+#[test]
+fn list_json_recent_kill_reason_shape() {
+    let (data, _e) = sandbox();
+    std::fs::write(
+        data.path().join("state.json"),
+        r#"{"servers":[],"recent_kills":[
+{"port":1,"command":"a","worktree":"/w","reason":{"kind":"manual"},"at_ms":1},
+{"port":2,"command":"b","worktree":"/w","reason":{"kind":"worktree_deleted"},"at_ms":2},
+{"port":3,"command":"c","worktree":"/w","reason":{"kind":"dead_session_idle","idle_ms":7},"at_ms":3}]}"#,
+    )
+    .unwrap();
+    let out = btp(&data).args(["list", "--json"]).assert().success();
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let k = &v["recent_kills"];
+    assert_eq!(k[0]["reason"], serde_json::json!({"kind": "manual"}));
+    assert_eq!(k[1]["reason"]["kind"], "worktree_deleted");
+    assert_eq!(
+        k[2]["reason"],
+        serde_json::json!({"kind": "dead_session_idle", "idle_ms": 7})
+    );
+}

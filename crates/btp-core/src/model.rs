@@ -38,6 +38,7 @@ pub struct Observation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum KillReason {
     WorktreeDeleted,
     DeadSessionIdle { idle_ms: u64 },

@@ -73,8 +73,16 @@ enum ConfigCmd {
 }
 
 #[derive(Serialize)]
+struct ServerOut<'a> {
+    #[serde(flatten)]
+    view: &'a ServerView,
+    /// `active`, `idle` or `session dead`, as in the plain output.
+    state: &'static str,
+}
+
+#[derive(Serialize)]
 struct ListOutput<'a> {
-    servers: &'a [ServerView],
+    servers: Vec<ServerOut<'a>>,
     recent_kills: &'a [KillRecord],
 }
 
@@ -125,7 +133,14 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
             let kills = btp_core::state::with_state(&dir, |s| s.recent_kills.clone())?;
             if json {
                 let out = ListOutput {
-                    servers: &report.servers,
+                    servers: report
+                        .servers
+                        .iter()
+                        .map(|view| ServerOut {
+                            view,
+                            state: state_label(view),
+                        })
+                        .collect(),
                     recent_kills: &kills,
                 };
                 println!(
@@ -200,9 +215,13 @@ fn watch(dir: std::path::PathBuf) -> Result<u8, Failure> {
     let mut w = Watcher::new(MacOs, dir.clone());
     println!("watching (Ctrl-C to stop)");
     while !stop.load(Ordering::SeqCst) {
-        let report = w.tick(now_ms())?;
-        print!("{}", render_events(&report));
-        let _ = io::Write::flush(&mut io::stdout());
+        match w.tick(now_ms()) {
+            Ok(report) => {
+                print!("{}", render_events(&report));
+                let _ = io::Write::flush(&mut io::stdout());
+            }
+            Err(e) => eprintln!("btp: scan failed: {e}"),
+        }
         let wait = load_config(&dir).scan_interval();
         let start = Instant::now();
         while start.elapsed() < wait && !stop.load(Ordering::SeqCst) {
