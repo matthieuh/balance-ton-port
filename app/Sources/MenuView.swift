@@ -95,27 +95,3 @@ private struct ServerRow: View {
         }
     }
 }
-
-/// `active`, `idle 12 min`, or `session dead · kill in 18 min`.
-func stateLabel(_ s: ServerViewFfi) -> String {
-    if let killIn = s.killInMs {
-        return "session dead \u{00B7} kill in \(durationLabel(ms: killIn))"
-    }
-    if s.state == "idle" {
-        return "idle \(durationLabel(ms: s.idleMs))"
-    }
-    return s.state
-}
-
-/// `just now`, `12 min ago`, `2 h ago`, `yesterday`, `3 days ago`.
-func relativeTime(atMs: UInt64, now: Date = Date()) -> String {
-    let nowMs = UInt64(max(0, now.timeIntervalSince1970 * 1000))
-    let min = nowMs > atMs ? (nowMs - atMs) / 60_000 : 0
-    switch min {
-    case 0: return "just now"
-    case 1..<60: return "\(min) min ago"
-    case 60..<(24 * 60): return "\(min / 60) h ago"
-    case (24 * 60)..<(48 * 60): return "yesterday"
-    default: return "\(min / (24 * 60)) days ago"
-    }
-}

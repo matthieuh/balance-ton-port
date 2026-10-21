@@ -13,9 +13,9 @@ struct BalanceTonPortApp: App {
         }
         .menuBarExtraStyle(.window)
 
-        // Filled in by Task 10.
         Settings {
-            EmptyView()
+            SettingsView()
+                .environmentObject(model)
         }
     }
 }

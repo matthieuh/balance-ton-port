@@ -1,15 +1,5 @@
 import Foundation
 
-/// A server's identity: a pid alone can be reused by a later process.
-struct ServerID: Hashable, Sendable {
-    let pid: Int32
-    let startTime: UInt64
-}
-
-extension ServerViewFfi {
-    var id: ServerID { ServerID(pid: pid, startTime: startTime) }
-}
-
 /// Owns the Rust `Core` for the app's lifetime and publishes what the menu
 /// shows. Every `Core` call can block (kills wait up to `kill_grace_s` while
 /// holding the core's lock, a tick may run several kills), so all of them run
@@ -22,6 +12,8 @@ final class CoreModel: ObservableObject {
     /// lock: the app then only observes and never runs a killing tick.
     @Published private(set) var watchedElsewhere = false
     @Published private(set) var lastError: String?
+    /// The last Settings save error, cleared by the next successful save.
+    @Published private(set) var settingsError: String?
 
     private let core = Core()
     private let queue = DispatchQueue(label: "com.matthieuh.balancetonport.core", qos: .utility)
@@ -31,17 +23,33 @@ final class CoreModel: ObservableObject {
     /// `killedHoldTime` has passed.
     private var killedByHand: [ServerID: Date] = [:]
     private let killedHoldTime: TimeInterval = 30
+    private let notifier = Notifier()
 
     init() {
+        notifier.onAction = { [weak self] action, id in
+            guard let self else { return }
+            switch action {
+            case .kill: self.kill(id)
+            case .keep: self.keep(id)
+            }
+        }
         scheduleNextPass(after: 0)
     }
 
     /// Kills one server by hand. The row leaves the list at once; the next
     /// pass confirms it.
     func kill(_ server: ServerViewFfi) {
-        killedByHand[server.id] = Date()
-        servers.removeAll { $0.id == server.id }
-        let pid = server.pid
+        kill(server.id)
+    }
+
+    /// Kills by identity, from the menu or a notification's Kill button.
+    /// Does nothing when the last pass no longer lists this exact server
+    /// (gone already, or its pid now belongs to another process).
+    func kill(_ id: ServerID) {
+        guard servers.contains(where: { $0.id == id }) else { return }
+        killedByHand[id] = Date()
+        servers.removeAll { $0.id == id }
+        let pid = id.pid
         Task {
             do {
                 let kills = try await onCore { core in
@@ -53,6 +61,43 @@ final class CoreModel: ObservableObject {
             } catch {
                 lastError = error.localizedDescription
             }
+        }
+    }
+
+    /// A notification's Keep button: no more alerts for this server until it
+    /// restarts.
+    func keep(_ id: ServerID) {
+        Task {
+            do {
+                try await onCore { core in try core.keep(pid: id.pid, startTime: id.startTime) }
+            } catch {
+                lastError = error.localizedDescription
+            }
+        }
+    }
+
+    /// The config as saved on disk (defaults when there is no file).
+    func loadConfig() async -> ConfigFfi {
+        let core = self.core
+        return await withCheckedContinuation { continuation in
+            queue.async { continuation.resume(returning: core.config()) }
+        }
+    }
+
+    /// Saves the Settings form. Enqueued on the core queue right away, so
+    /// saves land in the order the form made them. The watcher re-reads the
+    /// config every pass.
+    func saveConfig(_ config: ConfigFfi) {
+        let core = self.core
+        queue.async { [weak self] in
+            let message: String?
+            do {
+                try core.setConfig(c: config)
+                message = nil
+            } catch {
+                message = error.localizedDescription
+            }
+            Task { @MainActor in self?.settingsError = message }
         }
     }
 
@@ -68,13 +113,20 @@ final class CoreModel: ObservableObject {
                 let report = owner ? try core.tick() : try core.observe()
                 let kills = try core.recentKills()
                 let scan = core.config().scanIntervalS
-                return PassResult(owner: owner, servers: report.servers, kills: kills, scanIntervalS: scan)
+                return PassResult(
+                    owner: owner, servers: report.servers, alerts: report.alerts,
+                    kills: kills, scanIntervalS: scan
+                )
             }
             watchedElsewhere = !result.owner
             let now = Date()
             killedByHand = killedByHand.filter { now.timeIntervalSince($0.value) < killedHoldTime }
             servers = result.servers.filter { killedByHand[$0.id] == nil }
             recentKills = result.kills
+            // Only the watching app alerts; a read-only pass marks no alert.
+            if result.owner && !result.alerts.isEmpty {
+                notifier.post(result.alerts)
+            }
             interval = TimeInterval(max(1, result.scanIntervalS))
             lastError = nil
         } catch {
@@ -112,6 +164,7 @@ final class CoreModel: ObservableObject {
 private struct PassResult: Sendable {
     let owner: Bool
     let servers: [ServerViewFfi]
+    let alerts: [ServerViewFfi]
     let kills: [KillRecordFfi]
     let scanIntervalS: UInt64
 }

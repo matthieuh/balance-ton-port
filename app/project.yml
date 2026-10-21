@@ -1,6 +1,8 @@
 # Generates BalanceTonPort.xcodeproj (git-ignored):
 #   ../scripts/build-xcframework.sh   # Rust core + Swift bindings first
 #   xcodegen generate                 # from this directory
+# Tests (pure helpers + Rust core, no app host; the CLI check wants target/debug/btp):
+#   xcodebuild -project BalanceTonPort.xcodeproj -scheme BalanceTonPort test
 name: BalanceTonPort
 options:
   bundleIdPrefix: com.matthieuh
@@ -41,8 +43,30 @@ targets:
         CODE_SIGN_IDENTITY: "-"
         CODE_SIGN_STYLE: Manual
         SWIFT_TREAT_WARNINGS_AS_ERRORS: true
+  # Pure helpers (Sources/Logic.swift) plus the Rust core, no app host: the
+  # tests never start the app, its watch passes or its notifications.
+  BalanceTonPortTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests
+      - path: Sources/Logic.swift
+      - path: Sources/Generated
+    dependencies:
+      - framework: Frameworks/BtpCore.xcframework
+        embed: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.matthieuh.balancetonport.tests
+        GENERATE_INFOPLIST_FILE: true
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+        SWIFT_TREAT_WARNINGS_AS_ERRORS: true
 schemes:
   BalanceTonPort:
     build:
       targets:
         BalanceTonPort: all
+    test:
+      targets:
+        - BalanceTonPortTests
