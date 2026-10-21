@@ -26,6 +26,8 @@ use std::time::{Duration, Instant};
 pub struct ServerView {
     pub key: ServerKey,
     pub port: u16,
+    /// Every port the server's process tree listens on now, sorted.
+    pub ports: Vec<u16>,
     pub command: String,
     /// A readable name for the server (`Expo (Metro)`, `Vite`, `Node x.js`).
     pub tool_label: String,
@@ -80,7 +82,7 @@ fn is_claude_cli(command: &str) -> bool {
 /// belongs to another process never links. `None` when the listener is a
 /// session itself, when no live session is found, when the server or any
 /// process between it and the session is a Claude Code CLI (watched or not)
-/// or matches an excluded command, or when
+/// or matches an excluded command, when the port is excluded, or when
 /// the server's working directory cannot be read.
 pub fn link(
     listener: &Listener,
@@ -90,7 +92,8 @@ pub fn link(
     now_ms: u64,
 ) -> Option<TrackedServer> {
     let server = chain.first().filter(|p| p.pid == listener.pid)?;
-    if sessions.iter().any(|s| s.pid == listener.pid) {
+    if sessions.iter().any(|s| s.pid == listener.pid) || cfg.exclude_ports.contains(&listener.port)
+    {
         return None;
     }
     let (depth, session) = chain.iter().enumerate().skip(1).find_map(|(i, p)| {
@@ -129,6 +132,51 @@ pub fn link(
 /// `true` when `pid` is the very process that started at `start_time`.
 fn same_process(p: &dyn Platform, pid: i32, start_time: u64) -> bool {
     p.proc_info(pid).is_some_and(|i| i.start_time == start_time)
+}
+
+/// A tracked server's process tree as seen in one pass: the server and its
+/// descendants, and every port any of them listens on. Empty when the
+/// server's process is gone.
+#[derive(Debug, Clone, Default)]
+struct Tree {
+    pids: Vec<i32>,
+    ports: Vec<u16>,
+}
+
+fn tree_of(p: &dyn Platform, s: &TrackedServer, listeners: &[Listener]) -> Tree {
+    if !same_process(p, s.key.pid, s.key.start_time) {
+        return Tree::default();
+    }
+    let mut pids = vec![s.key.pid];
+    pids.extend(p.descendants(s.key.pid));
+    let mut ports: Vec<u16> = listeners
+        .iter()
+        .filter(|l| pids.contains(&l.pid))
+        .map(|l| l.port)
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    Tree { pids, ports }
+}
+
+/// The tracked server (index into `servers`) that owns a process whose
+/// ancestry is `chain`: the topmost tracked server among its ancestors below
+/// the session `session_pid`. `chain[0]` (the process itself) is skipped.
+fn owner_in_chain(
+    chain: &[ProcInfo],
+    session_pid: i32,
+    servers: &[TrackedServer],
+) -> Option<usize> {
+    chain
+        .iter()
+        .skip(1)
+        .take_while(|p| p.pid != session_pid)
+        .filter_map(|p| {
+            servers
+                .iter()
+                .position(|s| s.key.pid == p.pid && s.key.start_time == p.start_time)
+        })
+        .last()
 }
 
 /// Signals `pid` only if it is still the process we snapshotted, and never
@@ -304,31 +352,33 @@ impl<P: Platform> Watcher<P> {
         self.run(now_ms, Mode::Observe)
     }
 
-    /// Kills a tracked server by hand. A port matches the server's recorded
-    /// port or any port its process listens on now; a pid matches the
-    /// server's own pid. Untracked processes are never killed: `Ok(None)`.
+    /// Kills a tracked server by hand. A port matches any port the server's
+    /// tree listens on now, else its recorded port; a pid matches the
+    /// server's own pid; a key matches only that exact process. Untracked
+    /// processes are never killed: `Ok(None)`.
     pub fn kill(&mut self, target: KillTarget) -> io::Result<Option<KillRecord>> {
         let now = now_ms();
         let scan = self.scan();
         let listeners = self.platform.listeners();
         let found = with_state(&self.data_dir, |state| {
-            self.refresh(state, &scan, &listeners, now);
-            state
-                .servers
-                .iter()
-                .find(|s| {
-                    let hit = match target {
-                        KillTarget::Pid(pid) => s.key.pid == pid,
-                        KillTarget::Port(port) => {
-                            s.port == port
-                                || listeners
-                                    .iter()
-                                    .any(|l| l.port == port && l.pid == s.key.pid)
-                        }
-                    };
-                    hit && same_process(&self.platform, s.key.pid, s.key.start_time)
-                })
-                .cloned()
+            let trees = self.refresh(state, &scan, &listeners, now);
+            let live = || {
+                state
+                    .servers
+                    .iter()
+                    .zip(&trees)
+                    .filter(|(_, t)| !t.pids.is_empty())
+            };
+            let hit = match target {
+                KillTarget::Pid(pid) => live().find(|(s, _)| s.key.pid == pid),
+                KillTarget::Key(key) => live().find(|(s, _)| s.key == key),
+                // A port the tree listens on now wins over a recorded port
+                // that another process may have taken since.
+                KillTarget::Port(port) => live()
+                    .find(|(_, t)| t.ports.contains(&port))
+                    .or_else(|| live().find(|(s, _)| s.port == port)),
+            };
+            hit.map(|(s, _)| s.clone())
         })?;
         let Some(server) = found else {
             return Ok(None);
@@ -367,11 +417,26 @@ impl<P: Platform> Watcher<P> {
             && self.platform.proc_start_string(pid).as_deref() == Some(proc_start)
     }
 
-    /// Drops entries from before `session_proc_start` existed (they are
-    /// relinked below if their session still lives) and links new listeners.
-    fn refresh(&self, state: &mut State, scan: &Scan, listeners: &[Listener], now_ms: u64) {
+    /// Brings the tracked list up to date and returns each server's tree
+    /// (same order as `state.servers`):
+    /// - drops entries from before `session_proc_start` existed (they are
+    ///   relinked below if their session still lives);
+    /// - forgets servers that now match an exclusion (command, port, or an
+    ///   ancestor below the session), so a later exclusion still protects;
+    /// - links new listeners, except those inside a tracked server's tree
+    ///   (a server is a process tree: its children's ports are its ports);
+    /// - folds a tracked server into a tracked ancestor (a child that started
+    ///   listening before its parent did).
+    fn refresh(
+        &self,
+        state: &mut State,
+        scan: &Scan,
+        listeners: &[Listener],
+        now_ms: u64,
+    ) -> Vec<Tree> {
         state.servers.retain(|s| !s.session_proc_start.is_empty());
         let sessions = scan.sessions();
+        let mut linked = false;
         for l in listeners {
             // A tracked pid (same process, or a reused pid that this pass
             // forgets) is not linked again; extra ports of one process too.
@@ -379,14 +444,81 @@ impl<P: Platform> Watcher<P> {
                 continue;
             }
             let chain = ancestry(&self.platform, l.pid);
-            if let Some(s) = link(l, &chain, &sessions, &scan.cfg, now_ms) {
-                state.servers.push(s);
+            let Some(new) = link(l, &chain, &sessions, &scan.cfg, now_ms) else {
+                continue;
+            };
+            if owner_in_chain(&chain, new.session_pid, &state.servers).is_some() {
+                continue;
             }
+            state.servers.push(new);
+            linked = true;
+        }
+        if linked {
+            self.fold(state);
+        }
+        let mut trees: Vec<Tree> = state
+            .servers
+            .iter()
+            .map(|s| tree_of(&self.platform, s, listeners))
+            .collect();
+        let mut i = 0;
+        while i < state.servers.len() {
+            if self.excluded_now(&state.servers[i], &trees[i], &scan.cfg) {
+                state.servers.remove(i);
+                trees.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        trees
+    }
+
+    /// Merges every tracked server that descends from another tracked server
+    /// (below their session) into the topmost one.
+    fn fold(&self, state: &mut State) {
+        loop {
+            let found = state.servers.iter().enumerate().find_map(|(i, s)| {
+                let chain = ancestry(&self.platform, s.key.pid);
+                let own = chain
+                    .first()
+                    .is_some_and(|p| p.pid == s.key.pid && p.start_time == s.key.start_time);
+                if !own {
+                    return None;
+                }
+                owner_in_chain(&chain, s.session_pid, &state.servers).map(|j| (i, j))
+            });
+            let Some((child, owner)) = found else {
+                return;
+            };
+            let c = state.servers.remove(child);
+            let owner = if owner > child { owner - 1 } else { owner };
+            let o = &mut state.servers[owner];
+            o.last_active_ms = o.last_active_ms.max(c.last_active_ms);
+            o.kept |= c.kept;
         }
     }
 
-    fn observe_one(&self, s: &TrackedServer, scan: &Scan, now_ms: u64) -> Observation {
-        let alive = same_process(&self.platform, s.key.pid, s.key.start_time);
+    /// The server, any port of its tree, or a process between it and its
+    /// session matches the current exclusions.
+    fn excluded_now(&self, s: &TrackedServer, tree: &Tree, cfg: &Config) -> bool {
+        if is_excluded(&s.command, cfg)
+            || cfg.exclude_ports.contains(&s.port)
+            || tree.ports.iter().any(|p| cfg.exclude_ports.contains(p))
+        {
+            return true;
+        }
+        if tree.pids.is_empty() {
+            return false;
+        }
+        ancestry(&self.platform, s.key.pid)
+            .iter()
+            .skip(1)
+            .take_while(|p| p.pid != s.session_pid)
+            .any(|p| is_excluded(&p.command, cfg))
+    }
+
+    fn observe_one(&self, s: &TrackedServer, tree: &Tree, scan: &Scan, now_ms: u64) -> Observation {
+        let alive = !tree.pids.is_empty();
         let own = |l: &&LiveSession| {
             l.session.pid == s.session_pid && l.session.proc_start == s.session_proc_start
         };
@@ -400,11 +532,14 @@ impl<P: Platform> Watcher<P> {
         Observation {
             key: s.key,
             alive,
-            established: if alive {
-                self.platform.established(s.key.pid, s.port)
-            } else {
-                0
-            },
+            // Activity of the whole tree: any established connection on any
+            // port the server or one of its descendants listens on.
+            established: tree
+                .pids
+                .iter()
+                .flat_map(|&pid| tree.ports.iter().map(move |&port| (pid, port)))
+                .map(|(pid, port)| self.platform.established(pid, port))
+                .sum(),
             // Only a definite "does not exist" counts; an unreadable path
             // (permissions, unmounted volume) must not trigger a kill.
             worktree_exists: !matches!(s.worktree.try_exists(), Ok(false)),
@@ -418,11 +553,12 @@ impl<P: Platform> Watcher<P> {
         let scan = self.scan();
         let listeners = self.platform.listeners();
         let (mut report, to_kill) = with_state(&self.data_dir, |state| {
-            self.refresh(state, &scan, &listeners, now_ms);
+            let trees = self.refresh(state, &scan, &listeners, now_ms);
             let obs: Vec<Observation> = state
                 .servers
                 .iter()
-                .map(|s| self.observe_one(s, &scan, now_ms))
+                .zip(&trees)
+                .map(|(s, t)| self.observe_one(s, t, &scan, now_ms))
                 .collect();
             for (s, o) in state.servers.iter_mut().zip(&obs) {
                 if o.alive {
@@ -450,11 +586,11 @@ impl<P: Platform> Watcher<P> {
                     }
                 }
             }
-            for (s, o) in state.servers.iter_mut().zip(&obs) {
+            for ((s, o), t) in state.servers.iter_mut().zip(&obs).zip(&trees) {
                 if forget.contains(&s.key) {
                     continue;
                 }
-                let view = view(s, o, now_ms, &scan.cfg);
+                let view = view(s, o, t, now_ms, &scan.cfg);
                 if alerted.contains(&s.key) {
                     if mode == Mode::Tick {
                         s.alerted = true;
@@ -497,6 +633,13 @@ impl<P: Platform> Watcher<P> {
         let mut killed = Vec::new();
         let mut dropped = HashSet::new();
         for (s, reason) in &targets {
+            // Kills can wait seconds each: an exclusion saved meanwhile
+            // still protects the next target.
+            let fresh = load_config(&self.data_dir);
+            if is_excluded(&s.command, &fresh) || fresh.exclude_ports.contains(&s.port) {
+                dropped.insert(s.key);
+                continue;
+            }
             if kill_tree(&self.platform, s.key, grace) {
                 killed.push(record(s, reason.clone(), now_ms));
             } else if same_process(&self.platform, s.key.pid, s.key.start_time) {
@@ -539,7 +682,7 @@ fn record(s: &TrackedServer, reason: KillReason, now_ms: u64) -> KillRecord {
     }
 }
 
-fn view(s: &TrackedServer, o: &Observation, now_ms: u64, cfg: &Config) -> ServerView {
+fn view(s: &TrackedServer, o: &Observation, tree: &Tree, now_ms: u64, cfg: &Config) -> ServerView {
     let port_idle = now_ms.saturating_sub(s.last_active_ms);
     let idle_ms = if o.session_alive {
         port_idle.max(o.session_idle_ms.unwrap_or(0))
@@ -565,6 +708,7 @@ fn view(s: &TrackedServer, o: &Observation, now_ms: u64, cfg: &Config) -> Server
     ServerView {
         key: s.key,
         port: s.port,
+        ports: tree.ports.clone(),
         command: s.command.clone(),
         tool_label: tool_label(&s.command),
         worktree: s.worktree.clone(),
@@ -750,6 +894,7 @@ mod tests {
             vec![ServerView {
                 key: key30(),
                 port: 3000,
+                ports: vec![3000],
                 command: "bun run dev".into(),
                 tool_label: "Bun dev".into(),
                 worktree: f.wt.clone(),
@@ -791,7 +936,10 @@ mod tests {
             session_idle_ms: None,
             shared_with_live_session: false,
         };
-        assert_eq!(view(&s, &o, T0, &f.cfg()).session_name, "wt");
+        assert_eq!(
+            view(&s, &o, &Tree::default(), T0, &f.cfg()).session_name,
+            "wt"
+        );
     }
 
     #[test]
@@ -1224,6 +1372,133 @@ mod tests {
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].session_proc_start, format_proc_start(START + 20 * SEC));
         assert_eq!(s[0].worktree, f.wt);
+    }
+
+    /// Ticks once a minute from `from` (exclusive) to `to` (inclusive) and
+    /// returns every kill.
+    fn tick_minutes(f: &mut Fx, from: u64, to: u64) -> Vec<KillRecord> {
+        let mut t = from;
+        let mut killed = Vec::new();
+        while t < to {
+            t += MIN;
+            killed.extend(f.w.tick(t).unwrap().killed);
+        }
+        killed
+    }
+
+    #[test]
+    fn child_listener_belongs_to_its_server_and_parent_activity_keeps_it() {
+        let mut f = fx();
+        // workerd (31), child of the server, listens on an internal port
+        // while the browser uses the parent's 3000.
+        f.p().add_listener(31, 63055);
+        f.p().set_established(30, 3000, 2);
+        let r = f.w.tick(T0).unwrap();
+        let rows: Vec<(i32, u16)> = r.servers.iter().map(|v| (v.key.pid, v.port)).collect();
+        assert_eq!(rows, vec![(30, 3000)], "one row per server tree");
+        assert_eq!(r.servers[0].ports, vec![3000, 63055]);
+        f.p().remove_proc(20); // the session exits; :3000 stays in use
+        assert!(tick_minutes(&mut f, T0, T0 + 25 * MIN).is_empty());
+        assert!(f.p().is_alive(30));
+        assert!(f.p().is_alive(31));
+    }
+
+    #[test]
+    fn idle_parent_with_active_child_is_kept() {
+        let mut f = fx();
+        f.p().add_listener(31, 8787);
+        f.p().set_established(31, 8787, 2);
+        f.w.tick(T0).unwrap();
+        f.p().remove_proc(20);
+        assert!(tick_minutes(&mut f, T0, T0 + 25 * MIN).is_empty());
+        assert!(f.p().is_alive(30));
+        assert!(f.p().is_alive(31));
+    }
+
+    #[test]
+    fn activity_on_a_second_port_counts() {
+        let mut f = fx();
+        f.p().add_listener(30, 8080);
+        f.p().set_established(30, 8080, 3);
+        f.w.tick(T0).unwrap();
+        f.p().remove_proc(20);
+        assert!(f.w.tick(T0 + 20 * MIN).unwrap().killed.is_empty());
+        assert!(f.p().is_alive(30));
+    }
+
+    #[test]
+    fn child_tracked_first_folds_into_its_parent_server() {
+        let mut f = fx();
+        // The child listens before the parent does: it links on its own.
+        f.p().remove_proc(30);
+        let web = f.wt.join("apps/web");
+        f.p().spawn(
+            30,
+            20,
+            START + 30 * SEC,
+            "bun run dev",
+            web.to_str().unwrap(),
+        );
+        f.p().add_listener(31, 63055);
+        let r = f.w.tick(T0).unwrap();
+        assert_eq!(r.servers.len(), 1);
+        assert_eq!(r.servers[0].key.pid, 31);
+        // Then the parent listens: the child folds into the parent's tree.
+        f.p().add_listener(30, 3000);
+        let r = f.w.tick(T0 + MIN).unwrap();
+        let rows: Vec<(i32, u16)> = r.servers.iter().map(|v| (v.key.pid, v.port)).collect();
+        assert_eq!(rows, vec![(30, 3000)]);
+        assert_eq!(f.state_servers().len(), 1);
+    }
+
+    #[test]
+    fn exclusion_added_after_linking_forgets_the_server() {
+        let mut f = fx();
+        f.w.tick(T0).unwrap();
+        let mut c = f.cfg();
+        c.exclude_commands.push("bun".into());
+        save_config(f.data.path(), &c).unwrap();
+        f.p().remove_proc(20);
+        let r = f.w.tick(T0 + 20 * MIN).unwrap();
+        assert!(r.killed.is_empty());
+        assert!(
+            r.servers.is_empty(),
+            "an excluded server is no longer tracked"
+        );
+        assert!(f.state_servers().is_empty());
+        assert!(f.p().is_alive(30));
+    }
+
+    #[test]
+    fn excluded_port_is_never_tracked_or_killed() {
+        let mut f = fx();
+        let mut c = f.cfg();
+        c.exclude_ports = vec![3000];
+        save_config(f.data.path(), &c).unwrap();
+        assert!(f.w.tick(T0).unwrap().servers.is_empty());
+        // Excluding a port of an already tracked server forgets it too,
+        // even when the port belongs to a child of the server.
+        c.exclude_ports = vec![];
+        save_config(f.data.path(), &c).unwrap();
+        f.p().add_listener(31, 8787);
+        assert_eq!(f.w.tick(T0).unwrap().servers.len(), 1);
+        c.exclude_ports = vec![8787];
+        save_config(f.data.path(), &c).unwrap();
+        f.p().remove_proc(20);
+        let r = f.w.tick(T0 + 20 * MIN).unwrap();
+        assert!(r.killed.is_empty());
+        assert!(r.servers.is_empty());
+        assert!(f.p().is_alive(30));
+    }
+
+    #[test]
+    fn manual_kill_by_a_child_port_kills_the_tree() {
+        let mut f = fx();
+        f.p().add_listener(31, 63055);
+        let rec = f.w.kill(KillTarget::Port(63055)).unwrap().expect("killed");
+        assert_eq!(rec.port, 3000);
+        assert!(!f.p().is_alive(30));
+        assert!(!f.p().is_alive(31));
     }
 
     #[test]

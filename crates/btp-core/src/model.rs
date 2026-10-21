@@ -60,4 +60,6 @@ pub enum Action {
 pub enum KillTarget {
     Port(u16),
     Pid(i32),
+    /// Exactly this process (pid and start time), as the app identifies a row.
+    Key(ServerKey),
 }

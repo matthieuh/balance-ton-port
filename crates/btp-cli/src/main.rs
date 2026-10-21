@@ -165,6 +165,7 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
                 None => Err(Failure::User(match target {
                     KillTarget::Port(p) => format!("no tracked server on port {p}"),
                     KillTarget::Pid(p) => format!("no tracked server with pid {p}"),
+                    KillTarget::Key(k) => format!("no tracked server with pid {}", k.pid),
                 })),
             }
         }
@@ -331,6 +332,7 @@ mod tests {
                 start_time: 1,
             },
             port,
+            ports: vec![port],
             command: "vite".into(),
             tool_label: "Vite".into(),
             worktree: "/repo/app".into(),

@@ -53,6 +53,7 @@ mod tests {
                 start_time: 1,
             },
             port: 3000,
+            ports: vec![3000],
             command: "vite".into(),
             tool_label: "Vite".into(),
             worktree: "/repo/app".into(),

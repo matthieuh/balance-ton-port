@@ -91,6 +91,8 @@ pub struct ConfigFfi {
     pub scan_interval_s: u64,
     pub claude_config_dirs: Vec<String>,
     pub exclude_commands: Vec<String>,
+    /// Ports never tracked or killed.
+    pub exclude_ports: Vec<u16>,
 }
 
 /// The reason as the app shows it.
@@ -176,6 +178,7 @@ impl From<Config> for ConfigFfi {
                 .map(|p| p.display().to_string())
                 .collect(),
             exclude_commands: c.exclude_commands,
+            exclude_ports: c.exclude_ports,
         }
     }
 }
@@ -193,6 +196,7 @@ impl From<ConfigFfi> for Config {
                 .map(PathBuf::from)
                 .collect(),
             exclude_commands: c.exclude_commands,
+            exclude_ports: c.exclude_ports,
         }
     }
 }
@@ -365,6 +369,7 @@ mod tests {
                 start_time: 7,
             },
             port: 5173,
+            ports: vec![5173],
             command: "vite".into(),
             tool_label: "Vite".into(),
             worktree: "/repo/app".into(),

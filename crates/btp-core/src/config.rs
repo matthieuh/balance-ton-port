@@ -14,6 +14,9 @@ pub struct Config {
     /// so a `~/.claude-*` dir created later is still picked up.
     pub claude_config_dirs: Vec<PathBuf>,
     pub exclude_commands: Vec<String>,
+    /// Ports never tracked: a server listening on one of them (itself or a
+    /// child) is left alone.
+    pub exclude_ports: Vec<u16>,
 }
 
 impl Default for Config {
@@ -35,6 +38,7 @@ impl Default for Config {
             .iter()
             .map(|s| s.to_string())
             .collect(),
+            exclude_ports: Vec::new(),
         }
     }
 }
