@@ -112,6 +112,7 @@ mod fake {
         listeners: Vec<Listener>,
         established: HashMap<(i32, u16), u32>,
         ignores_sigterm: HashSet<i32>,
+        fails_signals: HashSet<i32>,
         signals: Vec<(i32, i32)>,
     }
 
@@ -169,6 +170,12 @@ mod fake {
             self.st().ignores_sigterm.insert(pid);
         }
 
+        /// Signals to `pid` fail as if refused (EPERM): recorded, no effect,
+        /// `false`.
+        pub fn fail_signals(&self, pid: i32) {
+            self.st().fails_signals.insert(pid);
+        }
+
         /// Every `(pid, sig)` sent so far, in order.
         pub fn signals(&self) -> Vec<(i32, i32)> {
             self.st().signals.clone()
@@ -221,7 +228,7 @@ mod fake {
             }
             let mut st = self.st();
             st.signals.push((pid, sig));
-            if !st.procs.contains_key(&pid) {
+            if !st.procs.contains_key(&pid) || st.fails_signals.contains(&pid) {
                 return false;
             }
             let dies = sig == libc::SIGKILL

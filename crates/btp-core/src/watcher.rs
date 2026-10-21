@@ -55,6 +55,12 @@ fn is_excluded(command: &str, cfg: &Config) -> bool {
         .any(|e| !e.is_empty() && command.contains(&e))
 }
 
+/// The Claude Code CLI itself: argv[0] named `claude`, or the npm package.
+fn is_claude_cli(command: &str) -> bool {
+    let argv0 = command.split_whitespace().next().unwrap_or("");
+    argv0.rsplit('/').next() == Some("claude") || command.contains("@anthropic-ai/claude-code")
+}
+
 /// Links a new listener to the live Claude Code session it descends from.
 ///
 /// `chain` is the listener's ancestry (`chain[0]` is the listener's own
@@ -62,7 +68,8 @@ fn is_excluded(command: &str, cfg: &Config) -> bool {
 /// by pid and by start time (`procStart`), so a stale file whose pid now
 /// belongs to another process never links. `None` when the listener is a
 /// session itself, when no live session is found, when the server or any
-/// process between it and the session matches an excluded command, or when
+/// process between it and the session is a Claude Code CLI (watched or not)
+/// or matches an excluded command, or when
 /// the server's working directory cannot be read.
 pub fn link(
     listener: &Listener,
@@ -82,7 +89,10 @@ pub fn link(
             .find(|s| s.pid == p.pid && s.proc_start == started)
             .map(|s| (i, s))
     })?;
-    if chain[..depth].iter().any(|p| is_excluded(&p.command, cfg)) {
+    if chain[..depth]
+        .iter()
+        .any(|p| is_claude_cli(&p.command) || is_excluded(&p.command, cfg))
+    {
         return None;
     }
     let cwd = server.cwd.as_deref()?;
@@ -300,6 +310,7 @@ impl<P: Platform> Watcher<P> {
         };
         Ok(self
             .execute(vec![(server, KillReason::Manual)], &scan.cfg, now)?
+            .0
             .pop())
     }
 
@@ -438,34 +449,44 @@ impl<P: Platform> Watcher<P> {
                 .collect();
             return Ok(report);
         }
-        let gone: HashSet<ServerKey> = to_kill.iter().map(|(s, _)| s.key).collect();
-        report.killed = self.execute(to_kill, &scan.cfg, now_ms)?;
+        let (killed, gone) = self.execute(to_kill, &scan.cfg, now_ms)?;
+        report.killed = killed;
         report.servers.retain(|v| !gone.contains(&v.key));
         Ok(report)
     }
 
     /// Kills each server's tree outside the state lock (the grace period can
-    /// last seconds), then records what was killed and stops tracking every
-    /// target: one that was not signalled is already gone or reused.
+    /// last seconds), then records what was killed. Stops tracking every
+    /// target except one that is still our process but refused the signal.
+    /// Returns the kills and the keys no longer tracked.
     fn execute(
         &self,
         targets: Vec<(TrackedServer, KillReason)>,
         cfg: &Config,
         now_ms: u64,
-    ) -> io::Result<Vec<KillRecord>> {
+    ) -> io::Result<(Vec<KillRecord>, HashSet<ServerKey>)> {
         if targets.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), HashSet::new()));
         }
         let grace = Duration::from_secs(cfg.kill_grace_s);
         let mut killed = Vec::new();
+        let mut dropped = HashSet::new();
         for (s, reason) in &targets {
             if kill_tree(&self.platform, s.key, grace) {
                 killed.push(record(s, reason.clone(), now_ms));
+            } else if same_process(&self.platform, s.key.pid, s.key.start_time) {
+                // Still our process but the signal was refused (EPERM):
+                // keep tracking it so a later pass can retry.
+                eprintln!(
+                    "btp: could not signal pid {} (port {}), still tracked",
+                    s.key.pid, s.port
+                );
+                continue;
             }
+            dropped.insert(s.key);
         }
-        let keys: HashSet<ServerKey> = targets.iter().map(|(s, _)| s.key).collect();
         with_state(&self.data_dir, |state| {
-            state.servers.retain(|s| !keys.contains(&s.key));
+            state.servers.retain(|s| !dropped.contains(&s.key));
             for r in &killed {
                 state.record_kill(r.clone());
             }
@@ -473,7 +494,7 @@ impl<P: Platform> Watcher<P> {
         for r in &killed {
             append_kill_log(&self.data_dir, r)?;
         }
-        Ok(killed)
+        Ok((killed, dropped))
     }
 }
 
@@ -731,6 +752,61 @@ mod tests {
     }
 
     #[test]
+    fn claude_process_without_session_file_not_linked() {
+        let mut f = fx();
+        let wt = f.wt.to_str().unwrap().to_string();
+        // A Claude CLI with no watched session file, listening (IDE, OAuth)
+        // under a live watched session.
+        f.p().spawn(70, 20, START + 70 * SEC, "claude", &wt);
+        f.p().add_listener(70, 7300);
+        assert_eq!(link_pid(&f, 70, 7300), None);
+        f.p().spawn(
+            71,
+            20,
+            START + 71 * SEC,
+            "node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js",
+            &wt,
+        );
+        f.p().add_listener(71, 7301);
+        assert_eq!(link_pid(&f, 71, 7301), None);
+        // A server under such an unwatched nested Claude belongs to it, not
+        // to the outer session.
+        f.p().spawn(
+            72,
+            20,
+            START + 72 * SEC,
+            "/opt/homebrew/bin/claude -p x",
+            &wt,
+        );
+        f.p().spawn(73, 72, START + 73 * SEC, "vite", &wt);
+        f.p().add_listener(73, 5174);
+        assert_eq!(link_pid(&f, 73, 5174), None);
+        // A command merely mentioning claude is still a server.
+        f.p()
+            .spawn(74, 20, START + 74 * SEC, "node claude-dashboard.js", &wt);
+        f.p().add_listener(74, 7302);
+        assert!(link_pid(&f, 74, 7302).is_some());
+
+        let r = f.w.tick(T0).unwrap();
+        let ports: Vec<u16> = r.servers.iter().map(|v| v.port).collect();
+        assert_eq!(ports, vec![3000, 7302]);
+    }
+
+    #[test]
+    fn unsignallable_server_stays_tracked() {
+        let mut f = fx();
+        f.w.tick(T0).unwrap();
+        f.p().fail_signals(30); // e.g. EPERM
+        f.p().remove_proc(20);
+        let r = f.w.tick(T0 + 20 * MIN).unwrap();
+        assert!(r.killed.is_empty());
+        assert_eq!(r.servers.len(), 1);
+        assert!(f.p().is_alive(30));
+        assert_eq!(f.state_servers().len(), 1);
+        assert!(f.kill_log().is_empty());
+    }
+
+    #[test]
     fn excluded_command_not_linked() {
         let mut f = fx();
         let wt = f.wt.to_str().unwrap().to_string();
@@ -949,6 +1025,39 @@ mod tests {
         assert!(!p.is_alive(31));
     }
 
+    /// Replaces `pid` by an unrelated process right after it receives
+    /// SIGTERM (it ignores it), as if the pid were reused at once.
+    struct SwapAfterTerm<'a> {
+        inner: &'a FakePlatform,
+        pid: i32,
+    }
+
+    impl Platform for SwapAfterTerm<'_> {
+        fn listeners(&self) -> Vec<Listener> {
+            self.inner.listeners()
+        }
+        fn proc_info(&self, pid: i32) -> Option<ProcInfo> {
+            self.inner.proc_info(pid)
+        }
+        fn established(&self, pid: i32, port: u16) -> u32 {
+            self.inner.established(pid, port)
+        }
+        fn descendants(&self, pid: i32) -> Vec<i32> {
+            self.inner.descendants(pid)
+        }
+        fn signal(&self, pid: i32, sig: i32) -> bool {
+            let delivered = self.inner.signal(pid, sig);
+            if pid == self.pid && sig == TERM {
+                self.inner.remove_proc(pid);
+                self.inner.spawn(pid, 1, 5_000, "unrelated", "/");
+            }
+            delivered
+        }
+        fn proc_start_string(&self, pid: i32) -> Option<String> {
+            self.inner.proc_start_string(pid)
+        }
+    }
+
     #[test]
     fn kill_tree_never_signals_a_reused_pid() {
         let p = FakePlatform::new();
@@ -970,14 +1079,10 @@ mod tests {
             pid: 30,
             start_time: 100,
         };
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                std::thread::sleep(Duration::from_millis(100));
-                p.remove_proc(31);
-                p.spawn(31, 1, 5_000, "unrelated", "/");
-            });
-            assert!(kill_tree(&p, key, Duration::from_millis(400)));
-        });
+        // The swap happens synchronously right after 31 gets its SIGTERM,
+        // before any poll: no timing involved.
+        let swapping = SwapAfterTerm { inner: &p, pid: 31 };
+        assert!(kill_tree(&swapping, key, Duration::from_millis(200)));
         assert!(p.signals().contains(&(31, TERM)));
         assert!(!p.signals().contains(&(31, KILL)));
         assert!(p.is_alive(31));

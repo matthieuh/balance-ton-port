@@ -73,12 +73,30 @@ fn expand_tilde(raw: &str, home: &Path) -> PathBuf {
     }
 }
 
-/// `~/.claude` plus the (tilde-expanded) `claude_config_dir`, deduplicated, existing only.
+/// Every `~/.claude-*` directory holding a `sessions/` subdirectory, sorted.
+fn discover_dash_dirs(home: &Path) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(home) else {
+        return Vec::new();
+    };
+    let mut found: Vec<PathBuf> = rd
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(".claude-"))
+        .map(|e| e.path())
+        .filter(|p| p.join("sessions").is_dir())
+        .collect();
+    found.sort();
+    found
+}
+
+/// `~/.claude`, the (tilde-expanded) `claude_config_dir`, then every
+/// `~/.claude-*` directory that has a `sessions/` subdirectory; deduplicated,
+/// existing only.
 pub fn config_dirs_from(home: &Path, claude_config_dir: Option<&str>) -> Vec<PathBuf> {
     let mut candidates = vec![home.join(".claude")];
     if let Some(raw) = claude_config_dir.filter(|r| !r.is_empty()) {
         candidates.push(expand_tilde(raw, home));
     }
+    candidates.extend(discover_dash_dirs(home));
     let mut out: Vec<PathBuf> = Vec::new();
     for c in candidates {
         if c.is_dir() && !out.contains(&c) {
@@ -195,5 +213,36 @@ mod tests {
         assert_eq!(v, vec![home.path().join(".claude")]);
         let none = tempfile::tempdir().unwrap();
         assert!(config_dirs_from(none.path(), None).is_empty());
+    }
+
+    #[test]
+    fn discovers_claude_dash_dirs_with_sessions() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        std::fs::create_dir(h.join(".claude")).unwrap();
+        std::fs::create_dir_all(h.join(".claude-perso/sessions")).unwrap();
+        std::fs::create_dir_all(h.join(".claude-alt/sessions")).unwrap();
+        std::fs::create_dir(h.join(".claude-nosessions")).unwrap();
+        std::fs::write(h.join(".claude-file"), "x").unwrap();
+        std::fs::create_dir_all(h.join("claude-nodot/sessions")).unwrap();
+        let v = config_dirs_from(h, None);
+        assert_eq!(
+            v,
+            vec![
+                h.join(".claude"),
+                h.join(".claude-alt"),
+                h.join(".claude-perso")
+            ]
+        );
+        // The env dir comes first after ~/.claude and is not repeated.
+        let v = config_dirs_from(h, Some("~/.claude-perso"));
+        assert_eq!(
+            v,
+            vec![
+                h.join(".claude"),
+                h.join(".claude-perso"),
+                h.join(".claude-alt")
+            ]
+        );
     }
 }
