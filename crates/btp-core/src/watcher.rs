@@ -730,9 +730,11 @@ impl<P: Platform> Watcher<P> {
         let mut dropped = HashSet::new();
         for (s, reason) in &targets {
             // Kills can wait seconds each: an exclusion saved meanwhile
-            // still protects the next target.
+            // still protects the next target, with the same check as a pass
+            // (command, any port of the tree, ancestors below the session).
             let fresh = read_config(&self.data_dir).unwrap_or_else(|_| cfg.clone());
-            if is_excluded(&s.command, &fresh) || fresh.exclude_ports.contains(&s.port) {
+            let tree = tree_of(&self.platform, s, &self.platform.listeners());
+            if self.excluded_now(s, &tree, &fresh) {
                 dropped.insert(s.key);
                 continue;
             }
@@ -1788,6 +1790,27 @@ mod tests {
         let rows: Vec<i32> = r.servers.iter().map(|v| v.key.pid).collect();
         assert_eq!(rows, vec![30]);
         assert_eq!(f.state_servers().len(), 1);
+    }
+
+    #[test]
+    fn exclusion_of_a_tree_port_saved_before_the_kill_spares_the_server() {
+        let mut f = fx();
+        f.p().add_listener(31, 8787);
+        f.w.tick(T0).unwrap();
+        let server = f.state_servers()[0].clone();
+        let old = f.cfg();
+        // Saved between the pass that planned the kill and the kill itself.
+        let mut c = old.clone();
+        c.exclude_ports = vec![8787];
+        save_config(f.data.path(), &c).unwrap();
+        let (killed, dropped) =
+            f.w.execute(vec![(server, KillReason::Manual)], &old, T0)
+                .unwrap();
+        assert!(killed.is_empty());
+        assert!(dropped.contains(&key30()));
+        assert!(f.p().signals().is_empty());
+        assert!(f.p().is_alive(30));
+        assert!(f.p().is_alive(31));
     }
 
     #[test]
