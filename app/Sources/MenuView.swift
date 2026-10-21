@@ -19,6 +19,24 @@ struct MenuView: View {
             }
             .font(.headline)
 
+            if let fix = menuNotificationFix(model.notificationPermission) {
+                HStack(spacing: 4) {
+                    Text("Notifications are off \u{00B7}")
+                        .foregroundStyle(.secondary)
+                    Button("Turn on") {
+                        switch fix {
+                        case .request:
+                            NSApp.activate(ignoringOtherApps: true)
+                            Task { await model.requestNotifications() }
+                        case .openSettings:
+                            NSApp.activate(ignoringOtherApps: true)
+                            openSettings()
+                        }
+                    }
+                    .buttonStyle(.link)
+                }
+                .font(.caption)
+            }
             if model.watchedElsewhere {
                 Text("Watching is done by another process")
                     .font(.caption)

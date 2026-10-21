@@ -1,9 +1,8 @@
 import AppKit
 import ServiceManagement
 import SwiftUI
-import UserNotifications
 
-/// The Settings window: the four delays, the two lists, launch at login.
+/// The Settings window: notifications, the four delays, the two lists, launch at login.
 /// Every valid user edit is saved at once through `CoreModel.saveConfig`;
 /// loading the form never saves (`SettingsSaveGate`).
 struct SettingsView: View {
@@ -11,13 +10,13 @@ struct SettingsView: View {
     @State private var draft: SettingsDraft?
     @State private var discovered: [String] = []
     @State private var gate = SettingsSaveGate()
-    @State private var notificationsDenied = false
     /// Set when `config.toml` cannot be parsed: no form is shown, so nothing
     /// overwrites the user's file with defaults.
     @State private var loadError: String?
 
     var body: some View {
         Form {
+            NotificationsSection()
             if let binding = Binding($draft) {
                 DelaysSection(draft: binding)
                 Section {
@@ -78,17 +77,6 @@ struct SettingsView: View {
                 ProgressView()
             }
             LaunchAtLoginSection()
-            if notificationsDenied {
-                Section("Notifications") {
-                    Text("Notifications are off for Balance ton port in System Settings. Idle servers still show in the menu.")
-                        .foregroundStyle(.secondary)
-                    Button("Open Notification Settings") {
-                        if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=com.matthieuh.balancetonport") {
-                            NSWorkspace.shared.open(url)
-                        }
-                    }
-                }
-            }
         }
         .formStyle(.grouped)
         .frame(width: 460)
@@ -104,13 +92,78 @@ struct SettingsView: View {
             } catch {
                 loadError = error.localizedDescription
             }
-            let settings = await UNUserNotificationCenter.current().notificationSettings()
-            notificationsDenied = settings.authorizationStatus == .denied
         }
         .onChange(of: draft) { _, new in
             guard let new, gate.shouldSave(new) else { return }
             model.saveConfig(new.ffi)
         }
+    }
+}
+
+/// Whether notifications reach the user, and the one step that fixes it.
+private struct NotificationsSection: View {
+    @EnvironmentObject private var model: CoreModel
+    @State private var testSent = false
+
+    var body: some View {
+        Section("Notifications") {
+            if let permission = model.notificationPermission {
+                let setup = notificationSetup(permission)
+                if setup.isOn {
+                    Label {
+                        Text(setup.message)
+                    } icon: {
+                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                    }
+                } else {
+                    Text(setup.message)
+                }
+                if let hint = setup.hint {
+                    Text(hint).foregroundStyle(.secondary)
+                }
+                if setup.button != nil || setup.canSendTest {
+                    HStack {
+                        if let button = setup.button {
+                            Button(button.title) { perform(button) }
+                        }
+                        if setup.canSendTest {
+                            Button(testSent ? "Test sent" : "Send a test notification") {
+                                Task {
+                                    await model.sendTestNotification()
+                                    testSent = true
+                                }
+                            }
+                            .controlSize(.small)
+                        }
+                    }
+                }
+            } else {
+                ProgressView().controlSize(.small)
+            }
+        }
+        .task { await model.refreshNotificationPermission() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            Task { await model.refreshNotificationPermission() }
+        }
+    }
+
+    private func perform(_ button: NotificationSetupButton) {
+        switch button {
+        case .turnOn:
+            Task { await model.requestNotifications() }
+        case .openSettings:
+            openNotificationSettings()
+        }
+    }
+}
+
+/// Opens this app's page in System Settings, Notifications (or the
+/// Notifications pane when that page cannot be opened).
+@MainActor
+func openNotificationSettings() {
+    let bundleID = Bundle.main.bundleIdentifier ?? "com.matthieuh.balancetonport"
+    for url in notificationSettingsURLs(bundleID: bundleID) where NSWorkspace.shared.open(url) {
+        return
     }
 }
 

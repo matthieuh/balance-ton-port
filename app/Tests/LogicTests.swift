@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import UserNotifications
 import XCTest
 
 private func server(
@@ -302,5 +303,91 @@ final class ConfigSaveTests: XCTestCase {
         for d in discovered {
             XCTAssertFalse(saved.contains(d), "discovered dir \(d) written to config.toml")
         }
+    }
+}
+
+final class NotificationSetupTests: XCTestCase {
+    func testPermissionFromStatus() {
+        XCTAssertEqual(NotificationPermission(status: .notDetermined, alertStyle: .none), .notAsked)
+        XCTAssertEqual(NotificationPermission(status: .denied, alertStyle: .banner), .denied)
+        XCTAssertEqual(NotificationPermission(status: .authorized, alertStyle: .banner), .allowed(bannersOff: false))
+        XCTAssertEqual(NotificationPermission(status: .authorized, alertStyle: .alert), .allowed(bannersOff: false))
+        XCTAssertEqual(NotificationPermission(status: .provisional, alertStyle: .none), .allowed(bannersOff: true))
+        XCTAssertTrue(NotificationPermission.allowed(bannersOff: true).isAllowed)
+        XCTAssertFalse(NotificationPermission.denied.isAllowed)
+        XCTAssertFalse(NotificationPermission.notAsked.isAllowed)
+    }
+
+    func testNotAskedOffersToTurnOn() {
+        let setup = notificationSetup(.notAsked)
+        XCTAssertEqual(setup.message, "Get a notification when a server sits idle, with Kill and Keep buttons.")
+        XCTAssertFalse(setup.isOn)
+        XCTAssertNil(setup.hint)
+        XCTAssertEqual(setup.button, .turnOn)
+        XCTAssertEqual(setup.button?.title, "Turn on notifications")
+        XCTAssertFalse(setup.canSendTest)
+    }
+
+    func testAllowedShowsCheckAndTest() {
+        let setup = notificationSetup(.allowed(bannersOff: false))
+        XCTAssertEqual(setup.message, "Notifications are on")
+        XCTAssertTrue(setup.isOn)
+        XCTAssertNil(setup.hint)
+        XCTAssertNil(setup.button)
+        XCTAssertTrue(setup.canSendTest)
+    }
+
+    func testAllowedWithBannersOffPointsToSettings() {
+        let setup = notificationSetup(.allowed(bannersOff: true))
+        XCTAssertTrue(setup.isOn)
+        XCTAssertEqual(setup.hint, "Banners are off: choose Banners or Alerts in System Settings")
+        XCTAssertEqual(setup.button, .openSettings)
+        XCTAssertTrue(setup.canSendTest)
+    }
+
+    func testDeniedPointsToSettings() {
+        let setup = notificationSetup(.denied)
+        XCTAssertEqual(setup.message, "Notifications are off for Balance ton port.")
+        XCTAssertFalse(setup.isOn)
+        XCTAssertEqual(setup.hint, "Turn on Allow notifications, then come back here.")
+        XCTAssertEqual(setup.button, .openSettings)
+        XCTAssertEqual(setup.button?.title, "Open Notification Settings")
+        XCTAssertFalse(setup.canSendTest)
+    }
+
+    func testMenuFix() {
+        XCTAssertEqual(menuNotificationFix(.notAsked), .request)
+        XCTAssertEqual(menuNotificationFix(.denied), .openSettings)
+        XCTAssertNil(menuNotificationFix(.allowed(bannersOff: false)))
+        XCTAssertNil(menuNotificationFix(.allowed(bannersOff: true)))
+        XCTAssertNil(menuNotificationFix(nil))
+    }
+
+    func testSettingsURLs() {
+        let urls = notificationSettingsURLs(bundleID: "com.matthieuh.balancetonport").map(\.absoluteString)
+        XCTAssertEqual(urls, [
+            "x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=com.matthieuh.balancetonport",
+            "x-apple.systempreferences:com.apple.Notifications-Settings.extension",
+        ])
+    }
+
+    func testSampleNotificationNamesNoServer() {
+        let info: [AnyHashable: Any] = sampleNotificationUserInfo().reduce(into: [:]) { $0[$1.key] = $1.value }
+        XCTAssertTrue(isSampleNotification(info))
+        XCTAssertNil(serverID(fromUserInfo: info))
+        let real: [AnyHashable: Any] = notificationUserInfo(ServerID(pid: 1, startTime: 2))
+            .reduce(into: [:]) { $0[$1.key] = $1.value }
+        XCTAssertFalse(isSampleNotification(real))
+    }
+
+    func testCopyHasNoEmDash() {
+        let permissions: [NotificationPermission] = [.notAsked, .allowed(bannersOff: false), .allowed(bannersOff: true), .denied]
+        for p in permissions {
+            let setup = notificationSetup(p)
+            for text in [setup.message, setup.hint ?? "", setup.button?.title ?? ""] {
+                XCTAssertFalse(text.contains("\u{2014}"), text)
+            }
+        }
+        XCTAssertFalse(sampleNotificationBody.contains("\u{2014}"))
     }
 }

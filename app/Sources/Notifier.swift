@@ -33,14 +33,39 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         center.setNotificationCategories([
             UNNotificationCategory(identifier: IDs.category, actions: [kill, keep], intentIdentifiers: [], options: [])
         ])
-        // The system only prompts the first time; later calls just report.
-        let log = self.log
-        center.requestAuthorization(options: [.alert, .sound]) { granted, error in
-            if let error {
-                log.error("authorization failed: \(error.localizedDescription, privacy: .public)")
-            } else if !granted {
-                log.info("notifications denied; the menu shows idle servers")
-            }
+    }
+
+    /// Asks macOS for permission. The system only prompts the first time;
+    /// later calls just report.
+    func requestAuthorization() async {
+        do {
+            let granted = try await center.requestAuthorization(options: [.alert, .sound])
+            if !granted { log.info("notifications denied; the menu shows idle servers") }
+        } catch {
+            log.error("authorization failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    /// The current permission, read from Notification Center.
+    func permission() async -> NotificationPermission {
+        let settings = await center.notificationSettings()
+        return NotificationPermission(status: settings.authorizationStatus, alertStyle: settings.alertStyle)
+    }
+
+    /// A made-up idle-server notification with the real Kill and Keep
+    /// buttons. Its userInfo names no server, so both buttons do nothing.
+    func postSample() async {
+        let content = UNMutableNotificationContent()
+        content.title = "Balance ton port"
+        content.body = sampleNotificationBody
+        content.categoryIdentifier = IDs.category
+        content.sound = .default
+        content.userInfo = sampleNotificationUserInfo()
+        let request = UNNotificationRequest(identifier: "sample", content: content, trigger: nil)
+        do {
+            try await center.add(request)
+        } catch {
+            log.error("could not post the test: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -89,7 +114,9 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         // A tap on the body (or a dismiss) opens nothing.
         default: return
         }
-        guard let id = serverID(fromUserInfo: response.notification.request.content.userInfo) else { return }
+        let info = response.notification.request.content.userInfo
+        // The test notification: its buttons never reach a server.
+        guard !isSampleNotification(info), let id = serverID(fromUserInfo: info) else { return }
         await MainActor.run { self.onAction?(action, id) }
     }
 

@@ -1,4 +1,5 @@
 import Foundation
+import UserNotifications
 
 // Pure helpers: no UI, no notification center, no core queue. Compiled into
 // both the app and BalanceTonPortTests.
@@ -115,6 +116,125 @@ func serverID(fromUserInfo info: [AnyHashable: Any]) -> ServerID? {
           let start = UInt64(startText)
     else { return nil }
     return ServerID(pid: pid, startTime: start)
+}
+
+// MARK: - Notification permission
+
+/// What macOS lets the app do with notifications, as the Settings section
+/// and the menu show it.
+enum NotificationPermission: Equatable, Sendable {
+    /// The system has not asked the user yet.
+    case notAsked
+    /// Allowed; `bannersOff` when the alert style is None, so nothing pops up.
+    case allowed(bannersOff: Bool)
+    /// Refused (or the prompt was closed): only System Settings can fix it.
+    case denied
+
+    init(status: UNAuthorizationStatus, alertStyle: UNAlertStyle) {
+        switch status {
+        case .notDetermined:
+            self = .notAsked
+        case .authorized, .provisional, .ephemeral:
+            self = .allowed(bannersOff: alertStyle == .none)
+        case .denied:
+            self = .denied
+        @unknown default:
+            self = .denied
+        }
+    }
+
+    var isAllowed: Bool {
+        if case .allowed = self { return true }
+        return false
+    }
+}
+
+/// The one button the Notifications section shows under its text.
+enum NotificationSetupButton: Equatable, Sendable {
+    case turnOn
+    case openSettings
+
+    var title: String {
+        switch self {
+        case .turnOn: return "Turn on notifications"
+        case .openSettings: return "Open Notification Settings"
+        }
+    }
+}
+
+/// The Notifications section's content for a permission.
+struct NotificationSetup: Equatable, Sendable {
+    /// Main line; shown with a green check when `isOn`.
+    let message: String
+    let isOn: Bool
+    /// A second, secondary line (what to do in System Settings).
+    let hint: String?
+    let button: NotificationSetupButton?
+    /// "Send a test notification" is offered.
+    let canSendTest: Bool
+}
+
+func notificationSetup(_ permission: NotificationPermission) -> NotificationSetup {
+    switch permission {
+    case .notAsked:
+        return NotificationSetup(
+            message: "Get a notification when a server sits idle, with Kill and Keep buttons.",
+            isOn: false, hint: nil, button: .turnOn, canSendTest: false
+        )
+    case .allowed(let bannersOff):
+        return NotificationSetup(
+            message: "Notifications are on",
+            isOn: true,
+            hint: bannersOff ? "Banners are off: choose Banners or Alerts in System Settings" : nil,
+            button: bannersOff ? .openSettings : nil,
+            canSendTest: true
+        )
+    case .denied:
+        return NotificationSetup(
+            message: "Notifications are off for Balance ton port.",
+            isOn: false,
+            hint: "Turn on Allow notifications, then come back here.",
+            button: .openSettings,
+            canSendTest: false
+        )
+    }
+}
+
+/// What "Turn on" in the menu does; `nil` when the menu shows no line.
+enum MenuNotificationFix: Equatable, Sendable {
+    /// Ask macOS right away (it has never asked).
+    case request
+    /// Open the Settings window, whose Notifications section is on top.
+    case openSettings
+}
+
+func menuNotificationFix(_ permission: NotificationPermission?) -> MenuNotificationFix? {
+    switch permission {
+    case .notAsked: return .request
+    case .denied: return .openSettings
+    case .allowed, nil: return nil
+    }
+}
+
+/// The app's pane in System Settings, Notifications, then the Notifications
+/// pane itself as a fallback.
+func notificationSettingsURLs(bundleID: String) -> [URL] {
+    let base = "x-apple.systempreferences:com.apple.Notifications-Settings.extension"
+    return [URL(string: "\(base)?id=\(bundleID)"), URL(string: base)].compactMap { $0 }
+}
+
+/// The test notification's body: a made-up idle server.
+let sampleNotificationBody =
+    "Test: Vite on port 5173 (my-project \u{203A} web) hasn't been used for 30 min."
+
+/// The test notification's userInfo: no pid nor start time, so
+/// `serverID(fromUserInfo:)` finds no server and its Kill and Keep do nothing.
+func sampleNotificationUserInfo() -> [String: Any] {
+    ["sample": true]
+}
+
+func isSampleNotification(_ info: [AnyHashable: Any]) -> Bool {
+    info["sample"] as? Bool == true
 }
 
 // MARK: - Settings

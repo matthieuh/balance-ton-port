@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 /// Owns the Rust `Core` for the app's lifetime and publishes what the menu
@@ -21,6 +22,8 @@ final class CoreModel: ObservableObject {
     private var killNoticeAt: Date?
     /// The last Settings save error, cleared by the next successful save.
     @Published private(set) var settingsError: String?
+    /// What macOS allows for notifications; `nil` until first read.
+    @Published private(set) var notificationPermission: NotificationPermission?
 
     private let core = Core()
     private let queue = DispatchQueue(label: "com.matthieuh.balancetonport.core", qos: .utility)
@@ -41,6 +44,34 @@ final class CoreModel: ObservableObject {
             }
         }
         scheduleNextPass(after: 0)
+        // Permission changes happen in System Settings; pick them up when
+        // the user comes back.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                Task { await self.refreshNotificationPermission() }
+            }
+        }
+        Task {
+            await notifier.requestAuthorization()
+            await refreshNotificationPermission()
+        }
+    }
+
+    func refreshNotificationPermission() async {
+        notificationPermission = await notifier.permission()
+    }
+
+    /// Shows the system prompt (first time only), then the new status.
+    func requestNotifications() async {
+        await notifier.requestAuthorization()
+        await refreshNotificationPermission()
+    }
+
+    func sendTestNotification() async {
+        await notifier.postSample()
     }
 
     /// Kills one server by hand. The row leaves the list at once; the next
@@ -160,6 +191,7 @@ final class CoreModel: ObservableObject {
             } else {
                 unnotified = []
             }
+            await refreshNotificationPermission()
             interval = TimeInterval(max(1, result.scanIntervalS))
             lastError = result.configError
         } catch {
