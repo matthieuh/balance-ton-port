@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["crates/btp-core", "crates/btp-cli", "crates/btp-ffi"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
