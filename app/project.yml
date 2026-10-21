@@ -1,0 +1,47 @@
+# Generates BalanceTonPort.xcodeproj (git-ignored):
+#   ../scripts/build-xcframework.sh   # Rust core + Swift bindings first
+#   xcodegen generate                 # from this directory
+name: BalanceTonPort
+options:
+  bundleIdPrefix: com.matthieuh
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+targets:
+  BalanceTonPort:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources
+    dependencies:
+      - framework: Frameworks/BtpCore.xcframework
+        embed: false
+    info:
+      path: Info.plist
+      properties:
+        CFBundleName: Balance ton port
+        CFBundleDisplayName: Balance ton port
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        LSUIElement: true
+        LSMinimumSystemVersion: "14.0"
+        NSHumanReadableCopyright: ""
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.matthieuh.balancetonport
+        PRODUCT_NAME: Balance ton port
+        GENERATE_INFOPLIST_FILE: false
+        ENABLE_HARDENED_RUNTIME: true
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+        SWIFT_TREAT_WARNINGS_AS_ERRORS: true
+schemes:
+  BalanceTonPort:
+    build:
+      targets:
+        BalanceTonPort: all

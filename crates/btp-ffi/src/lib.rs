@@ -167,6 +167,13 @@ impl From<ConfigFfi> for Config {
     }
 }
 
+/// A duration as the menu shows it (`<1 min`, `12 min`, `2 h`, `3 d`), the
+/// same label `btp list` prints.
+#[uniffi::export]
+pub fn duration_label(ms: u64) -> String {
+    format_idle(ms)
+}
+
 #[derive(uniffi::Object)]
 pub struct Core {
     dir: PathBuf,
@@ -214,6 +221,15 @@ impl Core {
     /// on the main thread.
     pub fn tick(&self) -> Result<TickReportFfi, BtpError> {
         let report = lock(&self.watcher).tick(now_ms())?;
+        Ok((&report).into())
+    }
+
+    /// A read-only watch pass for when another process holds the watch lock:
+    /// links new servers and records port activity, but kills nothing and
+    /// marks no alert. `killed` lists the kills the watcher would make;
+    /// ignore it. Blocking; never call it on the main thread.
+    pub fn observe(&self) -> Result<TickReportFfi, BtpError> {
+        let report = lock(&self.watcher).observe(now_ms())?;
         Ok((&report).into())
     }
 
@@ -284,6 +300,13 @@ mod tests {
         assert_eq!(reason_label(&KillReason::Manual), "manual");
     }
 
+    #[test]
+    fn duration_label_matches_the_cli() {
+        assert_eq!(duration_label(30_000), "<1 min");
+        assert_eq!(duration_label(12 * 60_000), "12 min");
+        assert_eq!(duration_label(2 * 3_600_000), "2 h");
+    }
+
     fn assert_send_sync<T: Send + Sync>() {}
 
     #[test]
@@ -345,6 +368,23 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let core = Core::at(d.path().to_path_buf());
         assert!(core.recent_kills().unwrap().is_empty());
+    }
+
+    #[test]
+    fn observe_works_without_the_watch_lock() {
+        let d = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let holder = Core::at(d.path().to_path_buf());
+        let mut c = holder.config();
+        c.claude_config_dirs = vec![sessions.path().display().to_string()];
+        holder.set_config(c).unwrap();
+        assert!(holder.acquire_watch().unwrap());
+        let reader = Core::at(d.path().to_path_buf());
+        assert!(!reader.acquire_watch().unwrap());
+        let report = reader.observe().unwrap();
+        assert!(report.servers.is_empty());
+        assert!(report.alerts.is_empty());
+        assert!(report.killed.is_empty());
     }
 
     #[test]

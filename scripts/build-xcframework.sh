@@ -10,6 +10,10 @@
 # the libproc crate's bindgen step), rustup with the aarch64-apple-darwin and
 # x86_64-apple-darwin targets (`rustup target add ...`). Works from a clean
 # checkout; run from anywhere.
+#
+# Then build the app (XcodeGen generates the git-ignored .xcodeproj):
+#   (cd app && xcodegen generate)
+#   xcodebuild -project app/BalanceTonPort.xcodeproj -scheme BalanceTonPort build
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
