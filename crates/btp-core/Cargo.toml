@@ -8,6 +8,8 @@ license.workspace = true
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 dirs = "5"
+fs4 = { version = "1.1.0", features = ["sync"] }
+serde_json = "1.0.154"
 
 [dev-dependencies]
 tempfile = "3"
