@@ -9,6 +9,9 @@ pub struct Config {
     pub alert_after_s: u64,
     pub kill_grace_s: u64,
     pub scan_interval_s: u64,
+    /// Extra Claude config dirs, watched on top of the ones found
+    /// automatically (`effective_claude_dirs`). Never holds the found ones,
+    /// so a `~/.claude-*` dir created later is still picked up.
     pub claude_config_dirs: Vec<PathBuf>,
     pub exclude_commands: Vec<String>,
 }
@@ -20,7 +23,7 @@ impl Default for Config {
             alert_after_s: 1800,
             kill_grace_s: 5,
             scan_interval_s: 5,
-            claude_config_dirs: crate::sessions::default_config_dirs(),
+            claude_config_dirs: Vec::new(),
             exclude_commands: [
                 "mcp",
                 "argent",
@@ -37,6 +40,24 @@ impl Default for Config {
 }
 
 const CONFIG_FILE: &str = "config.toml";
+
+/// Every Claude config dir whose sessions are read: the ones found
+/// automatically (`~/.claude`, `CLAUDE_CONFIG_DIR`, `~/.claude-*` with a
+/// `sessions/` subdir), then the configured extras; deduplicated, existing
+/// only.
+pub fn effective_claude_dirs(cfg: &Config) -> Vec<PathBuf> {
+    effective_claude_dirs_with(crate::sessions::default_config_dirs(), cfg)
+}
+
+/// `effective_claude_dirs` with the automatic discovery supplied by the
+/// caller (tests pass none, so no real session is read).
+pub fn effective_claude_dirs_with(discovered: Vec<PathBuf>, cfg: &Config) -> Vec<PathBuf> {
+    crate::sessions::merge_config_dirs(
+        discovered,
+        &cfg.claude_config_dirs,
+        dirs::home_dir().as_deref(),
+    )
+}
 
 pub fn data_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("BTP_DATA_DIR") {
@@ -113,6 +134,37 @@ mod tests {
                 "mysqld",
                 "mongod"
             ]
+        );
+    }
+
+    #[test]
+    fn default_has_no_extra_dirs_and_saving_writes_none() {
+        assert!(Config::default().claude_config_dirs.is_empty());
+        let d = tempfile::tempdir().unwrap();
+        save_config(d.path(), &Config::default()).unwrap();
+        let text = std::fs::read_to_string(d.path().join(CONFIG_FILE)).unwrap();
+        assert!(text.contains("claude_config_dirs = []"), "{text}");
+        // Loading and saving again still writes no discovered dir.
+        save_config(d.path(), &load_config(d.path())).unwrap();
+        let again = std::fs::read_to_string(d.path().join(CONFIG_FILE)).unwrap();
+        assert_eq!(text, again);
+    }
+
+    #[test]
+    fn effective_dirs_are_discovered_then_extras() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let c = Config {
+            claude_config_dirs: vec![b.path().to_path_buf(), a.path().to_path_buf()],
+            ..Config::default()
+        };
+        assert_eq!(
+            effective_claude_dirs_with(vec![a.path().to_path_buf()], &c),
+            vec![a.path().to_path_buf(), b.path().to_path_buf()]
+        );
+        assert_eq!(
+            effective_claude_dirs_with(Vec::new(), &Config::default()),
+            Vec::<PathBuf>::new()
         );
     }
 

@@ -4,8 +4,10 @@ use btp_core::watcher::acquire_watch_lock;
 use std::net::TcpListener;
 use std::process::Stdio;
 
-/// A temp data dir whose config points `claude_config_dirs` at an empty dir,
-/// so no real session is ever read.
+/// A temp data dir whose config adds an empty dir as extra Claude config dir.
+/// `btp` runs with `HOME` set to the data dir (no `.claude*` inside) and no
+/// `CLAUDE_CONFIG_DIR`, so automatic discovery finds nothing and no real
+/// session is ever read.
 fn sandbox() -> (tempfile::TempDir, tempfile::TempDir) {
     let data = tempfile::tempdir().unwrap();
     let empty = tempfile::tempdir().unwrap();
@@ -20,6 +22,8 @@ fn sandbox() -> (tempfile::TempDir, tempfile::TempDir) {
 fn btp(data: &tempfile::TempDir) -> Command {
     let mut c = Command::cargo_bin("btp").unwrap();
     c.env("BTP_DATA_DIR", data.path());
+    c.env("HOME", data.path());
+    c.env_remove("CLAUDE_CONFIG_DIR");
     c
 }
 
@@ -33,6 +37,8 @@ fn config_set_then_get() {
     let out = btp(&data).args(["config", "get"]).assert().success();
     let text = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     assert!(text.contains("alert_after_s = 42"), "{text}");
+    // Discovered dirs are never written; the read list is a comment.
+    assert!(text.contains("# Session dirs read"), "{text}");
     // bare `config` behaves like `config get`
     btp(&data).arg("config").assert().success();
 }

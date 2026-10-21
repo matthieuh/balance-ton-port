@@ -6,11 +6,11 @@
 //! is ever tracked, and only tracked servers are ever signalled, each signal
 //! guarded by a fresh start-time check (a pid can be reused at any moment).
 
-use crate::config::{load_config, Config};
+use crate::config::{effective_claude_dirs_with, load_config, Config};
 use crate::decide::{decide, touch};
 use crate::model::{Action, KillReason, KillTarget, Observation, ServerKey, TrackedServer};
 use crate::platform::{ancestry, format_proc_start, Listener, Platform, ProcInfo};
-use crate::sessions::{read_sessions, session_idle_ms, ClaudeSession};
+use crate::sessions::{default_config_dirs, read_sessions, session_idle_ms, ClaudeSession};
 use crate::state::{append_kill_log, with_state, KillRecord, State};
 use crate::worktree::worktree_root;
 use fs4::{FileExt, TryLockError};
@@ -251,11 +251,24 @@ impl Scan {
 pub struct Watcher<P: Platform> {
     platform: P,
     data_dir: PathBuf,
+    /// Finds the Claude config dirs on its own; the config's dirs are extras.
+    discover: fn() -> Vec<PathBuf>,
 }
 
 impl<P: Platform> Watcher<P> {
     pub fn new(platform: P, data_dir: PathBuf) -> Self {
-        Watcher { platform, data_dir }
+        Watcher {
+            platform,
+            data_dir,
+            discover: default_config_dirs,
+        }
+    }
+
+    /// Replaces the automatic discovery of Claude config dirs (tests pass
+    /// `Vec::new` so only the configured extras are read).
+    pub fn with_discovery(mut self, discover: fn() -> Vec<PathBuf>) -> Self {
+        self.discover = discover;
+        self
     }
 
     pub fn platform(&self) -> &P {
@@ -325,7 +338,7 @@ impl<P: Platform> Watcher<P> {
 
     fn scan(&self) -> Scan {
         let cfg = load_config(&self.data_dir);
-        let live = read_sessions(&cfg.claude_config_dirs)
+        let live = read_sessions(&effective_claude_dirs_with((self.discover)(), &cfg))
             .into_iter()
             .filter(|s| self.process_matches(s.pid, &s.proc_start))
             .map(|s| LiveSession {
@@ -660,7 +673,7 @@ mod tests {
         );
         p.add_listener(30, 3000);
         write_session(claude.path(), 20, "sess-a", &wt, START + 20 * SEC);
-        let w = Watcher::new(p, data.path().to_path_buf());
+        let w = Watcher::new(p, data.path().to_path_buf()).with_discovery(Vec::new);
         Fx {
             data,
             claude,

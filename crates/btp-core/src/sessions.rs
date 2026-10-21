@@ -106,6 +106,28 @@ pub fn config_dirs_from(home: &Path, claude_config_dir: Option<&str>) -> Vec<Pat
     out
 }
 
+/// `discovered` followed by `extras` (tilde-expanded against `home`),
+/// deduplicated, existing only.
+pub fn merge_config_dirs(
+    discovered: Vec<PathBuf>,
+    extras: &[PathBuf],
+    home: Option<&Path>,
+) -> Vec<PathBuf> {
+    let expanded = extras.iter().map(|p| match (p.to_str(), home) {
+        (Some(raw), Some(home)) => expand_tilde(raw, home),
+        _ => p.clone(),
+    });
+    let mut out: Vec<PathBuf> = Vec::new();
+    for c in discovered.into_iter().chain(expanded) {
+        if c.is_dir() && !out.contains(&c) {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The automatically found Claude config dirs (see `config_dirs_from`) for
+/// the current user and `CLAUDE_CONFIG_DIR`.
 pub fn default_config_dirs() -> Vec<PathBuf> {
     let Some(home) = dirs::home_dir() else {
         return Vec::new();
@@ -132,6 +154,37 @@ mod tests {
         }
         let p = d.path().to_path_buf();
         (d, vec![p])
+    }
+
+    #[test]
+    fn merge_puts_discovered_first_then_extras_deduplicated() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        for d in [".claude", ".claude-perso", "extra", "other"] {
+            std::fs::create_dir_all(h.join(d)).unwrap();
+        }
+        let discovered = vec![h.join(".claude"), h.join(".claude-perso")];
+        let extras = vec![
+            h.join("extra"),
+            PathBuf::from("~/.claude"), // already discovered
+            h.join("extra"),            // listed twice
+            h.join("missing"),          // does not exist
+            PathBuf::from("~/other"),
+        ];
+        assert_eq!(
+            merge_config_dirs(discovered, &extras, Some(h)),
+            vec![
+                h.join(".claude"),
+                h.join(".claude-perso"),
+                h.join("extra"),
+                h.join("other"),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_with_nothing_is_empty() {
+        assert!(merge_config_dirs(Vec::new(), &[], None).is_empty());
     }
 
     #[test]

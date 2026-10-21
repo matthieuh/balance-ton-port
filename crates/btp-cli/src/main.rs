@@ -2,7 +2,7 @@
 //! sessions. Exit codes: 0 success, 1 user error / nothing matched / lock
 //! held, 2 internal error.
 
-use btp_core::config::{data_dir, load_config, save_config};
+use btp_core::config::{data_dir, effective_claude_dirs, load_config, save_config};
 use btp_core::display::{format_idle, server_state as state_label};
 use btp_core::model::{KillReason, KillTarget};
 use btp_core::platform::MacOs;
@@ -192,6 +192,11 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
                     let text = toml::to_string_pretty(&cfg)
                         .map_err(|e| Failure::Internal(e.to_string()))?;
                     print!("{text}");
+                    // `claude_config_dirs` lists extras only; show what is read.
+                    println!("# Session dirs read (found automatically, then extras):");
+                    for d in effective_claude_dirs(&cfg) {
+                        println!("#   {}", d.display());
+                    }
                 }
                 ConfigCmd::Set { key, value } => {
                     cfg.set(&key, &value).map_err(Failure::User)?;

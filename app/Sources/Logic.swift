@@ -63,11 +63,11 @@ func shortCommand(_ command: String) -> String {
     return words.prefix(2).joined(separator: " ")
 }
 
-/// "`astro dev` on port 4322 (worktree web) hasn't been used for 30 min."
+/// "astro dev on port 4322 (worktree web) hasn't been used for 30 min."
 /// Minutes are rounded down.
 func notificationBody(_ s: ServerViewFfi) -> String {
     let minutes = s.idleMs / 60_000
-    return "`\(shortCommand(s.command))` on port \(s.port) (worktree \(s.worktreeName)) hasn't been used for \(minutes) min."
+    return "\(shortCommand(s.command)) on port \(s.port) (worktree \(s.worktreeName)) hasn't been used for \(minutes) min."
 }
 
 /// What a notification carries to find its server again. The start time is a
@@ -158,6 +158,25 @@ struct SettingsDraft: Equatable, Sendable {
     }
 
     var isValid: Bool { validationErrors.isEmpty }
+}
+
+/// Decides when the Settings form saves: only when the draft differs from
+/// what was last loaded or saved, so loading (or reloading on reopen) never
+/// writes the file; only a user edit does.
+struct SettingsSaveGate: Sendable {
+    private var synced: SettingsDraft?
+
+    /// The draft just read from disk.
+    mutating func loaded(_ draft: SettingsDraft) {
+        synced = draft
+    }
+
+    /// True when `draft` is a valid edit to save; it then counts as synced.
+    mutating func shouldSave(_ draft: SettingsDraft) -> Bool {
+        guard let synced, draft != synced, draft.isValid else { return false }
+        self.synced = draft
+        return true
+    }
 }
 
 /// `list` with `entry` appended, trimmed. `nil` when the entry is empty or

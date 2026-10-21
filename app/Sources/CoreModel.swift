@@ -76,11 +76,14 @@ final class CoreModel: ObservableObject {
         }
     }
 
-    /// The config as saved on disk (defaults when there is no file).
-    func loadConfig() async -> ConfigFfi {
+    /// The config as saved on disk (defaults when there is no file), whose
+    /// `claudeConfigDirs` are the extras, plus the dirs found automatically.
+    func loadConfig() async -> (config: ConfigFfi, discovered: [String]) {
         let core = self.core
         return await withCheckedContinuation { continuation in
-            queue.async { continuation.resume(returning: core.config()) }
+            queue.async {
+                continuation.resume(returning: (core.config(), core.discoveredClaudeDirs()))
+            }
         }
     }
 

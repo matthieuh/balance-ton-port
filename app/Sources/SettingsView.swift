@@ -1,12 +1,16 @@
+import AppKit
 import ServiceManagement
 import SwiftUI
 import UserNotifications
 
 /// The Settings window: the four delays, the two lists, launch at login.
-/// Every valid change is saved at once through `CoreModel.saveConfig`.
+/// Every valid user edit is saved at once through `CoreModel.saveConfig`;
+/// loading the form never saves (`SettingsSaveGate`).
 struct SettingsView: View {
     @EnvironmentObject private var model: CoreModel
     @State private var draft: SettingsDraft?
+    @State private var discovered: [String] = []
+    @State private var gate = SettingsSaveGate()
     @State private var notificationsDenied = false
 
     var body: some View {
@@ -14,15 +18,27 @@ struct SettingsView: View {
             if let binding = Binding($draft) {
                 DelaysSection(draft: binding)
                 Section {
+                    if discovered.isEmpty {
+                        Text("None").foregroundStyle(.secondary)
+                    }
+                    ForEach(discovered, id: \.self) { dir in
+                        Text(dir).lineLimit(1).truncationMode(.middle)
+                    }
+                } header: {
+                    Text("Claude config directories: found automatically")
+                } footer: {
+                    Text("~/.claude, CLAUDE_CONFIG_DIR and every ~/.claude-* with a sessions/ folder, re-checked every scan.")
+                }
+                Section {
                     ListEditor(
                         items: binding.claudeConfigDirs,
-                        placeholder: "~/.claude",
-                        emptyText: "None: no session is read"
+                        placeholder: "~/work/.claude",
+                        emptyText: "None"
                     )
                 } header: {
-                    Text("Claude config directories")
+                    Text("Also watch")
                 } footer: {
-                    Text("Where Claude Code keeps its sessions/ folder.")
+                    Text("Other Claude config directories (each holding a sessions/ folder).")
                 }
                 Section {
                     ListEditor(
@@ -54,13 +70,16 @@ struct SettingsView: View {
         .frame(width: 460)
         .frame(minHeight: 520)
         .task {
-            draft = SettingsDraft(await model.loadConfig())
+            let loaded = await model.loadConfig()
+            let fresh = SettingsDraft(loaded.config)
+            discovered = loaded.discovered
+            gate.loaded(fresh)
+            draft = fresh
             let settings = await UNUserNotificationCenter.current().notificationSettings()
             notificationsDenied = settings.authorizationStatus == .denied
         }
-        .onChange(of: draft) { old, new in
-            // The first load is not a change; saving it would write defaults.
-            guard let old, let new, old != new, new.isValid else { return }
+        .onChange(of: draft) { _, new in
+            guard let new, gate.shouldSave(new) else { return }
             model.saveConfig(new.ffi)
         }
     }
@@ -156,6 +175,11 @@ private struct LaunchAtLoginSection: View {
             }
         }
         .onAppear { status = SMAppService.mainApp.status }
+        // Approving in System Settings happens outside the app; pick it up
+        // when the user comes back.
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            status = SMAppService.mainApp.status
+        }
     }
 
     private func setEnabled(_ on: Bool) {

@@ -21,14 +21,14 @@ final class NotificationTextTests: XCTestCase {
         let s = server(command: "astro dev", idleMs: 30 * 60_000 + 59_999)
         XCTAssertEqual(
             notificationBody(s),
-            "`astro dev` on port 4322 (worktree web) hasn't been used for 30 min."
+            "astro dev on port 4322 (worktree web) hasn't been used for 30 min."
         )
     }
 
     func testBodyUnderOneMinute() {
         XCTAssertEqual(
             notificationBody(server(idleMs: 59_000)),
-            "`bun run dev` on port 4322 (worktree web) hasn't been used for 0 min."
+            "bun run dev on port 4322 (worktree web) hasn't been used for 0 min."
         )
     }
 
@@ -107,6 +107,27 @@ final class SettingsDraftTests: XCTestCase {
         XCTAssertTrue(d.isValid)
     }
 
+    func testSaveGateIgnoresLoadsAndReloads() {
+        var gate = SettingsSaveGate()
+        let loaded = SettingsDraft(config)
+        XCTAssertFalse(gate.shouldSave(loaded), "nothing loaded yet")
+        gate.loaded(loaded)
+        XCTAssertFalse(gate.shouldSave(loaded), "the load itself is not an edit")
+
+        var edited = loaded
+        edited.alertAfterMin = 1
+        XCTAssertTrue(gate.shouldSave(edited))
+        XCTAssertFalse(gate.shouldSave(edited), "already saved")
+
+        // Reopen: the form reloads what is on disk; that is not a save.
+        gate.loaded(edited)
+        XCTAssertFalse(gate.shouldSave(edited))
+
+        var invalid = edited
+        invalid.scanIntervalS = 0
+        XCTAssertFalse(gate.shouldSave(invalid), "invalid drafts never save")
+    }
+
     func testAddingEntry() {
         XCTAssertEqual(addingEntry("  redis-server ", to: ["mcp"]), ["mcp", "redis-server"])
         XCTAssertNil(addingEntry("   ", to: ["mcp"]))
@@ -157,7 +178,9 @@ final class ConfigSaveTests: XCTestCase {
 
     func testDelayChangeIsSavedAndVisibleToCli() throws {
         let core = Core()
+        let discovered = core.discoveredClaudeDirs()
         var draft = SettingsDraft(core.config())
+        XCTAssertTrue(draft.claudeConfigDirs.isEmpty, "extras only, discovered dirs stay out")
         draft.alertAfterMin = 1
         draft.excludeCommands = addingEntry("vite", to: draft.excludeCommands) ?? draft.excludeCommands
         try core.setConfig(c: draft.ffi)
@@ -187,5 +210,10 @@ final class ConfigSaveTests: XCTestCase {
         XCTAssertEqual(process.terminationStatus, 0)
         XCTAssertTrue(output.contains("alert_after_s = 60"), output)
         XCTAssertTrue(output.contains("\"vite\""), output)
+        XCTAssertTrue(output.contains("claude_config_dirs = []"), output)
+        let saved = try String(contentsOf: dir.appendingPathComponent("config.toml"), encoding: .utf8)
+        for d in discovered {
+            XCTAssertFalse(saved.contains(d), "discovered dir \(d) written to config.toml")
+        }
     }
 }

@@ -8,6 +8,7 @@ use btp_core::config::{data_dir, load_config, save_config, Config};
 use btp_core::display::{format_idle, server_state};
 use btp_core::model::{KillReason, KillTarget, ServerKey};
 use btp_core::platform::MacOs;
+use btp_core::sessions::default_config_dirs;
 use btp_core::state::{with_state, KillRecord};
 use btp_core::watcher::{acquire_watch_lock, now_ms, ServerView, TickReport, WatchLock, Watcher};
 use std::io;
@@ -177,6 +178,8 @@ pub fn duration_label(ms: u64) -> String {
 #[derive(uniffi::Object)]
 pub struct Core {
     dir: PathBuf,
+    /// Finds the Claude config dirs on its own (`default_config_dirs`).
+    discover: fn() -> Vec<PathBuf>,
     watcher: Mutex<Watcher<MacOs>>,
     /// Held from a successful `acquire_watch` until the object is dropped.
     watch_lock: Mutex<Option<WatchLock>>,
@@ -189,10 +192,11 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Core {
-    fn at(dir: PathBuf) -> Self {
+    fn at(dir: PathBuf, discover: fn() -> Vec<PathBuf>) -> Self {
         Core {
-            watcher: Mutex::new(Watcher::new(MacOs, dir.clone())),
+            watcher: Mutex::new(Watcher::new(MacOs, dir.clone()).with_discovery(discover)),
             dir,
+            discover,
             watch_lock: Mutex::new(None),
         }
     }
@@ -214,7 +218,7 @@ impl Core {
     /// `~/Library/Application Support/balance-ton-port`).
     #[uniffi::constructor]
     pub fn new() -> Self {
-        Core::at(data_dir())
+        Core::at(data_dir(), default_config_dirs)
     }
 
     /// One watch pass (link, observe, kill, alert). Blocking; never call it
@@ -248,6 +252,16 @@ impl Core {
         Ok(lock(&self.watcher).keep(ServerKey { pid, start_time })?)
     }
 
+    /// The Claude config dirs found automatically, read only. The config's
+    /// `claude_config_dirs` are extras watched on top of these.
+    pub fn discovered_claude_dirs(&self) -> Vec<String> {
+        (self.discover)()
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect()
+    }
+
+    /// The saved config; `claude_config_dirs` holds only the extras.
     pub fn config(&self) -> ConfigFfi {
         load_config(&self.dir).into()
     }
@@ -353,7 +367,7 @@ mod tests {
     #[test]
     fn config_roundtrips_through_disk() {
         let d = tempfile::tempdir().unwrap();
-        let core = Core::at(d.path().to_path_buf());
+        let core = Core::at(d.path().to_path_buf(), Vec::new);
         let mut c = core.config();
         assert_eq!(c.dead_session_idle_s, 1200);
         c.alert_after_s = 60;
@@ -364,9 +378,26 @@ mod tests {
     }
 
     #[test]
+    fn saving_never_writes_discovered_dirs() {
+        fn found() -> Vec<PathBuf> {
+            vec![PathBuf::from("/tmp/found-claude")]
+        }
+        let d = tempfile::tempdir().unwrap();
+        let core = Core::at(d.path().to_path_buf(), found);
+        assert_eq!(core.discovered_claude_dirs(), vec!["/tmp/found-claude"]);
+        let mut c = core.config();
+        assert!(c.claude_config_dirs.is_empty());
+        c.alert_after_s = 60;
+        core.set_config(c).unwrap();
+        let text = std::fs::read_to_string(d.path().join("config.toml")).unwrap();
+        assert!(!text.contains("found-claude"), "{text}");
+        assert!(text.contains("claude_config_dirs = []"), "{text}");
+    }
+
+    #[test]
     fn recent_kills_empty_on_fresh_dir() {
         let d = tempfile::tempdir().unwrap();
-        let core = Core::at(d.path().to_path_buf());
+        let core = Core::at(d.path().to_path_buf(), Vec::new);
         assert!(core.recent_kills().unwrap().is_empty());
     }
 
@@ -374,12 +405,12 @@ mod tests {
     fn observe_works_without_the_watch_lock() {
         let d = tempfile::tempdir().unwrap();
         let sessions = tempfile::tempdir().unwrap();
-        let holder = Core::at(d.path().to_path_buf());
+        let holder = Core::at(d.path().to_path_buf(), Vec::new);
         let mut c = holder.config();
         c.claude_config_dirs = vec![sessions.path().display().to_string()];
         holder.set_config(c).unwrap();
         assert!(holder.acquire_watch().unwrap());
-        let reader = Core::at(d.path().to_path_buf());
+        let reader = Core::at(d.path().to_path_buf(), Vec::new);
         assert!(!reader.acquire_watch().unwrap());
         let report = reader.observe().unwrap();
         assert!(report.servers.is_empty());
@@ -390,8 +421,8 @@ mod tests {
     #[test]
     fn acquire_watch_is_exclusive_and_held_until_drop() {
         let d = tempfile::tempdir().unwrap();
-        let a = Core::at(d.path().to_path_buf());
-        let b = Core::at(d.path().to_path_buf());
+        let a = Core::at(d.path().to_path_buf(), Vec::new);
+        let b = Core::at(d.path().to_path_buf(), Vec::new);
         assert!(a.acquire_watch().unwrap());
         assert!(a.acquire_watch().unwrap(), "idempotent for the holder");
         assert!(!b.acquire_watch().unwrap());
