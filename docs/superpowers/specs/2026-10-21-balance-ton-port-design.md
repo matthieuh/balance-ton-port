@@ -1,7 +1,7 @@
 # Balance ton port: design
 
 Date: 2026-10-21
-Status: agreed in brainstorming, builder check done, pending user review
+Status: approved by the user on 2026-10-21
 Repo: `github.com/matthieuh/balance-ton-port` (new, open source)
 
 ## 1. Intent
@@ -86,6 +86,8 @@ Watched Claude Code config directories: `~/.claude` and every `CLAUDE_CONFIG_DIR
    > [Kill] [Keep]
 
    [Keep] = no more alerts for that server until it restarts (*my call*).
+
+**All delays are configurable** (user decision): the dead-session idle delay (default 20 min), the alert delay (default 30 min), the SIGKILL delay (default 5 s) and the scan interval (default 5 s). They live in one config file shared by the app and `btp` (`~/Library/Application Support/balance-ton-port/config.toml`, *my call*), editable from the app's Settings and with `btp config`.
 
 Definitions (*my calls*):
 - **Session idle**: the session's transcript file has not been written for the threshold.
