@@ -12,6 +12,9 @@ struct SettingsView: View {
     @State private var discovered: [String] = []
     @State private var gate = SettingsSaveGate()
     @State private var notificationsDenied = false
+    /// Set when `config.toml` cannot be parsed: no form is shown, so nothing
+    /// overwrites the user's file with defaults.
+    @State private var loadError: String?
 
     var body: some View {
         Form {
@@ -47,13 +50,29 @@ struct SettingsView: View {
                         emptyText: "None"
                     )
                 } header: {
-                    Text("Never kill commands containing")
+                    Text("Never track or kill commands containing")
+                } footer: {
+                    Text("Case-insensitive, anywhere in the command line, paths included.")
+                }
+                Section {
+                    PortListEditor(ports: binding.excludePorts)
+                } header: {
+                    Text("Never track or kill ports")
+                } footer: {
+                    Text("A server listening on one of these, itself or through a child process.")
                 }
                 ForEach(binding.wrappedValue.validationErrors, id: \.self) { error in
                     Text(error).foregroundStyle(.red)
                 }
                 if let error = model.settingsError {
                     Text("Could not save: \(error)").foregroundStyle(.red)
+                }
+            } else if let loadError {
+                Section("Configuration") {
+                    Text(verbatim: "Could not read config.toml: \(loadError)")
+                        .foregroundStyle(.red)
+                    Text("Fix or delete the file; the watcher keeps its last valid settings meanwhile.")
+                        .foregroundStyle(.secondary)
                 }
             } else {
                 ProgressView()
@@ -63,6 +82,11 @@ struct SettingsView: View {
                 Section("Notifications") {
                     Text("Notifications are off for Balance ton port in System Settings. Idle servers still show in the menu.")
                         .foregroundStyle(.secondary)
+                    Button("Open Notification Settings") {
+                        if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=com.matthieuh.balancetonport") {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }
                 }
             }
         }
@@ -70,11 +94,16 @@ struct SettingsView: View {
         .frame(width: 460)
         .frame(minHeight: 520)
         .task {
-            let loaded = await model.loadConfig()
-            let fresh = SettingsDraft(loaded.config)
-            discovered = loaded.discovered
-            gate.loaded(fresh)
-            draft = fresh
+            do {
+                let loaded = try await model.loadConfig()
+                let fresh = SettingsDraft(loaded.config)
+                discovered = loaded.discovered
+                gate.loaded(fresh)
+                draft = fresh
+                loadError = nil
+            } catch {
+                loadError = error.localizedDescription
+            }
             let settings = await UNUserNotificationCenter.current().notificationSettings()
             notificationsDenied = settings.authorizationStatus == .denied
         }
@@ -144,6 +173,45 @@ private struct ListEditor: View {
         guard let next = addingEntry(newItem, to: items) else { return }
         items = next
         newItem = ""
+    }
+}
+
+/// The excluded ports, with a remove button per row and a field to add one.
+private struct PortListEditor: View {
+    @Binding var ports: [UInt16]
+    @State private var newPort = ""
+
+    var body: some View {
+        if ports.isEmpty {
+            Text("None").foregroundStyle(.secondary)
+        }
+        ForEach(ports, id: \.self) { port in
+            HStack {
+                Text(verbatim: String(port)).monospacedDigit()
+                Spacer()
+                Button {
+                    ports.removeAll { $0 == port }
+                } label: {
+                    Image(systemName: "minus.circle.fill")
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                .help("Remove")
+            }
+        }
+        HStack {
+            TextField("Add", text: $newPort, prompt: Text(verbatim: "5432"))
+                .labelsHidden()
+                .onSubmit(add)
+            Button("Add", action: add)
+                .disabled(addingPort(newPort, to: ports) == nil)
+        }
+    }
+
+    private func add() {
+        guard let next = addingPort(newPort, to: ports) else { return }
+        ports = next
+        newPort = ""
     }
 }
 

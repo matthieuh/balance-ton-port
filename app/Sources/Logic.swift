@@ -26,8 +26,22 @@ func stateLabel(_ s: ServerViewFfi) -> String {
     return s.state
 }
 
+/// The menu panel's width, its padding, and the indent of a row's lines 2
+/// and 3 (past the status dot). A row's third line must fit in
+/// `rowTextWidth` at the callout font (tested).
+let menuWidth: CGFloat = 480
+let menuPadding: CGFloat = 12
+let rowIndent: CGFloat = 16
+var rowTextWidth: CGFloat { menuWidth - 2 * menuPadding - rowIndent }
+
+/// `:8081`. Always the bare digits: a port is not a quantity, so no
+/// locale grouping (SwiftUI's `Text("\(port)")` would show `8 081`).
+func portLabel(_ port: UInt16) -> String {
+    ":" + String(port)
+}
+
 /// Session names longer than this are cut with an ellipsis in the menu.
-let sessionNameMaxLength = 24
+let sessionNameMaxLength = 20
 
 /// `name`, or its first characters plus "\u{2026}" when longer than
 /// `sessionNameMaxLength` (the result is never longer than that).
@@ -37,17 +51,21 @@ func truncatedSessionName(_ name: String) -> String {
 }
 
 /// The row's third line. Alive session:
-/// `Claude session "revva-b8" · active · started 4 min ago`; dead session:
-/// `Session ended · idle 12 min · kill in 8 min` (`kill soon` under a minute).
-func sessionLine(_ s: ServerViewFfi) -> String {
+/// `Claude session "revva-b8" · active · started 4 min ago`; due an alert
+/// that could not be shown (`notificationsOff`):
+/// `Claude session "revva-b8" · idle 31 min, notifications off`; dead
+/// session: `Session ended · idle 12 min · kill in 8 min` (`kill soon` under
+/// a minute).
+func sessionLine(_ s: ServerViewFfi, notificationsOff: Bool = false) -> String {
     var parts: [String]
     if s.sessionAlive {
-        let activity = s.state == "idle" ? "idle \(durationLabel(ms: s.idleMs))" : "active"
-        parts = [
-            "Claude session \"\(truncatedSessionName(s.sessionName))\"",
-            activity,
-            s.startedLabel,
-        ]
+        let name = "Claude session \"\(truncatedSessionName(s.sessionName))\""
+        let idle = "idle \(durationLabel(ms: s.idleMs))"
+        if notificationsOff {
+            parts = [name, "\(idle), notifications off"]
+        } else {
+            parts = [name, s.state == "idle" ? idle : "active", s.startedLabel]
+        }
     } else {
         parts = ["Session ended", "idle \(durationLabel(ms: s.idleMs))"]
     }
@@ -77,33 +95,12 @@ func relativeTime(atMs: UInt64, now: Date = Date()) -> String {
 
 // MARK: - Notifications
 
-/// Commands longer than this are shortened in notifications.
-let shortCommandMaxLength = 40
-
-/// A command line short enough for a notification. Kept as is up to
-/// `shortCommandMaxLength` characters; otherwise every path-like word is cut
-/// to its basename (`/x/.bun/bin/bun /repo/node_modules/.bin/astro dev`
-/// becomes `bun astro dev`), and if that is still too long, only the first
-/// word plus the next one remain (`bun astro`).
-func shortCommand(_ command: String) -> String {
-    let trimmed = command.trimmingCharacters(in: .whitespaces)
-    if trimmed.count <= shortCommandMaxLength { return trimmed }
-    let words = trimmed.split(separator: " ", omittingEmptySubsequences: true).map { word -> String in
-        let w = String(word)
-        guard w.contains("/") else { return w }
-        let base = (w as NSString).lastPathComponent
-        return base.isEmpty ? w : base
-    }
-    let basenamed = words.joined(separator: " ")
-    if basenamed.count <= shortCommandMaxLength { return basenamed }
-    return words.prefix(2).joined(separator: " ")
-}
-
-/// "astro dev on port 4322 (worktree web) hasn't been used for 30 min."
-/// Minutes are rounded down.
+/// "Astro on port 4322 (revva \u{203A} web) hasn't been used for 30 min."
+/// Only the tool label, the port and the location: the raw command line
+/// (flags, tokens) never reaches the lock screen. Minutes are rounded down.
 func notificationBody(_ s: ServerViewFfi) -> String {
     let minutes = s.idleMs / 60_000
-    return "\(shortCommand(s.command)) on port \(s.port) (worktree \(s.worktreeName)) hasn't been used for \(minutes) min."
+    return "\(s.toolLabel) on port \(String(s.port)) (\(s.locationLabel)) hasn't been used for \(minutes) min."
 }
 
 /// What a notification carries to find its server again. The start time is a
@@ -141,6 +138,7 @@ struct SettingsDraft: Equatable, Sendable {
     var scanIntervalS: UInt64
     var claudeConfigDirs: [String]
     var excludeCommands: [String]
+    var excludePorts: [UInt16]
 
     init(_ c: ConfigFfi) {
         deadSessionIdleS = c.deadSessionIdleS
@@ -149,6 +147,7 @@ struct SettingsDraft: Equatable, Sendable {
         scanIntervalS = c.scanIntervalS
         claudeConfigDirs = c.claudeConfigDirs
         excludeCommands = c.excludeCommands
+        excludePorts = c.excludePorts
     }
 
     var ffi: ConfigFfi {
@@ -158,7 +157,8 @@ struct SettingsDraft: Equatable, Sendable {
             killGraceS: killGraceS,
             scanIntervalS: scanIntervalS,
             claudeConfigDirs: claudeConfigDirs,
-            excludeCommands: excludeCommands
+            excludeCommands: excludeCommands,
+            excludePorts: excludePorts
         )
     }
 
@@ -221,4 +221,12 @@ func addingEntry(_ entry: String, to list: [String]) -> [String]? {
     let value = entry.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !value.isEmpty, !list.contains(value) else { return nil }
     return list + [value]
+}
+
+/// `ports` with the port typed in `entry` appended. `nil` when the entry is
+/// not a port number (1 to 65535) or is already in the list.
+func addingPort(_ entry: String, to ports: [UInt16]) -> [UInt16]? {
+    let text = entry.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let port = UInt16(text), port > 0, !ports.contains(port) else { return nil }
+    return ports + [port]
 }

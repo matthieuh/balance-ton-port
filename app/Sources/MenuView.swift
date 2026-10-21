@@ -25,10 +25,15 @@ struct MenuView: View {
                     .foregroundStyle(.secondary)
             }
             if let error = model.lastError {
-                Text(error)
+                Text(verbatim: error)
                     .font(.caption)
                     .foregroundStyle(.red)
-                    .lineLimit(2)
+                    .lineLimit(3)
+            }
+            if let notice = model.killNotice {
+                Text(verbatim: notice)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Divider()
@@ -40,7 +45,10 @@ struct MenuView: View {
                 VStack(alignment: .leading, spacing: 6) {
                     ForEach(Array(model.servers.enumerated()), id: \.element.id) { index, server in
                         if index > 0 { Divider() }
-                        ServerRow(server: server) { model.kill(server) }
+                        ServerRow(
+                            server: server,
+                            notificationsOff: model.unnotified.contains(server.id)
+                        ) { model.kill(server) }
                     }
                 }
             }
@@ -57,7 +65,7 @@ struct MenuView: View {
                 Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 2) {
                     ForEach(Array(model.recentKills.prefix(5).enumerated()), id: \.offset) { _, kill in
                         GridRow {
-                            Text(String(kill.port)).monospacedDigit()
+                            Text(verbatim: String(kill.port)).monospacedDigit()
                             Text(kill.toolLabel).lineLimit(1)
                             Text(kill.reason).lineLimit(1)
                             Text(relativeTime(atMs: kill.atMs))
@@ -81,8 +89,8 @@ struct MenuView: View {
             }
             .buttonStyle(.borderless)
         }
-        .padding(12)
-        .frame(minWidth: 380, alignment: .leading)
+        .padding(menuPadding)
+        .frame(width: menuWidth, alignment: .leading)
     }
 }
 
@@ -91,10 +99,12 @@ struct MenuView: View {
 /// and worktree path.
 private struct ServerRow: View {
     let server: ServerViewFfi
+    /// Its alert is due but notifications are not allowed.
+    let notificationsOff: Bool
     let onKill: () -> Void
 
     /// Lines 2 and 3 start under the tool label, past the status dot.
-    private let indent: CGFloat = 16
+    private let indent = rowIndent
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -102,23 +112,23 @@ private struct ServerRow: View {
                 Text(server.sessionAlive ? "\u{25CF}" : "\u{25CB}")
                     .foregroundStyle(server.sessionAlive ? Color.green : Color.secondary)
                     .frame(width: indent, alignment: .leading)
-                Text(server.toolLabel)
+                Text(verbatim: server.toolLabel)
                     .fontWeight(.semibold)
                     .lineLimit(1)
                 Spacer(minLength: 12)
-                Text(":\(server.port)")
+                Text(verbatim: portLabel(server.port))
                     .monospacedDigit()
                     .padding(.trailing, 10)
                 Button("Kill", action: onKill)
                     .controlSize(.small)
             }
             .font(.body)
-            Text(server.locationLabel)
+            Text(verbatim: server.locationLabel)
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .foregroundStyle(.secondary)
                 .padding(.leading, indent)
-            Text(sessionLine(server))
+            Text(verbatim: sessionLine(server, notificationsOff: notificationsOff))
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .foregroundStyle(.secondary)

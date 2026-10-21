@@ -1,8 +1,10 @@
+import AppKit
 import Foundation
 import XCTest
 
 private func server(
     command: String = "bun run dev",
+    toolLabel: String = "Bun dev",
     port: UInt16 = 4322,
     worktree: String = "web",
     sessionName: String = "revva-b8",
@@ -13,7 +15,7 @@ private func server(
 ) -> ServerViewFfi {
     ServerViewFfi(
         pid: 4242, startTime: 1_700_000_000_123, port: port, command: command,
-        toolLabel: "Bun dev", worktree: "/Users/me/trees/\(worktree)", worktreeName: worktree,
+        toolLabel: toolLabel, worktree: "/Users/me/trees/\(worktree)", worktreeName: worktree,
         locationLabel: "revva \u{203A} \(worktree)", sessionName: sessionName,
         startedMs: 1_700_000_000, startedLabel: "started 4 min ago",
         sessionAlive: sessionAlive, idleMs: idleMs, killInMs: killInMs, state: state
@@ -22,35 +24,25 @@ private func server(
 
 final class NotificationTextTests: XCTestCase {
     func testBodyRoundsMinutesDown() {
-        let s = server(command: "astro dev", idleMs: 30 * 60_000 + 59_999)
+        let s = server(command: "astro dev", toolLabel: "Astro", idleMs: 30 * 60_000 + 59_999)
         XCTAssertEqual(
             notificationBody(s),
-            "astro dev on port 4322 (worktree web) hasn't been used for 30 min."
+            "Astro on port 4322 (revva \u{203A} web) hasn't been used for 30 min."
         )
     }
 
     func testBodyUnderOneMinute() {
         XCTAssertEqual(
             notificationBody(server(idleMs: 59_000)),
-            "bun run dev on port 4322 (worktree web) hasn't been used for 0 min."
+            "Bun dev on port 4322 (revva \u{203A} web) hasn't been used for 0 min."
         )
     }
 
-    func testShortCommandKeepsShortOnes() {
-        XCTAssertEqual(shortCommand("bun run dev"), "bun run dev")
-        XCTAssertEqual(shortCommand("  /usr/bin/node x.js "), "/usr/bin/node x.js")
-    }
-
-    func testShortCommandBasenamesPaths() {
-        XCTAssertEqual(
-            shortCommand("/Users/me/.bun/bin/bun /Users/me/repo/node_modules/.bin/astro dev"),
-            "bun astro dev"
-        )
-    }
-
-    func testShortCommandFallsBackToFirstTwoWords() {
-        let long = "/opt/homebrew/bin/node /repo/node_modules/next/dist/bin/next dev --turbopack --port 3000 --hostname 0.0.0.0"
-        XCTAssertEqual(shortCommand(long), "node next")
+    func testBodyNeverCarriesTheCommandLine() {
+        let s = server(command: "node server.js --token=abc123", toolLabel: "Node server.js", port: 8081)
+        let body = notificationBody(s)
+        XCTAssertFalse(body.contains("abc123"), body)
+        XCTAssertTrue(body.hasPrefix("Node server.js on port 8081 "), body)
     }
 
     func testUserInfoRoundTrip() {
@@ -67,7 +59,7 @@ final class NotificationTextTests: XCTestCase {
 final class SettingsDraftTests: XCTestCase {
     private let config = ConfigFfi(
         deadSessionIdleS: 1200, alertAfterS: 1800, killGraceS: 5, scanIntervalS: 5,
-        claudeConfigDirs: ["/Users/me/.claude"], excludeCommands: ["mcp"]
+        claudeConfigDirs: ["/Users/me/.claude"], excludeCommands: ["mcp"], excludePorts: [5432]
     )
 
     func testConversions() {
@@ -132,6 +124,15 @@ final class SettingsDraftTests: XCTestCase {
         XCTAssertFalse(gate.shouldSave(invalid), "invalid drafts never save")
     }
 
+    func testAddingPort() {
+        XCTAssertEqual(addingPort(" 6379 ", to: [5432]), [5432, 6379])
+        XCTAssertNil(addingPort("5432", to: [5432]))
+        XCTAssertNil(addingPort("0", to: []))
+        XCTAssertNil(addingPort("70000", to: []))
+        XCTAssertNil(addingPort("redis", to: []))
+        XCTAssertEqual(SettingsDraft(config).ffi.excludePorts, [5432])
+    }
+
     func testAddingEntry() {
         XCTAssertEqual(addingEntry("  redis-server ", to: ["mcp"]), ["mcp", "redis-server"])
         XCTAssertNil(addingEntry("   ", to: ["mcp"]))
@@ -151,12 +152,12 @@ final class MenuLabelTests: XCTestCase {
 
     func testSessionNameTruncation() {
         XCTAssertEqual(truncatedSessionName("revva-b8"), "revva-b8")
-        let exact = String(repeating: "a", count: 24)
+        let exact = String(repeating: "a", count: 20)
         XCTAssertEqual(truncatedSessionName(exact), exact)
         let long = "tec-6435-us58-endpoints-publics-create-u-a1"
         let cut = truncatedSessionName(long)
-        XCTAssertEqual(cut, "tec-6435-us58-endpoints\u{2026}")
-        XCTAssertEqual(cut.count, 24)
+        XCTAssertEqual(cut, "tec-6435-us58-endpo\u{2026}")
+        XCTAssertEqual(cut.count, 20)
     }
 
     func testSessionLineAliveActive() {
@@ -173,8 +174,37 @@ final class MenuLabelTests: XCTestCase {
         )
         XCTAssertEqual(
             sessionLine(s),
-            "Claude session \"web-itinerairer-public-\u{2026}\" \u{00B7} idle 12 min \u{00B7} started 4 min ago"
+            "Claude session \"web-itinerairer-pub\u{2026}\" \u{00B7} idle 12 min \u{00B7} started 4 min ago"
         )
+    }
+
+    func testSessionLineWhenTheAlertCouldNotBeShown() {
+        let s = server(idleMs: 31 * 60_000, state: "idle")
+        XCTAssertEqual(
+            sessionLine(s, notificationsOff: true),
+            "Claude session \"revva-b8\" \u{00B7} idle 31 min, notifications off"
+        )
+    }
+
+    /// The longest third lines fit the menu at the callout font (12 pt), so
+    /// "started 2 d ago" is never cut.
+    func testLongestSessionLinesFitTheMenu() {
+        let font = NSFont.preferredFont(forTextStyle: .callout)
+        let name = "web-itinerairer-public-cb4fa7a5"
+        let lines = [
+            sessionLine(server(sessionName: name, idleMs: 59 * 60_000, state: "idle")),
+            sessionLine(server(sessionName: name, idleMs: 59 * 60_000, state: "idle"), notificationsOff: true),
+            sessionLine(server(sessionName: name, killInMs: 0)),
+        ].map { $0.replacingOccurrences(of: "started 4 min ago", with: "started 59 min ago") }
+        for line in lines {
+            let width = (line as NSString).size(withAttributes: [.font: font]).width
+            XCTAssertLessThanOrEqual(width, rowTextWidth, line)
+        }
+    }
+
+    func testPortLabelIsVerbatim() {
+        XCTAssertEqual(portLabel(8081), ":8081")
+        XCTAssertEqual(portLabel(65535), ":65535")
     }
 
     func testSessionLineAliveWithWorktreeGone() {
@@ -236,13 +266,13 @@ final class ConfigSaveTests: XCTestCase {
     func testDelayChangeIsSavedAndVisibleToCli() throws {
         let core = Core()
         let discovered = core.discoveredClaudeDirs()
-        var draft = SettingsDraft(core.config())
+        var draft = SettingsDraft(try core.config())
         XCTAssertTrue(draft.claudeConfigDirs.isEmpty, "extras only, discovered dirs stay out")
         draft.alertAfterMin = 1
         draft.excludeCommands = addingEntry("vite", to: draft.excludeCommands) ?? draft.excludeCommands
         try core.setConfig(c: draft.ffi)
 
-        let reread = Core().config()
+        let reread = try Core().config()
         XCTAssertEqual(reread.alertAfterS, 60)
         XCTAssertTrue(reread.excludeCommands.contains("vite"))
 

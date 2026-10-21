@@ -14,8 +14,9 @@ private enum IDs {
 }
 
 /// Posts the "idle server" alerts and routes their Kill and Keep buttons back
-/// to the model. If notifications are denied, posting fails silently and the
-/// menu row stays the way to act on the server.
+/// to the model. When notifications are not allowed, nothing is posted and
+/// `post` reports nothing delivered: the menu row says so and stays the way
+/// to act on the server.
 @MainActor
 final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     /// Called on the main actor when the user presses Kill or Keep.
@@ -43,9 +44,18 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
-    /// One notification per server. The identifier is the server's identity,
-    /// so a repeat replaces the previous one instead of stacking.
-    func post(_ servers: [ServerViewFfi]) {
+    /// One notification per server; returns the servers whose notification
+    /// was added. The identifier is the server's identity, so a repeat
+    /// replaces the previous one instead of stacking.
+    func post(_ servers: [ServerViewFfi]) async -> [ServerID] {
+        let settings = await center.notificationSettings()
+        switch settings.authorizationStatus {
+        case .authorized, .provisional, .ephemeral:
+            break
+        default:
+            return []
+        }
+        var delivered: [ServerID] = []
         for server in servers {
             let content = UNMutableNotificationContent()
             content.title = "Balance ton port"
@@ -58,13 +68,14 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
                 content: content,
                 trigger: nil
             )
-            let log = self.log
-            center.add(request) { error in
-                if let error {
-                    log.error("could not post: \(error.localizedDescription, privacy: .public)")
-                }
+            do {
+                try await center.add(request)
+                delivered.append(server.id)
+            } catch {
+                log.error("could not post: \(error.localizedDescription, privacy: .public)")
             }
         }
+        return delivered
     }
 
     nonisolated func userNotificationCenter(

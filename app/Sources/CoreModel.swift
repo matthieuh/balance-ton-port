@@ -12,6 +12,13 @@ final class CoreModel: ObservableObject {
     /// lock: the app then only observes and never runs a killing tick.
     @Published private(set) var watchedElsewhere = false
     @Published private(set) var lastError: String?
+    /// Servers due an alert that could not be shown (notifications not
+    /// allowed): their row says so, and the alert is not marked as sent.
+    @Published private(set) var unnotified: Set<ServerID> = []
+    /// A short note about the last manual kill ("already gone"), shown in the
+    /// menu for `killedHoldTime`.
+    @Published private(set) var killNotice: String?
+    private var killNoticeAt: Date?
     /// The last Settings save error, cleared by the next successful save.
     @Published private(set) var settingsError: String?
 
@@ -42,23 +49,29 @@ final class CoreModel: ObservableObject {
         kill(server.id)
     }
 
-    /// Kills by identity, from the menu or a notification's Kill button.
-    /// Does nothing when the last pass no longer lists this exact server
-    /// (gone already, or its pid now belongs to another process).
+    /// Kills by identity (pid and start time), from the menu or a
+    /// notification's Kill button. Asks the core directly, not the last pass:
+    /// right after a relaunch the list is still empty. The core kills only
+    /// that exact process; when it is already gone (or its pid now belongs to
+    /// another process), nothing is signalled and the menu says so.
     func kill(_ id: ServerID) {
-        guard servers.contains(where: { $0.id == id }) else { return }
         killedByHand[id] = Date()
         servers.removeAll { $0.id == id }
-        let pid = id.pid
         Task {
             do {
-                let kills = try await onCore { core in
-                    _ = try core.killPid(pid: pid)
-                    return try core.recentKills()
+                let (record, kills) = try await onCore { core in
+                    let record = try core.killServer(pid: id.pid, startTime: id.startTime)
+                    return (record, try core.recentKills())
                 }
                 recentKills = kills
-                lastError = nil
+                if record == nil {
+                    killNotice = "That server was already gone."
+                    killNoticeAt = Date()
+                } else {
+                    killNotice = nil
+                }
             } catch {
+                killedByHand[id] = nil
                 lastError = error.localizedDescription
             }
         }
@@ -78,13 +91,10 @@ final class CoreModel: ObservableObject {
 
     /// The config as saved on disk (defaults when there is no file), whose
     /// `claudeConfigDirs` are the extras, plus the dirs found automatically.
-    func loadConfig() async -> (config: ConfigFfi, discovered: [String]) {
-        let core = self.core
-        return await withCheckedContinuation { continuation in
-            queue.async {
-                continuation.resume(returning: (core.config(), core.discoveredClaudeDirs()))
-            }
-        }
+    /// Throws when `config.toml` cannot be parsed: the form must not show (and
+    /// then save) defaults over what the user wrote.
+    func loadConfig() async throws -> (config: ConfigFfi, discovered: [String]) {
+        try await onCore { core in (try core.config(), core.discoveredClaudeDirs()) }
     }
 
     /// Saves the Settings form. Enqueued on the core queue right away, so
@@ -115,23 +125,43 @@ final class CoreModel: ObservableObject {
                 let owner = try core.acquireWatch()
                 let report = owner ? try core.tick() : try core.observe()
                 let kills = try core.recentKills()
-                let scan = core.config().scanIntervalS
+                // The file may be broken (reported in `configError`): fall
+                // back to the default interval, the core keeps its last
+                // valid config anyway.
+                let scan = (try? core.config())?.scanIntervalS ?? 5
                 return PassResult(
                     owner: owner, servers: report.servers, alerts: report.alerts,
-                    kills: kills, scanIntervalS: scan
+                    kills: kills, scanIntervalS: scan, configError: report.configError
                 )
             }
             watchedElsewhere = !result.owner
             let now = Date()
             killedByHand = killedByHand.filter { now.timeIntervalSince($0.value) < killedHoldTime }
+            if let at = killNoticeAt, now.timeIntervalSince(at) >= killedHoldTime {
+                killNotice = nil
+                killNoticeAt = nil
+            }
             servers = result.servers.filter { killedByHand[$0.id] == nil }
             recentKills = result.kills
-            // Only the watching app alerts; a read-only pass marks no alert.
+            // Only the watching app alerts; a read-only pass leaves them to
+            // the other watcher. An alert is marked only once it was added
+            // to Notification Center, so a refused one is retried and its
+            // row says notifications are off.
             if result.owner && !result.alerts.isEmpty {
-                notifier.post(result.alerts)
+                let delivered = await notifier.post(result.alerts)
+                if !delivered.isEmpty {
+                    try await onCore { core in
+                        for id in delivered {
+                            try core.markAlerted(pid: id.pid, startTime: id.startTime)
+                        }
+                    }
+                }
+                unnotified = Set(result.alerts.map(\.id)).subtracting(delivered)
+            } else {
+                unnotified = []
             }
             interval = TimeInterval(max(1, result.scanIntervalS))
-            lastError = nil
+            lastError = result.configError
         } catch {
             lastError = error.localizedDescription
         }
@@ -170,4 +200,5 @@ private struct PassResult: Sendable {
     let alerts: [ServerViewFfi]
     let kills: [KillRecordFfi]
     let scanIntervalS: UInt64
+    let configError: String?
 }
