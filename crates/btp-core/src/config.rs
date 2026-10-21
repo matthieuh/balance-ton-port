@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -95,7 +96,8 @@ fn below_minimum(key: &str, value: u64, min: u64) -> String {
 /// The saved config. A missing file gives the defaults. A file that cannot
 /// be read or parsed (one mistyped field included) is an error, never
 /// silently the defaults: the caller decides what to run on. Values below
-/// their minimum are raised to it, with a note on stderr.
+/// their minimum are raised to it, with a note on stderr (once per change
+/// of the file, not on every read).
 pub fn read_config(dir: &Path) -> Result<Config, String> {
     let path = dir.join(CONFIG_FILE);
     let text = match std::fs::read_to_string(&path) {
@@ -105,10 +107,31 @@ pub fn read_config(dir: &Path) -> Result<Config, String> {
     };
     let mut c: Config = toml::from_str(&text)
         .map_err(|e| format!("invalid {}: {}", path.display(), e.message()))?;
-    for note in c.clamp() {
-        eprintln!("btp: {}: {note}", path.display());
+    let notes = c.clamp();
+    if !notes.is_empty() {
+        let mut seen = NOTED.lock().unwrap_or_else(|e| e.into_inner());
+        if note_due(&mut seen, &path, &text) {
+            for note in notes {
+                eprintln!("btp: {}: {note}", path.display());
+            }
+        }
     }
     Ok(c)
+}
+
+/// The text of each config file whose clamp notes were last printed: the
+/// watcher reads the file every pass, the notes are printed once per change.
+static NOTED: std::sync::Mutex<Option<HashMap<PathBuf, String>>> = std::sync::Mutex::new(None);
+
+/// `true` (and remembered) when `text` is not what `path` held the last time
+/// its notes were printed.
+fn note_due(seen: &mut Option<HashMap<PathBuf, String>>, path: &Path, text: &str) -> bool {
+    let seen = seen.get_or_insert_with(HashMap::new);
+    if seen.get(path).is_some_and(|t| t == text) {
+        return false;
+    }
+    seen.insert(path.to_path_buf(), text.to_string());
+    true
 }
 
 /// Writes the config through a temp file and a rename, so a reader never
@@ -304,6 +327,22 @@ mod tests {
             ),
             (60, 60, 1, 1)
         );
+    }
+
+    #[test]
+    fn a_clamp_note_is_due_once_per_distinct_file() {
+        let mut seen = None;
+        let a = Path::new("/x/config.toml");
+        let b = Path::new("/y/config.toml");
+        assert!(note_due(&mut seen, a, "kill_grace_s = 0"));
+        // Every pass re-reads the same file: no repeat.
+        assert!(!note_due(&mut seen, a, "kill_grace_s = 0"));
+        // Another file is noted on its own.
+        assert!(note_due(&mut seen, b, "kill_grace_s = 0"));
+        // A change, then back: each change is noted once.
+        assert!(note_due(&mut seen, a, "scan_interval_s = 0"));
+        assert!(!note_due(&mut seen, a, "scan_interval_s = 0"));
+        assert!(note_due(&mut seen, a, "kill_grace_s = 0"));
     }
 
     #[test]
