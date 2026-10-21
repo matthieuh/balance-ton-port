@@ -111,6 +111,7 @@ mod tests {
             session_id: "s".into(),
             session_pid: 1,
             session_proc_start: "x".into(),
+            session_name: "x".into(),
             first_seen_ms: 0,
             last_active_ms: 0,
             kept: false,

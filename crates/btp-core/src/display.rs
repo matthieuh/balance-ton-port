@@ -31,6 +31,16 @@ pub fn format_idle(ms: u64) -> String {
     }
 }
 
+/// `started just now`, `started 4 min ago`, `started 2 d ago`.
+pub fn started_label(started_ms: u64, now_ms: u64) -> String {
+    let age = now_ms.saturating_sub(started_ms);
+    if age < 60_000 {
+        "started just now".to_string()
+    } else {
+        format!("started {} ago", format_idle(age))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -44,7 +54,12 @@ mod tests {
             },
             port: 3000,
             command: "vite".into(),
+            tool_label: "Vite".into(),
+            worktree: "/repo/app".into(),
             worktree_name: "app".into(),
+            location_label: "app".into(),
+            session_name: "app-1d".into(),
+            started_ms: 0,
             session_alive: alive,
             idle_ms,
             kill_in_ms: None,
@@ -59,6 +74,16 @@ mod tests {
         assert_eq!(server_state(&view(true, 59_999)), "active");
         assert_eq!(server_state(&view(true, 60_000)), "idle");
         assert_eq!(server_state(&view(true, 600_000)), "idle");
+    }
+
+    #[test]
+    fn started_labels() {
+        let now = 1_800_000_000_000;
+        assert_eq!(started_label(now - 30_000, now), "started just now");
+        assert_eq!(started_label(now - 4 * 60_000, now), "started 4 min ago");
+        assert_eq!(started_label(now - 2 * 86_400_000, now), "started 2 d ago");
+        // A clock that went back never underflows.
+        assert_eq!(started_label(now + 5_000, now), "started just now");
     }
 
     #[test]

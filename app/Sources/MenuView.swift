@@ -37,8 +37,9 @@ struct MenuView: View {
                 Text("No dev servers from Claude Code sessions")
                     .foregroundStyle(.secondary)
             } else {
-                Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 4) {
-                    ForEach(model.servers, id: \.id) { server in
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(Array(model.servers.enumerated()), id: \.element.id) { index, server in
+                        if index > 0 { Divider() }
                         ServerRow(server: server) { model.kill(server) }
                     }
                 }
@@ -57,7 +58,7 @@ struct MenuView: View {
                     ForEach(Array(model.recentKills.prefix(5).enumerated()), id: \.offset) { _, kill in
                         GridRow {
                             Text(String(kill.port)).monospacedDigit()
-                            Text(kill.command).lineLimit(1)
+                            Text(kill.toolLabel).lineLimit(1)
                             Text(kill.reason).lineLimit(1)
                             Text(relativeTime(atMs: kill.atMs))
                                 .foregroundStyle(.secondary)
@@ -85,20 +86,47 @@ struct MenuView: View {
     }
 }
 
+/// Three lines: what the server is and its port, where it runs, and the
+/// Claude Code session behind it. Hovering shows the full command line, pid
+/// and worktree path.
 private struct ServerRow: View {
     let server: ServerViewFfi
     let onKill: () -> Void
 
+    /// Lines 2 and 3 start under the tool label, past the status dot.
+    private let indent: CGFloat = 16
+
     var body: some View {
-        GridRow {
-            Text(server.sessionAlive ? "\u{25CF}" : "\u{25CB}")
-                .foregroundStyle(server.sessionAlive ? Color.green : Color.secondary)
-            Text(String(server.port)).monospacedDigit()
-            Text(server.command).lineLimit(1)
-            Text(server.worktreeName).lineLimit(1).foregroundStyle(.secondary)
-            Text(stateLabel(server)).lineLimit(1)
-            Button("Kill", action: onKill)
-                .controlSize(.small)
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 0) {
+                Text(server.sessionAlive ? "\u{25CF}" : "\u{25CB}")
+                    .foregroundStyle(server.sessionAlive ? Color.green : Color.secondary)
+                    .frame(width: indent, alignment: .leading)
+                Text(server.toolLabel)
+                    .fontWeight(.semibold)
+                    .lineLimit(1)
+                Spacer(minLength: 12)
+                Text(":\(server.port)")
+                    .monospacedDigit()
+                    .padding(.trailing, 10)
+                Button("Kill", action: onKill)
+                    .controlSize(.small)
+            }
+            .font(.body)
+            Text(server.locationLabel)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .foregroundStyle(.secondary)
+                .padding(.leading, indent)
+            Text(sessionLine(server))
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .foregroundStyle(.secondary)
+                .padding(.leading, indent)
         }
+        .font(.callout)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .help(rowHelp(server))
     }
 }

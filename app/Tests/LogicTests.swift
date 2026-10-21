@@ -5,14 +5,18 @@ private func server(
     command: String = "bun run dev",
     port: UInt16 = 4322,
     worktree: String = "web",
+    sessionName: String = "revva-b8",
+    sessionAlive: Bool = true,
     idleMs: UInt64 = 0,
     killInMs: UInt64? = nil,
     state: String = "active"
 ) -> ServerViewFfi {
     ServerViewFfi(
         pid: 4242, startTime: 1_700_000_000_123, port: port, command: command,
-        worktreeName: worktree, sessionAlive: true, idleMs: idleMs,
-        killInMs: killInMs, state: state
+        toolLabel: "Bun dev", worktree: "/Users/me/trees/\(worktree)", worktreeName: worktree,
+        locationLabel: "revva \u{203A} \(worktree)", sessionName: sessionName,
+        startedMs: 1_700_000_000, startedLabel: "started 4 min ago",
+        sessionAlive: sessionAlive, idleMs: idleMs, killInMs: killInMs, state: state
     )
 }
 
@@ -142,6 +146,59 @@ final class MenuLabelTests: XCTestCase {
         XCTAssertEqual(
             stateLabel(server(killInMs: 18 * 60_000, state: "session dead")),
             "session dead \u{00B7} kill in 18 min"
+        )
+    }
+
+    func testSessionNameTruncation() {
+        XCTAssertEqual(truncatedSessionName("revva-b8"), "revva-b8")
+        let exact = String(repeating: "a", count: 24)
+        XCTAssertEqual(truncatedSessionName(exact), exact)
+        let long = "tec-6435-us58-endpoints-publics-create-u-a1"
+        let cut = truncatedSessionName(long)
+        XCTAssertEqual(cut, "tec-6435-us58-endpoints\u{2026}")
+        XCTAssertEqual(cut.count, 24)
+    }
+
+    func testSessionLineAliveActive() {
+        XCTAssertEqual(
+            sessionLine(server()),
+            "Claude session \"revva-b8\" \u{00B7} active \u{00B7} started 4 min ago"
+        )
+    }
+
+    func testSessionLineAliveIdleTruncatesTheName() {
+        let s = server(
+            sessionName: "web-itinerairer-public-cb4fa7a5-ff",
+            idleMs: 12 * 60_000, state: "idle"
+        )
+        XCTAssertEqual(
+            sessionLine(s),
+            "Claude session \"web-itinerairer-public-\u{2026}\" \u{00B7} idle 12 min \u{00B7} started 4 min ago"
+        )
+    }
+
+    func testSessionLineAliveWithWorktreeGone() {
+        let s = server(killInMs: 0)
+        XCTAssertEqual(
+            sessionLine(s),
+            "Claude session \"revva-b8\" \u{00B7} active \u{00B7} started 4 min ago \u{00B7} kill soon"
+        )
+    }
+
+    func testSessionLineDead() {
+        let dead = server(sessionAlive: false, idleMs: 12 * 60_000, killInMs: 8 * 60_000, state: "session dead")
+        XCTAssertEqual(sessionLine(dead), "Session ended \u{00B7} idle 12 min \u{00B7} kill in 8 min")
+        let soon = server(sessionAlive: false, idleMs: 20 * 60_000, killInMs: 59_999, state: "session dead")
+        XCTAssertEqual(sessionLine(soon), "Session ended \u{00B7} idle 20 min \u{00B7} kill soon")
+        // Shared with a live session: no kill is scheduled.
+        let shared = server(sessionAlive: false, idleMs: 30_000, state: "session dead")
+        XCTAssertEqual(sessionLine(shared), "Session ended \u{00B7} idle <1 min")
+    }
+
+    func testRowHelp() {
+        XCTAssertEqual(
+            rowHelp(server(command: "bun run dev")),
+            "bun run dev\npid 4242\n/Users/me/trees/web"
         )
     }
 

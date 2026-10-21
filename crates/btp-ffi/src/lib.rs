@@ -5,7 +5,8 @@
 uniffi::setup_scaffolding!();
 
 use btp_core::config::{data_dir, load_config, save_config, Config};
-use btp_core::display::{format_idle, server_state};
+use btp_core::display::{format_idle, server_state, started_label};
+use btp_core::labels::tool_label;
 use btp_core::model::{KillReason, KillTarget, ServerKey};
 use btp_core::platform::MacOs;
 use btp_core::sessions::default_config_dirs;
@@ -39,7 +40,19 @@ pub struct ServerViewFfi {
     pub start_time: u64,
     pub port: u16,
     pub command: String,
+    /// A readable name for the server (`Expo (Metro)`, `Vite`, `Node x.js`).
+    pub tool_label: String,
+    /// Full worktree path.
+    pub worktree: String,
     pub worktree_name: String,
+    /// `<repo> › <worktree>`, the repo dir name, or a `~`-shortened path.
+    pub location_label: String,
+    /// The Claude Code session's display name.
+    pub session_name: String,
+    /// When the server process started, Unix milliseconds.
+    pub started_ms: u64,
+    /// `started 4 min ago`, as of the pass that produced this view.
+    pub started_label: String,
     pub session_alive: bool,
     pub idle_ms: u64,
     pub kill_in_ms: Option<u64>,
@@ -51,6 +64,8 @@ pub struct ServerViewFfi {
 pub struct KillRecordFfi {
     pub port: u16,
     pub command: String,
+    /// A readable name for the command (`Vite`, `Node x.js`).
+    pub tool_label: String,
     /// Full worktree path.
     pub worktree: String,
     /// Last path component of `worktree`.
@@ -95,14 +110,21 @@ fn file_name(p: &Path) -> String {
         .unwrap_or_else(|| p.display().to_string())
 }
 
-impl From<&ServerView> for ServerViewFfi {
-    fn from(v: &ServerView) -> Self {
+impl ServerViewFfi {
+    /// `v` as the menu shows it at `now_ms`.
+    pub fn at(v: &ServerView, now_ms: u64) -> Self {
         ServerViewFfi {
             pid: v.key.pid,
             start_time: v.key.start_time,
             port: v.port,
             command: v.command.clone(),
+            tool_label: v.tool_label.clone(),
+            worktree: v.worktree.display().to_string(),
             worktree_name: v.worktree_name.clone(),
+            location_label: v.location_label.clone(),
+            session_name: v.session_name.clone(),
+            started_ms: v.started_ms,
+            started_label: started_label(v.started_ms, now_ms),
             session_alive: v.session_alive,
             idle_ms: v.idle_ms,
             kill_in_ms: v.kill_in_ms,
@@ -111,11 +133,18 @@ impl From<&ServerView> for ServerViewFfi {
     }
 }
 
+impl From<&ServerView> for ServerViewFfi {
+    fn from(v: &ServerView) -> Self {
+        ServerViewFfi::at(v, now_ms())
+    }
+}
+
 impl From<&KillRecord> for KillRecordFfi {
     fn from(r: &KillRecord) -> Self {
         KillRecordFfi {
             port: r.port,
             command: r.command.clone(),
+            tool_label: tool_label(&r.command),
             worktree: r.worktree.display().to_string(),
             worktree_name: file_name(&r.worktree),
             reason: reason_label(&r.reason),
@@ -337,15 +366,25 @@ mod tests {
             },
             port: 5173,
             command: "vite".into(),
+            tool_label: "Vite".into(),
+            worktree: "/repo/app".into(),
             worktree_name: "app".into(),
+            location_label: "app".into(),
+            session_name: "app-1d".into(),
+            started_ms: 0,
             session_alive: false,
             idle_ms: 0,
             kill_in_ms: Some(1_000),
         };
-        let f = ServerViewFfi::from(&v);
+        let f = ServerViewFfi::at(&v, 4 * 60_000);
         assert_eq!((f.pid, f.start_time, f.port), (42, 7, 5173));
         assert_eq!(f.kill_in_ms, Some(1_000));
         assert_eq!(f.state, "session dead");
+        assert_eq!(f.tool_label, "Vite");
+        assert_eq!(f.worktree, "/repo/app");
+        assert_eq!(f.location_label, "app");
+        assert_eq!(f.session_name, "app-1d");
+        assert_eq!(f.started_label, "started 4 min ago");
     }
 
     #[test]
@@ -360,6 +399,7 @@ mod tests {
         let f = KillRecordFfi::from(&r);
         assert_eq!(f.worktree, "/repo/.worktrees/feat-x");
         assert_eq!(f.worktree_name, "feat-x");
+        assert_eq!(f.tool_label, "Next.js");
         assert_eq!(f.reason, "worktree deleted");
         assert_eq!(f.at_ms, 9);
     }

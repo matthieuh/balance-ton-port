@@ -1,6 +1,7 @@
 pub mod config;
 pub mod decide;
 pub mod display;
+pub mod labels;
 pub mod model;
 pub mod platform;
 pub mod sessions;

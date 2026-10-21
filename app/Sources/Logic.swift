@@ -26,6 +26,42 @@ func stateLabel(_ s: ServerViewFfi) -> String {
     return s.state
 }
 
+/// Session names longer than this are cut with an ellipsis in the menu.
+let sessionNameMaxLength = 24
+
+/// `name`, or its first characters plus "\u{2026}" when longer than
+/// `sessionNameMaxLength` (the result is never longer than that).
+func truncatedSessionName(_ name: String) -> String {
+    guard name.count > sessionNameMaxLength else { return name }
+    return String(name.prefix(sessionNameMaxLength - 1)) + "\u{2026}"
+}
+
+/// The row's third line. Alive session:
+/// `Claude session "revva-b8" · active · started 4 min ago`; dead session:
+/// `Session ended · idle 12 min · kill in 8 min` (`kill soon` under a minute).
+func sessionLine(_ s: ServerViewFfi) -> String {
+    var parts: [String]
+    if s.sessionAlive {
+        let activity = s.state == "idle" ? "idle \(durationLabel(ms: s.idleMs))" : "active"
+        parts = [
+            "Claude session \"\(truncatedSessionName(s.sessionName))\"",
+            activity,
+            s.startedLabel,
+        ]
+    } else {
+        parts = ["Session ended", "idle \(durationLabel(ms: s.idleMs))"]
+    }
+    if let killIn = s.killInMs {
+        parts.append(killIn < 60_000 ? "kill soon" : "kill in \(durationLabel(ms: killIn))")
+    }
+    return parts.joined(separator: " \u{00B7} ")
+}
+
+/// The row tooltip: full command line, pid and full worktree path.
+func rowHelp(_ s: ServerViewFfi) -> String {
+    "\(s.command)\npid \(s.pid)\n\(s.worktree)"
+}
+
 /// `just now`, `12 min ago`, `2 h ago`, `yesterday`, `3 days ago`.
 func relativeTime(atMs: UInt64, now: Date = Date()) -> String {
     let nowMs = UInt64(max(0, now.timeIntervalSince1970 * 1000))

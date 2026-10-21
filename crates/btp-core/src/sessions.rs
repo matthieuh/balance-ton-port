@@ -16,6 +16,8 @@ pub struct ClaudeSession {
     pub status: SessionStatus,
     pub status_updated_at_ms: u64,
     pub proc_start: String,
+    /// The session's display name (`name`), empty when the file has none.
+    pub name: String,
 }
 
 fn parse_session(text: &str) -> Option<ClaudeSession> {
@@ -32,6 +34,11 @@ fn parse_session(text: &str) -> Option<ClaudeSession> {
         status,
         status_updated_at_ms: v.get("statusUpdatedAt")?.as_u64()?,
         proc_start: v.get("procStart")?.as_str()?.to_string(),
+        name: v
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
     })
 }
 
@@ -199,6 +206,7 @@ mod tests {
         assert_eq!(s.status, SessionStatus::Idle);
         assert_eq!(s.status_updated_at_ms, 1700000500000);
         assert_eq!(s.proc_start, "Thu Oct 15 12:51:40 2026");
+        assert_eq!(s.name, "project-1d");
     }
 
     #[test]
@@ -234,6 +242,7 @@ mod tests {
             status,
             status_updated_at_ms: 1000,
             proc_start: String::new(),
+            name: String::new(),
         };
         assert_eq!(session_idle_ms(&mk(SessionStatus::Idle), 5000), Some(4000));
         assert_eq!(session_idle_ms(&mk(SessionStatus::Busy), 5000), None);

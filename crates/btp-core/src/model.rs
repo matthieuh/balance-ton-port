@@ -20,6 +20,10 @@ pub struct TrackedServer {
     /// `session_pid` has this exact start time.
     #[serde(default)]
     pub session_proc_start: String,
+    /// The session's display name at link time (its `name`, or the basename
+    /// of its working directory). Empty for servers tracked before it existed.
+    #[serde(default)]
+    pub session_name: String,
     pub first_seen_ms: u64,
     pub last_active_ms: u64,
     pub kept: bool,

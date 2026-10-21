@@ -8,6 +8,7 @@
 
 use crate::config::{effective_claude_dirs_with, load_config, Config};
 use crate::decide::{decide, touch};
+use crate::labels::{location_label, session_display_name, tool_label};
 use crate::model::{Action, KillReason, KillTarget, Observation, ServerKey, TrackedServer};
 use crate::platform::{ancestry, format_proc_start, Listener, Platform, ProcInfo};
 use crate::sessions::{default_config_dirs, read_sessions, session_idle_ms, ClaudeSession};
@@ -26,7 +27,17 @@ pub struct ServerView {
     pub key: ServerKey,
     pub port: u16,
     pub command: String,
+    /// A readable name for the server (`Expo (Metro)`, `Vite`, `Node x.js`).
+    pub tool_label: String,
+    /// Full worktree path.
+    pub worktree: PathBuf,
     pub worktree_name: String,
+    /// `<repo> › <worktree>`, the repo dir name, or a `~`-shortened path.
+    pub location_label: String,
+    /// The Claude Code session's display name.
+    pub session_name: String,
+    /// When the server process started, Unix milliseconds.
+    pub started_ms: u64,
     pub session_alive: bool,
     /// Port idle time, or the larger of port and session idle time while the
     /// session is alive (what the alert compares against).
@@ -107,6 +118,7 @@ pub fn link(
         session_id: session.session_id.clone(),
         session_pid: session.pid,
         session_proc_start: session.proc_start.clone(),
+        session_name: session_display_name(Some(&session.name), &session.cwd),
         first_seen_ms: now_ms,
         last_active_ms: now_ms,
         kept: false,
@@ -545,15 +557,26 @@ fn view(s: &TrackedServer, o: &Observation, now_ms: u64, cfg: &Config) -> Server
                 .saturating_sub(port_idle),
         )
     };
+    let worktree_name = s
+        .worktree
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| s.worktree.display().to_string());
     ServerView {
         key: s.key,
         port: s.port,
         command: s.command.clone(),
-        worktree_name: s
-            .worktree
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| s.worktree.display().to_string()),
+        tool_label: tool_label(&s.command),
+        worktree: s.worktree.clone(),
+        location_label: location_label(&s.worktree),
+        session_name: if s.session_name.is_empty() {
+            worktree_name.clone()
+        } else {
+            s.session_name.clone()
+        },
+        worktree_name,
+        // Process start times are Unix microseconds.
+        started_ms: s.key.start_time / 1000,
         session_alive: o.session_alive,
         idle_ms,
         kill_in_ms,
@@ -713,6 +736,7 @@ mod tests {
                 session_id: "sess-a".into(),
                 session_pid: 20,
                 session_proc_start: format_proc_start(START + 20 * SEC),
+                session_name: "wt".into(),
                 first_seen_ms: T0,
                 last_active_ms: T0,
                 kept: false,
@@ -727,13 +751,47 @@ mod tests {
                 key: key30(),
                 port: 3000,
                 command: "bun run dev".into(),
+                tool_label: "Bun dev".into(),
+                worktree: f.wt.clone(),
                 worktree_name: "wt".into(),
+                location_label: "main \u{203A} wt".into(),
+                session_name: "wt".into(),
+                started_ms: (START + 30 * SEC) / 1000,
                 session_alive: true,
                 idle_ms: 0,
                 kill_in_ms: None,
             }]
         );
         assert_eq!(f.state_servers(), vec![s]);
+    }
+
+    #[test]
+    fn link_keeps_the_session_name() {
+        let f = fx();
+        let path = f.claude.path().join("sessions/20.json");
+        let mut v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        v["name"] = "revva-b8".into();
+        fs::write(&path, v.to_string()).unwrap();
+        let s = link_pid(&f, 30, 3000).expect("linked");
+        assert_eq!(s.session_name, "revva-b8");
+    }
+
+    #[test]
+    fn view_of_a_legacy_server_names_the_session_after_its_worktree() {
+        let f = fx();
+        let mut s = link_pid(&f, 30, 3000).expect("linked");
+        s.session_name = String::new();
+        let o = Observation {
+            key: s.key,
+            alive: true,
+            established: 0,
+            worktree_exists: true,
+            session_alive: true,
+            session_idle_ms: None,
+            shared_with_live_session: false,
+        };
+        assert_eq!(view(&s, &o, T0, &f.cfg()).session_name, "wt");
     }
 
     #[test]
@@ -1152,6 +1210,7 @@ mod tests {
                 session_id: "old".into(),
                 session_pid: 20,
                 session_proc_start: String::new(),
+                session_name: String::new(),
                 first_seen_ms: 0,
                 last_active_ms: 0,
                 kept: true,
