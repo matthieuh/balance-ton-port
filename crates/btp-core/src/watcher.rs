@@ -154,12 +154,42 @@ struct Tree {
     ports: Vec<u16>,
 }
 
+/// The descendants of `pid` that belong to its server, as (pid, start time):
+/// a Claude Code process found among them is a session of its own, so it and
+/// its whole subtree are left out (never signalled, never its ports).
+fn own_descendants(p: &dyn Platform, pid: i32) -> Vec<(i32, u64)> {
+    let mut own = Vec::new();
+    let mut spared = HashSet::new();
+    for pid in p.descendants(pid) {
+        if spared.contains(&pid) {
+            continue;
+        }
+        let Some(info) = p.proc_info(pid) else {
+            continue;
+        };
+        if is_claude_cli(&info.command) {
+            spared.insert(pid);
+            spared.extend(p.descendants(pid));
+            continue;
+        }
+        own.push((pid, info.start_time));
+    }
+    own
+}
+
+/// The server's tree leaves out any Claude Code process and its subtree:
+/// a server started from such a nested session is not this server's, so
+/// neither are its ports (`btp kill <port>` must never pick the outer one).
 fn tree_of(p: &dyn Platform, s: &TrackedServer, listeners: &[Listener]) -> Tree {
     if !same_process(p, s.key.pid, s.key.start_time) {
         return Tree::default();
     }
     let mut pids = vec![s.key.pid];
-    pids.extend(p.descendants(s.key.pid));
+    pids.extend(
+        own_descendants(p, s.key.pid)
+            .into_iter()
+            .map(|(pid, _)| pid),
+    );
     let mut ports: Vec<u16> = listeners
         .iter()
         .filter(|l| pids.contains(&l.pid))
@@ -212,21 +242,7 @@ pub fn kill_tree(p: &dyn Platform, key: ServerKey, grace: Duration) -> bool {
     let mut targets = vec![(key.pid, key.start_time)];
     // A Claude Code process started from the server (and whatever it runs)
     // is a live session of its own: never signalled.
-    let mut spared = HashSet::new();
-    for pid in p.descendants(key.pid) {
-        if spared.contains(&pid) {
-            continue;
-        }
-        let Some(info) = p.proc_info(pid) else {
-            continue;
-        };
-        if is_claude_cli(&info.command) {
-            spared.insert(pid);
-            spared.extend(p.descendants(pid));
-            continue;
-        }
-        targets.push((pid, info.start_time));
-    }
+    targets.extend(own_descendants(p, key.pid));
     if !signal_checked(p, key.pid, key.start_time, libc::SIGTERM) {
         return false;
     }
@@ -1707,6 +1723,54 @@ mod tests {
         assert_eq!(rec.port, 3000);
         assert!(!f.p().is_alive(30));
         assert!(!f.p().is_alive(31));
+    }
+
+    /// The fixture's server (30) runs a Claude Code session (40, with a
+    /// session file when `with_session`) that runs its own server (41,
+    /// listening on 4000).
+    fn claude_inside_server(f: &Fx, with_session: bool) {
+        let web = f.wt.join("apps/web");
+        let web = web.to_str().unwrap();
+        f.p().spawn(40, 30, START + 40 * SEC, "claude", web);
+        f.p().spawn(41, 40, START + 41 * SEC, "vite", web);
+        f.p().add_listener(41, 4000);
+        if with_session {
+            f.session(40, "sess-inner", &f.wt.join("apps/web"), START + 40 * SEC);
+        }
+    }
+
+    #[test]
+    fn kill_by_inner_port_targets_the_inner_server_only() {
+        let mut f = fx();
+        claude_inside_server(&f, true);
+        let r = f.w.tick(T0).unwrap();
+        let mut rows: Vec<(i32, Vec<u16>)> = r
+            .servers
+            .iter()
+            .map(|v| (v.key.pid, v.ports.clone()))
+            .collect();
+        rows.sort();
+        assert_eq!(rows, vec![(30, vec![3000]), (41, vec![4000])]);
+        let rec = f.w.kill(KillTarget::Port(4000)).unwrap().expect("killed");
+        assert_eq!(rec.port, 4000);
+        assert!(!f.p().is_alive(41));
+        for pid in [30, 31, 40] {
+            assert!(f.p().is_alive(pid), "pid {pid} was killed");
+        }
+    }
+
+    #[test]
+    fn kill_by_a_port_held_under_an_unwatched_claude_matches_nothing() {
+        let mut f = fx();
+        claude_inside_server(&f, false);
+        let r = f.w.tick(T0).unwrap();
+        assert_eq!(r.servers.len(), 1);
+        assert_eq!(r.servers[0].ports, vec![3000]);
+        assert_eq!(f.w.kill(KillTarget::Port(4000)).unwrap(), None);
+        assert!(f.p().signals().is_empty());
+        for pid in [30, 31, 40, 41] {
+            assert!(f.p().is_alive(pid), "pid {pid} was killed");
+        }
     }
 
     #[test]
