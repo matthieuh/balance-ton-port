@@ -256,7 +256,9 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
         Cmd::SessionEnd(a) => {
             // Any internal error or panic still exits 0.
             let notify = notifier();
-            if std::panic::catch_unwind(|| session_end(dir, &a, notify.as_ref())).is_err() {
+            if std::panic::catch_unwind(|| session_end(dir, &a, notify.as_ref(), hook_debug()))
+                .is_err()
+            {
                 eprintln!("btp: session-end failed");
             }
             Ok(0)
@@ -556,8 +558,47 @@ fn render_recent(kills: &[KillRecord], now: u64) -> String {
         .collect()
 }
 
-fn session_end(dir: std::path::PathBuf, a: &SessionEndArgs, notify: &Notifier) {
+/// `BTP_HOOK_DEBUG=1`: `btp session-end` appends a trace of what it found
+/// and did to `<data dir>/session-end.log`. Off by default.
+fn hook_debug() -> bool {
+    std::env::var_os("BTP_HOOK_DEBUG").is_some_and(|v| v == "1")
+}
+
+/// Appends `lines` to `<dir>/session-end.log`, each stamped with the time
+/// and this pid. Best effort.
+fn debug_log(dir: &std::path::Path, lines: &[String]) {
+    use std::io::Write;
+    let _ = std::fs::create_dir_all(dir);
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("session-end.log"))
+    else {
+        return;
+    };
+    let (now, pid) = (now_ms(), std::process::id());
+    for l in lines {
+        let _ = writeln!(f, "{now} btp[{pid}] {l}");
+    }
+}
+
+fn session_end(dir: std::path::PathBuf, a: &SessionEndArgs, notify: &Notifier, debug: bool) {
+    let mut trace = vec![format!(
+        "session-end reason={} session_pid={} session_id={} parent={}",
+        a.reason,
+        a.session_pid,
+        a.session_id.as_deref().unwrap_or("-"),
+        std::os::unix::process::parent_id()
+    )];
+    let log_dir = dir.clone();
+    let finish = |trace: &[String]| {
+        if debug {
+            debug_log(&log_dir, trace);
+        }
+    };
     if !ends_process(&a.reason) {
+        trace.push("not a process stop: nothing to do".into());
+        finish(&trace);
         return;
     }
     let started = Instant::now();
@@ -578,33 +619,43 @@ fn session_end(dir: std::path::PathBuf, a: &SessionEndArgs, notify: &Notifier) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("btp: session-end: {e}");
+            trace.push(format!("refused: {e}"));
+            finish(&trace);
             return;
         }
     };
+    trace.extend(report.trace.iter().cloned());
     // The SIGKILL stage first: it matters more than the message.
     if !report.survivors.is_empty() {
         let grace_ms = w.config().kill_grace_s.saturating_mul(1000);
         let deadline = now_ms().saturating_sub(started.elapsed().as_millis() as u64) + grace_ms;
-        match std::env::current_exe() {
-            Ok(exe) => {
-                let mut cmd = std::process::Command::new(exe);
-                cmd.arg("_finish-kill")
-                    .arg("--deadline-ms")
-                    .arg(deadline.to_string())
-                    .args(report.survivors.iter().map(|(p, s)| format!("{p}:{s}")));
-                if let Err(e) = spawn_detached(cmd) {
-                    eprintln!("btp: could not start the SIGKILL stage: {e}");
-                }
+        let spawned = std::env::current_exe().and_then(|exe| {
+            let mut cmd = std::process::Command::new(exe);
+            cmd.arg("_finish-kill")
+                .arg("--deadline-ms")
+                .arg(deadline.to_string())
+                .args(report.survivors.iter().map(|(p, s)| format!("{p}:{s}")));
+            spawn_detached(cmd)
+        });
+        match spawned {
+            Ok(()) => trace.push("SIGKILL stage detached".into()),
+            Err(e) => {
+                eprintln!("btp: could not start the SIGKILL stage: {e}");
+                trace.push(format!("SIGKILL stage failed to start: {e}"));
             }
-            Err(e) => eprintln!("btp: could not start the SIGKILL stage: {e}"),
         }
     }
-    if report.post_notification {
-        if let Some(g) = &report.group {
+    match (&report.group, report.post_notification) {
+        (Some(g), true) => {
             let (subtitle, body) = notification_text(g);
             notify(NOTIFY_TITLE, &subtitle, &body);
+            trace.push(format!("notification posted: {body}"));
         }
+        (Some(_), false) => trace.push("group left for the app to notify".into()),
+        (None, _) => trace.push("nothing stopped or left open: no notification".into()),
     }
+    trace.push(format!("done in {} ms", started.elapsed().as_millis()));
+    finish(&trace);
 }
 
 /// Reports a `config.toml` that could not be used (stderr).
@@ -873,11 +924,31 @@ mod tests {
                 reason: reason.into(),
                 session_id: None,
             };
-            session_end(d.path().to_path_buf(), &a, &notify);
+            session_end(d.path().to_path_buf(), &a, &notify, false);
         }
         assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
         // Nothing read or written: the data dir stays empty.
         assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn the_debug_trace_is_written_only_when_asked() {
+        let d = tempfile::tempdir().unwrap();
+        let notify = |_: &str, _: &str, _: &str| {};
+        let a = SessionEndArgs {
+            session_pid: 1,
+            reason: "clear".into(),
+            session_id: Some("conv-9".into()),
+        };
+        session_end(d.path().to_path_buf(), &a, &notify, false);
+        assert!(!d.path().join("session-end.log").exists());
+        session_end(d.path().to_path_buf(), &a, &notify, true);
+        let log = std::fs::read_to_string(d.path().join("session-end.log")).unwrap();
+        assert!(
+            log.contains("reason=clear session_pid=1 session_id=conv-9"),
+            "{log}"
+        );
+        assert!(log.contains("nothing to do"), "{log}");
     }
 
     #[test]
@@ -896,7 +967,7 @@ mod tests {
             reason: "prompt_input_exit".into(),
             session_id: None,
         };
-        session_end(d.path().to_path_buf(), &a, &notify);
+        session_end(d.path().to_path_buf(), &a, &notify, false);
         assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
         assert!(child.try_wait().unwrap().is_none(), "never signalled");
         assert!(!d.path().join("state.json").exists());

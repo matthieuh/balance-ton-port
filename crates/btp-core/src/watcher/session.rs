@@ -31,6 +31,8 @@ pub struct SessionEndReport {
     pub post_notification: bool,
     /// Processes still running at `term_until`, as (pid, start time).
     pub survivors: Vec<(i32, u64)>,
+    /// What was found and decided, one short line each (`BTP_HOOK_DEBUG`).
+    pub trace: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,14 +105,47 @@ impl<P: Platform> Watcher<P> {
                 format!("pid {session_pid} is not an ancestor of this process"),
             ));
         };
+        if !is_claude_cli(&session_proc.command) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("pid {session_pid} is not a Claude Code process"),
+            ));
+        }
         let proc_start = format_proc_start(session_proc.start_time);
-        let scan = self.scan();
+        let mut trace = vec![format!(
+            "session pid {session_pid}: Claude Code ancestor, started {proc_start}"
+        )];
+        let mut scan = self.scan();
         let listeners = self.platform.listeners();
         let app_running = watch_lock_held(&self.data_dir);
 
         // The quitting process may still look alive: never "another" session.
         let ending =
             |l: &LiveSession| l.session.pid == session_pid && l.session.proc_start == proc_start;
+        // Claude Code may remove its session file before the hook runs. The
+        // process itself is proven (a Claude Code ancestor of this very
+        // process, start time from the platform): it stands in for the
+        // file, so its untracked listeners still link, with the same rules.
+        let cwd_unknown = session_proc.cwd.is_none();
+        let cwd = session_proc.cwd.clone().unwrap_or_default();
+        let session_root = canonical(&worktree_root(&cwd));
+        if scan.live.iter().any(ending) {
+            trace.push("session file: present".into());
+        } else {
+            trace.push("session file: missing, linking with the process identity".into());
+            scan.live.push(LiveSession {
+                session: ClaudeSession {
+                    pid: session_pid,
+                    session_id: conversation.unwrap_or_default().to_string(),
+                    cwd,
+                    status: crate::sessions::SessionStatus::Unknown,
+                    status_updated_at_ms: 0,
+                    proc_start: proc_start.clone(),
+                    name: String::new(),
+                },
+                root: session_root.clone(),
+            });
+        }
         let others = Scan {
             cfg: scan.cfg.clone(),
             live: scan.live.iter().filter(|l| !ending(l)).cloned().collect(),
@@ -155,18 +190,73 @@ impl<P: Platform> Watcher<P> {
                 .collect();
             let actions =
                 session_end_actions(&judged, &obs, session_pid, &proc_start, now_ms, &scan.cfg);
-            actions
+            let mut lines = Vec::new();
+            for s in state.servers.iter().filter(|s| !before.contains(&s.key)) {
+                lines.push(format!(
+                    "linked :{} pid {} ({})",
+                    s.port, s.key.pid, s.command
+                ));
+            }
+            // An untracked listener working inside the session's worktree
+            // whose ancestry no longer reaches the session (a background
+            // task moved out of it): nothing proves it was this session's,
+            // so it is left; the trace says so.
+            let in_trees: HashSet<i32> = trees.iter().flat_map(|t| t.pids.clone()).collect();
+            for l in &listeners {
+                if in_trees.contains(&l.pid) || state.servers.iter().any(|s| s.key.pid == l.pid) {
+                    continue;
+                }
+                let Some(info) = self.platform.proc_info(l.pid) else {
+                    continue;
+                };
+                // An unknown session cwd proves nothing: no line.
+                let inside = !cwd_unknown
+                    && info
+                        .cwd
+                        .as_deref()
+                        .is_some_and(|c| canonical(c).starts_with(&session_root));
+                let reaches = ancestry(&self.platform, l.pid)
+                    .iter()
+                    .any(|p| p.pid == session_pid);
+                if inside && !reaches && l.pid != session_pid {
+                    lines.push(format!(
+                        "left :{} pid {} ({}): in the session worktree but not under the session process",
+                        l.port, l.pid, info.command
+                    ));
+                }
+            }
+            let planned = actions
                 .into_iter()
                 .filter_map(|(key, action)| {
                     let i = state.servers.iter().position(|s| s.key == key)?;
+                    lines.push(format!(
+                        ":{} pid {} ({}): {}",
+                        state.servers[i].port,
+                        key.pid,
+                        state.servers[i].command,
+                        match action {
+                            EndAction::Kill => "kill if still idle after the sample",
+                            EndAction::KeepInUse => "in use, left",
+                            EndAction::KeepNoted => "kept, left",
+                            EndAction::Skip => "skipped (excluded or shared worktree)",
+                        }
+                    ));
                     Some(Planned {
                         server: state.servers[i].clone(),
                         tree: trees[i].clone(),
                         action,
                     })
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            lines.push(format!(
+                "servers of this session: {}, tracked in all: {}",
+                planned.len(),
+                state.servers.len()
+            ));
+            (planned, lines)
         })?;
+        let (plan, lines) = plan;
+        trace.extend(lines);
 
         // Sample the candidates outside the state lock.
         let mut plan = plan;
@@ -200,6 +290,21 @@ impl<P: Platform> Watcher<P> {
             Stage::TermUntil(budget.term_until),
         )?;
 
+        for p in plan.iter().filter(|p| seen_active.contains(&p.server.key)) {
+            trace.push(format!(
+                ":{}: connection seen while sampling, left",
+                p.server.port
+            ));
+        }
+        for (_, r) in &done.killed {
+            trace.push(format!("stopped :{} (SIGTERM)", r.port));
+        }
+        if !done.survivors.is_empty() {
+            trace.push(format!(
+                "survivors for the SIGKILL stage: {:?}",
+                done.survivors
+            ));
+        }
         let entry = |p: &Planned, in_use: bool| GroupServer {
             key: p.server.key,
             port: p.server.port,
@@ -250,6 +355,7 @@ impl<P: Platform> Watcher<P> {
             post_notification: group.is_some() && !app_running,
             group,
             survivors: done.survivors,
+            trace,
         })
     }
 
@@ -718,6 +824,90 @@ mod tests {
         assert!(g.stopped.is_empty());
         assert!(g.still_open[0].in_use);
         assert_eq!(f.state_servers()[0].last_active_ms, T0);
+    }
+
+    fn has_line(r: &SessionEndReport, parts: &[&str]) -> bool {
+        r.trace.iter().any(|l| parts.iter().all(|p| l.contains(p)))
+    }
+
+    #[test]
+    fn without_a_session_file_the_process_identity_links_and_stops() {
+        // Claude Code removed its session file before the hook ran, and no
+        // watcher ever saw the server.
+        let mut f = fx();
+        hook(&f);
+        fs::remove_file(f.claude.path().join("sessions/20.json")).unwrap();
+        let r = end(&mut f, T0);
+        assert!(!f.p().is_alive(30));
+        let g = r.group.clone().unwrap();
+        assert_eq!(g.stopped, vec![gs(3000, "Bun dev", false)]);
+        assert_eq!(g.session_name, "wt");
+        assert!(has_line(&r, &["session file", "missing"]), "{:?}", r.trace);
+        assert!(has_line(&r, &["linked", ":3000"]), "{:?}", r.trace);
+        assert!(has_line(&r, &[":3000", "kill"]), "{:?}", r.trace);
+        assert_eq!(f.state_kills()[0].reason, KillReason::SessionEnded);
+    }
+
+    #[test]
+    fn without_a_session_file_other_process_trees_are_never_linked() {
+        let mut f = fx();
+        hook(&f);
+        fs::remove_file(f.claude.path().join("sessions/20.json")).unwrap();
+        // Another claude process, no session file either, same worktree.
+        let web = f.wt.join("apps/web");
+        f.p()
+            .spawn(50, 10, START + 50 * SEC, "claude", f.wt.to_str().unwrap());
+        f.p()
+            .spawn(60, 50, START + 60 * SEC, "vite", web.to_str().unwrap());
+        f.p().add_listener(60, 5173);
+        end(&mut f, T0);
+        assert!(f.p().is_alive(60));
+        assert!(!f.p().signals().iter().any(|&(pid, _)| pid == 60));
+        assert!(f.state_servers().iter().all(|s| s.key.pid != 60));
+    }
+
+    #[test]
+    fn the_session_pid_must_be_a_claude_process() {
+        let mut f = fx();
+        hook(&f);
+        // The hook's bash is an ancestor too, but not Claude Code.
+        let e =
+            f.w.session_end(HOOK, 39, None, T0, &now_budget())
+                .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert!(f.p().signals().is_empty());
+    }
+
+    #[test]
+    fn a_listener_already_reparented_is_left_and_traced() {
+        // A background task moved out of the session before the hook ran:
+        // its shell now hangs off launchd, nothing proves it was ours.
+        let mut f = fx();
+        hook(&f);
+        let web = f.wt.join("apps/web");
+        f.p().spawn(
+            70,
+            1,
+            START + 70 * SEC,
+            "zsh -c python3",
+            web.to_str().unwrap(),
+        );
+        f.p().spawn(
+            71,
+            70,
+            START + 71 * SEC,
+            "python3 -m http.server 8790",
+            web.to_str().unwrap(),
+        );
+        f.p().add_listener(71, 8790);
+        let r = end(&mut f, T0);
+        assert!(f.p().is_alive(71));
+        assert!(!f
+            .p()
+            .signals()
+            .iter()
+            .any(|&(pid, _)| pid == 71 || pid == 70));
+        assert!(has_line(&r, &["left", ":8790", "71"]), "{:?}", r.trace);
     }
 
     // Notes.

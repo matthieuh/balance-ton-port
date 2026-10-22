@@ -1,7 +1,7 @@
 //! `btp session-end`, `note`, `stale`, `recent` and `_finish-kill` against
 //! real processes. Every process signalled here is one this test spawned: a
-//! `sh` stands in for the Claude Code process (a session file names it), and
-//! a `perl` one-liner is its dev server. `BTP_DATA_DIR` and `HOME` point to a
+//! `bash` run under the name `claude` stands in for the Claude Code process,
+//! and a `perl` one-liner is its dev server. `BTP_DATA_DIR` and `HOME` point to a
 //! temp dir, `CLAUDE_CONFIG_DIR` is unset, and notifications go to a file
 //! (`BTP_TEST_NOTIFY_FILE`), so osascript never runs.
 #![cfg(target_os = "macos")]
@@ -48,7 +48,12 @@ impl Sandbox {
         c.env("BTP_DATA_DIR", self.data.path())
             .env("HOME", self.data.path())
             .env("BTP_TEST_NOTIFY_FILE", self.notify_file())
+            .env("BTP_HOOK_DEBUG", "1")
             .env_remove("CLAUDE_CONFIG_DIR");
+    }
+
+    fn debug_log(&self) -> String {
+        std::fs::read_to_string(self.data.path().join("session-end.log")).unwrap_or_default()
     }
 
     fn btp(&self) -> Command {
@@ -144,8 +149,10 @@ wait"#,
         btp = btp.display(),
         out = sb.data.path().join("out.txt").display(),
     );
-    let mut c = std::process::Command::new("/bin/sh");
-    c.arg("-c")
+    use std::os::unix::process::CommandExt;
+    let mut c = std::process::Command::new("/bin/bash");
+    c.arg0("claude")
+        .arg("-c")
         .arg(script)
         .current_dir(sb.wt.path())
         .stdin(Stdio::null())
@@ -166,6 +173,19 @@ fn perl_server(port: u16, ignore_term: bool) -> String {
     format!(
         "perl -MIO::Socket::INET -e '{term} $s=IO::Socket::INET->new(LocalAddr=>q(127.0.0.1),LocalPort=>{port},Listen=>5,ReuseAddr=>1) or die; @c=(); while(1){{ push @c, $s->accept }}'"
     )
+}
+
+/// The process listening on `port`, wherever it hangs.
+fn wait_port(port: u16) -> Spawned {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(l) = MacOs.listeners().into_iter().find(|l| l.port == port) {
+            let start = MacOs.proc_info(l.pid).unwrap().start_time;
+            return Spawned { pid: l.pid, start };
+        }
+        assert!(Instant::now() < deadline, "server never listened");
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// The process listening on `port` among the descendants of `root`.
@@ -255,6 +275,64 @@ fn session_end_stops_an_idle_server_and_hands_survivors_to_the_kill_stage() {
     // its server is gone.
     let status = session.0.wait().unwrap();
     assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+#[test]
+fn session_end_works_after_the_session_file_is_gone() {
+    // Claude Code removes its session file before SessionEnd hooks run, and
+    // no watcher tracked the server: the process identity is enough.
+    let sb = Sandbox::new();
+    let port = free_port();
+    let session = spawn_session(
+        &sb,
+        &perl_server(port, false),
+        "session-end --session-pid $$ --reason prompt_input_exit --session-id conv-1",
+    );
+    let sh = session.0.id() as i32;
+    let server = wait_listener(sh, port);
+    sb.session_file(sh, "conv-1");
+    std::fs::remove_file(sb.claude.path().join(format!("sessions/{sh}.json"))).unwrap();
+    std::fs::write(sb.data.path().join("go"), "").unwrap();
+    assert_eq!(run_result(&sb).0, 0);
+    assert!(
+        wait_gone(server.pid, Duration::from_secs(3)),
+        "server survived"
+    );
+    let log = sb.debug_log();
+    assert!(log.contains("reason=prompt_input_exit"), "{log}");
+    assert!(log.contains("session file: missing"), "{log}");
+    assert!(log.contains(&format!("linked :{port}")), "{log}");
+    assert!(log.contains(&format!("stopped :{port}")), "{log}");
+    assert!(
+        sb.notified().contains(&format!(":{port}.")),
+        "{}",
+        sb.notified()
+    );
+}
+
+#[test]
+fn a_server_already_moved_out_of_the_session_is_left_and_traced() {
+    // A background task detached before the hook ran: its parent exited and
+    // it hangs off launchd. Nothing proves it was the session's: left.
+    let sb = Sandbox::new();
+    let port = free_port();
+    let session = spawn_session(
+        &sb,
+        &format!("( {} & ); sleep 0", perl_server(port, false)),
+        "session-end --session-pid $$ --reason other",
+    );
+    let server = wait_port(port);
+    assert_eq!(MacOs.proc_info(server.pid).unwrap().ppid, 1);
+    let _ = session.0.id();
+    std::fs::write(sb.data.path().join("go"), "").unwrap();
+    assert_eq!(run_result(&sb).0, 0);
+    assert!(!wait_gone(server.pid, Duration::from_millis(500)), "killed");
+    let log = sb.debug_log();
+    assert!(
+        log.contains(&format!("left :{port} pid {}", server.pid)),
+        "{log}"
+    );
+    assert_eq!(sb.notified(), "");
 }
 
 #[test]
@@ -379,6 +457,8 @@ fn session_end_never_fails_even_on_bad_input() {
         .code(0)
         .stdout("");
     assert_eq!(sb.notified(), "");
+    // Diagnostics are opt-in: no BTP_HOOK_DEBUG, no log.
+    assert_eq!(sb.debug_log(), "");
 }
 
 #[test]

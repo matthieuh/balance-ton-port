@@ -16,6 +16,15 @@
 
 exec 2>/dev/null
 
+# BTP_HOOK_DEBUG=1 (off by default): one line per step, appended to
+# session-end.log in btp's data dir, next to the trace `btp session-end`
+# writes there.
+debug_log() {
+  [ "${BTP_HOOK_DEBUG:-}" = 1 ] || return 0
+  local dir="${BTP_DATA_DIR:-$HOME/Library/Application Support/balance-ton-port}"
+  mkdir -p "$dir" && printf '%s hook[%s] %s\n' "$(date +%s)" "$$" "$*" >>"$dir/session-end.log"
+}
+
 if [ "${1:-}" = --run ]; then
   exec </dev/null >/dev/null
   claude_pid="${2:-}" reason="${3:-}" session_id="${4:-}"
@@ -31,9 +40,12 @@ if [ "${1:-}" = --run ]; then
   . "$here/../scripts/lib.sh" || exit 0
   # Missing or too old: stay silent, the app or `btp watch` cleans up later.
   if bin="$(btp_find)"; then
+    debug_log "running $bin session-end (parent $PPID)"
     args=(session-end "--session-pid=$claude_pid" "--reason=$reason")
     [ -n "$session_id" ] && args+=("--session-id=$session_id")
     "$bin" "${args[@]}"
+  else
+    debug_log "no usable btp (missing or older than $BTP_MIN): nothing done"
   fi
   kill "$watchdog"
   exit 0
@@ -55,6 +67,14 @@ field() {
 }
 reason="$(field reason)"
 session_id="$(field session_id)"
+
+if [ "${BTP_HOOK_DEBUG:-}" = 1 ]; then
+  files=""
+  for d in "${CLAUDE_CONFIG_DIR:-}" "$HOME/.claude" "$HOME"/.claude-*; do
+    [ -n "$d" ] && [ -f "$d/sessions/$PPID.json" ] && files="$files $d/sessions/$PPID.json"
+  done
+  debug_log "reason=$reason session_id=$session_id ppid=$PPID ppid_command=$(ps -o comm= -p "$PPID") session file:${files:- missing}"
+fi
 
 # /clear and /resume keep the process: nothing to stop (btp agrees, this
 # only saves starting it).

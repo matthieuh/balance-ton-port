@@ -249,6 +249,28 @@ check "session-end: btp runs outside the hook's process group" \
 check "session-end: the hung btp still runs after the hook returned" pgrep -f "$fakebin/btp session-end" >/dev/null
 pkill -f "$fakebin/btp session-end"
 
+rm -rf "$work/btpdata"
+run_hook session-end.sh "$end_payload" with-btp
+settle
+check "session-end: no debug log by default" test ! -e "$work/btpdata/session-end.log"
+# The hook's parent writes its own session file first, as Claude Code does.
+printf '%s' "$end_payload" | env HOME="$work/home" PATH="$fakebin:$fix/bin:$BASE_PATH" \
+  BTP_HOOK_DEBUG=1 BTP_DATA_DIR="$work/btpdata" bash -c '
+    mkdir -p "$HOME/.claude/sessions"
+    echo "{}" >"$HOME/.claude/sessions/$$.json"
+    echo $$ >"$1"
+    "$2"
+    true' _ "$work/hookparent" "$plugin/hooks/session-end.sh"
+settle
+hp="$(cat "$work/hookparent")"
+check "session-end: BTP_HOOK_DEBUG logs the reason, parent and session file" \
+  grep -Eq "hook\[[0-9]+\] reason=prompt_input_exit session_id=conv-1 ppid=$hp .*session file: $work/home/.claude/sessions/$hp.json" "$work/btpdata/session-end.log"
+check "session-end: BTP_HOOK_DEBUG logs the btp run" grep -q "running $fakebin/btp session-end" "$work/btpdata/session-end.log"
+HOOK_ENV="BTP_HOOK_DEBUG=1 BTP_DATA_DIR=$work/btpdata" run_hook session-end.sh "${end_payload/prompt_input_exit/clear}"
+settle
+check "session-end: BTP_HOOK_DEBUG logs a missing session file" grep -q "reason=clear .*session file: missing" "$work/btpdata/session-end.log"
+check "session-end: debug still prints nothing" test "$code:$out$err" = "0:"
+
 FAKE_BTP_VERSION=x FAKE_SLEEP=0 run_hook session-end.sh "not json" with-btp
 check "session-end: garbage payload exits 0 silently" test "$code:$out$err" = "0:"
 
