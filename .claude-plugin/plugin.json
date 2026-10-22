@@ -1,0 +1,12 @@
+{
+  "name": "balance-ton-port",
+  "version": "0.1.0",
+  "description": "Stops the idle dev servers of a Claude Code session when it quits, and ships the btp agent skill",
+  "author": { "name": "Matthieu Hostache" },
+  "homepage": "https://github.com/matthieuh/balance-ton-port",
+  "repository": "https://github.com/matthieuh/balance-ton-port",
+  "license": "MIT",
+  "keywords": ["dev-server", "ports", "cleanup", "macos"],
+  "commands": "./plugin/commands/",
+  "hooks": "./plugin/hooks/hooks.json"
+}
