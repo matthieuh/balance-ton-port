@@ -130,7 +130,7 @@ crates/btp-core   Rust library: platform layer, sessions, linking, decide, kill,
 crates/btp-cli    the `btp` binary (clap)
 crates/btp-ffi    UniFFI wrapper around the core for Swift
 app/              SwiftUI menu bar app (XcodeGen project)
-skills/           the agent skill
+plugin/           the Claude Code plugin: hooks, install script, the agent skill (plugin/skills/)
 ```
 
 - `btp-core`: `platform` (a `Platform` trait; the macOS implementation uses libproc and sysctl for listening sockets, process info, ancestry, descendants and per-socket TCP states, plus `kill(2)`), `sessions` (session files and config dir discovery), `worktree`, `decide` (pure decision logic, unit-tested with fake clocks and fake process tables), `watcher` (link, refresh, observe, execute, the watch lock), `state`, `config`, and `labels`/`display` for readable names (`Expo (Metro)`, `repo › worktree`).

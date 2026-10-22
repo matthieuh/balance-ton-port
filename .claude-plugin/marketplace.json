@@ -7,7 +7,7 @@
   "plugins": [
     {
       "name": "balance-ton-port",
-      "source": "./",
+      "source": "./plugin",
       "description": "Stops the idle dev servers of a Claude Code session when it quits, and ships the btp agent skill"
     }
   ]

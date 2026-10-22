@@ -25,6 +25,12 @@ Settings > Secrets and variables > Actions, or `gh secret set NAME`:
 
 3. Check the release: download the dmg, `spctl -a -t open --context context:primary-signature -vv BalanceTonPort-0.1.0.dmg` must say `accepted, source=Notarized Developer ID`; open it, drag the app to Applications, then `spctl -a -vv "/Applications/Balance ton port.app"` must say the same.
 
+### The Claude Code plugin
+
+The plugin (`plugin/`) is installed from the repo's default branch, not from a release. Claude Code updates an installed plugin only when its version changes, so bump `version` in `plugin/.claude-plugin/plugin.json` in every change to `plugin/` that should reach users.
+
+`BTP_MIN_VERSION` in `plugin/scripts/lib.sh` is the oldest `btp` the hooks accept. Raise it when the hooks start calling a command or flag that only a newer `btp` has, and never above the version being released (the release workflow refuses a tag below it; `scripts/test-plugin.sh` notes when `btp-cli` is still below it, which is expected between raising it and the release bump). A `btp` below it makes the plugin offer an install, which refuses until a release at or above it is published.
+
 ### Publishing to Homebrew
 
 The tap lives in `matthieuh/homebrew-tap` (a public repo with that exact name, so `brew` finds it as `matthieuh/tap`). The templates are in `packaging/homebrew/`; each release attaches them already filled with its version and sha256 (`scripts/render-homebrew.sh` does it):

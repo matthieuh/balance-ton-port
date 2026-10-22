@@ -1,18 +1,26 @@
 # shellcheck shell=bash
 # Shared by the plugin's hooks and install script. Sourced, never run.
 
-# The oldest btp that has the commands the hooks call (`session-end`,
-# `stale`, `note`, `recent`). Kept equal to the btp-cli crate version
-# (plugin/tests/run.sh checks it), so a release bumps both together.
-BTP_MIN_VERSION="0.1.0"
+# The first btp that ships the commands the hooks call (`session-end`,
+# `stale`, `note`, `recent`). See RELEASING.md before changing it.
+# BTP_PLUGIN_MIN_VERSION overrides it (for testing a dev build).
+BTP_MIN_VERSION="0.2.0"
+BTP_MIN="${BTP_PLUGIN_MIN_VERSION:-$BTP_MIN_VERSION}"
+
+# shellcheck disable=SC2034 # used by install-btp.sh and session-start.sh
+BTP_REPO="matthieuh/balance-ton-port"
+# shellcheck disable=SC2034
+BTP_LATEST_URL="https://api.github.com/repos/$BTP_REPO/releases/latest"
 
 # The marker install-btp.sh leaves next to the btp it installed. It holds
 # that file's sha256: a btp is replaced only while it still matches.
-# shellcheck disable=SC2034 # used by install-btp.sh
+# shellcheck disable=SC2034
 BTP_MARKER_NAME=".btp-installed-by-balance-ton-port"
 
-# Where the plugin keeps its own state (the "no" to the install). Claude
-# Code sets CLAUDE_PLUGIN_DATA for hooks; the install command passes it.
+# Where the plugin keeps its own state: install-declined (the user's "no"),
+# install-refused (the release tag an install refused), latest-release-tag
+# (a day-long cache of the latest tag). Claude Code sets CLAUDE_PLUGIN_DATA
+# for hooks; the install command passes it.
 btp_data_dir() {
   printf '%s\n' "${CLAUDE_PLUGIN_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/balance-ton-port-plugin}"
 }
@@ -43,14 +51,13 @@ btp_version() {
   printf '%s\n' "$out"
 }
 
-# btp_usable PATH: the binary is recent enough for the hooks. The version
-# alone is not enough while the minimum equals the last release's number,
-# so the `stale` command must exist too.
+# btp_usable PATH: the binary is recent enough for the hooks: its version
+# is at least the minimum and it has the `stale` command.
 btp_usable() {
   local v
   [ -x "$1" ] || return 1
   v="$(btp_version "$1")" || return 1
-  btp_version_ge "$v" "$BTP_MIN_VERSION" || return 1
+  btp_version_ge "$v" "$BTP_MIN" || return 1
   "$1" stale --help >/dev/null 2>&1
 }
 
@@ -101,4 +108,18 @@ btp_json_escape() {
   s="${s//$'\r'/\\r}"
   s="${s//$'\t'/\\t}"
   printf '%s' "$s"
+}
+
+# btp_fetch URL FILE [MAX_SECONDS]: HTTPS GET into FILE.
+btp_fetch() {
+  curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+    --max-time "${3:-120}" -o "$2" "$1"
+}
+
+# btp_tag_of FILE: the tag_name of a GitHub release JSON, or fails.
+btp_tag_of() {
+  local tag
+  tag="$(plutil -extract tag_name raw -o - "$1" 2>/dev/null)" || return 1
+  [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  printf '%s\n' "$tag"
 }

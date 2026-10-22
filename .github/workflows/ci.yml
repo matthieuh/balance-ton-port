@@ -69,7 +69,7 @@ jobs:
       - name: Plugin tests
         run: |
           command -v shellcheck >/dev/null || brew install shellcheck
-          plugin/tests/run.sh
+          scripts/test-plugin.sh
 
       - name: Build xcframework
         run: scripts/build-xcframework.sh

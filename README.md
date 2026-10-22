@@ -95,7 +95,7 @@ What a quit stopped is shown as one macOS notification and in the app's recent k
 Teaches agents to run `btp list --json` before starting a server, reuse or free ports with `btp`, note their intent (`btp note <port> --keep "<why>"` or `--done`), and `btp sweep` at the end of a task, instead of `lsof | xargs kill`. The plugin installs it; without the plugin:
 
 ```bash
-cp -r skills/balance-ton-port ~/.claude/skills/
+cp -r plugin/skills/balance-ton-port ~/.claude/skills/
 ```
 
 If you use a custom `CLAUDE_CONFIG_DIR`, copy it into that directory's `skills/` folder instead.
