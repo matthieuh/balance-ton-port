@@ -3,11 +3,15 @@
 //! held, 2 internal error.
 
 use btp_core::config::{data_dir, effective_claude_dirs, read_config, save_config};
+use btp_core::display::format_idle as ago;
 use btp_core::display::{format_idle, server_state as state_label};
 use btp_core::model::{KillReason, KillTarget};
 use btp_core::platform::MacOs;
-use btp_core::state::KillRecord;
-use btp_core::watcher::{acquire_watch_lock, now_ms, ServerView, TickReport, Watcher};
+use btp_core::state::{KillRecord, SessionEndedGroup};
+use btp_core::watcher::{
+    acquire_watch_lock, finish_kill, now_ms, EndBudget, NoteCmd, NoteOutcome, ServerView,
+    TickReport, Watcher,
+};
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use std::io;
@@ -50,6 +54,59 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<ConfigCmd>,
     },
+    /// List the last kills
+    Recent {
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Tell btp your intent for a server of your own Claude Code session
+    Note(NoteArgs),
+    /// Servers of an earlier conversation of your session, idle more than
+    /// 5 min (JSON; each is listed once)
+    Stale {
+        /// The current conversation id
+        #[arg(long)]
+        conversation: String,
+    },
+    /// Claude Code SessionEnd hook: stop the idle servers of the session
+    /// that quits. Prints nothing and always exits 0.
+    SessionEnd(SessionEndArgs),
+    /// Detached SIGKILL stage of `session-end` (internal)
+    #[command(name = "_finish-kill", hide = true)]
+    FinishKill {
+        /// When to send SIGKILL, Unix milliseconds
+        #[arg(long)]
+        deadline_ms: u64,
+        /// `<pid>:<start time>` pairs
+        targets: Vec<String>,
+    },
+}
+
+#[derive(Args)]
+#[command(group(clap::ArgGroup::new("intent").required(true).args(["keep", "done"])))]
+struct NoteArgs {
+    /// Port the server listens on
+    port: u16,
+    /// Spare it when the session ends and stop alerts, with an optional reason
+    #[arg(long, num_args = 0..=1, value_name = "REASON")]
+    keep: Option<Option<String>>,
+    /// You are done with it: stopped when the session ends, once idle
+    #[arg(long)]
+    done: bool,
+}
+
+#[derive(Args)]
+struct SessionEndArgs {
+    /// The Claude Code process (the hook's parent)
+    #[arg(long)]
+    session_pid: i32,
+    /// The SessionEnd `reason` from the hook payload
+    #[arg(long)]
+    reason: String,
+    /// The conversation id from the hook payload
+    #[arg(long)]
+    session_id: Option<String>,
 }
 
 #[derive(Args)]
@@ -104,6 +161,11 @@ impl From<io::Error> for Failure {
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(c) => c,
+        // The SessionEnd hook never fails Claude Code's shutdown.
+        Err(e) if std::env::args().nth(1).as_deref() == Some("session-end") => {
+            eprintln!("btp: session-end: {}", e.kind());
+            return ExitCode::SUCCESS;
+        }
         Err(e) => {
             let code = if e.use_stderr() { 1 } else { 0 };
             let _ = e.print();
@@ -191,6 +253,81 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
             Ok(0)
         }
         Cmd::Watch => watch(dir),
+        Cmd::SessionEnd(a) => {
+            // Any internal error or panic still exits 0.
+            let notify = notifier();
+            if std::panic::catch_unwind(|| session_end(dir, &a, notify.as_ref())).is_err() {
+                eprintln!("btp: session-end failed");
+            }
+            Ok(0)
+        }
+        Cmd::FinishKill {
+            deadline_ms,
+            targets,
+        } => {
+            let targets = parse_targets(&targets);
+            let wait =
+                Duration::from_millis(deadline_ms.saturating_sub(now_ms())).min(MAX_FINISH_WAIT);
+            finish_kill(&MacOs, &targets, Instant::now() + wait);
+            Ok(0)
+        }
+        Cmd::Note(a) => {
+            let cmd = match (a.keep, a.done) {
+                (Some(reason), false) => NoteCmd::Keep(reason),
+                (None, true) => NoteCmd::Done,
+                _ => return Err(Failure::User("give --keep [reason] or --done".into())),
+            };
+            let mut w = Watcher::new(MacOs, dir);
+            let out = w.note(std::process::id() as i32, a.port, cmd.clone(), now_ms())?;
+            warn_config(w.config_error());
+            match out {
+                NoteOutcome::Set { port, tool_label } => {
+                    match cmd {
+                        NoteCmd::Keep(_) => println!("noted: keep {tool_label} :{port}"),
+                        NoteCmd::Done => println!("noted: done with {tool_label} :{port}"),
+                    }
+                    Ok(0)
+                }
+                NoteOutcome::NoSession => Err(Failure::User(
+                    "not run from a Claude Code session: notes only apply to your own session's servers".into(),
+                )),
+                NoteOutcome::NotTracked => Err(Failure::User(format!(
+                    "no tracked server on port {}",
+                    a.port
+                ))),
+                NoteOutcome::OtherSession => Err(Failure::User(format!(
+                    "port {} belongs to another Claude Code session: notes only apply to your own session's servers",
+                    a.port
+                ))),
+            }
+        }
+        Cmd::Stale { conversation } => {
+            let mut w = Watcher::new(MacOs, dir);
+            let out = w.stale(std::process::id() as i32, &conversation, now_ms())?;
+            warn_config(w.config_error());
+            let Some(list) = out else {
+                return Err(Failure::User("not run from a Claude Code session".into()));
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&list)
+                    .map_err(|e| Failure::Internal(e.to_string()))?
+            );
+            Ok(0)
+        }
+        Cmd::Recent { json } => {
+            let kills = btp_core::state::with_state(&dir, |s| s.recent_kills.clone())?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&kills)
+                        .map_err(|e| Failure::Internal(e.to_string()))?
+                );
+            } else {
+                print!("{}", render_recent(&kills, now_ms()));
+            }
+            Ok(0)
+        }
         Cmd::Config { action } => {
             // A broken file is reported, never shown or saved as defaults
             // (saving would erase what the user wrote).
@@ -255,6 +392,219 @@ fn watch(dir: std::path::PathBuf) -> Result<u8, Failure> {
         }
     }
     Ok(0)
+}
+
+/// SessionEnd budget: Claude Code gives the hook about 1.5 s in all, the
+/// hook script and process start included. A pass takes tens of ms.
+const SAMPLE_WINDOW: Duration = Duration::from_millis(300);
+const SAMPLE_EVERY: Duration = Duration::from_millis(100);
+/// From the start of `session-end` to the hand-off of the survivors.
+const TERM_BUDGET: Duration = Duration::from_millis(900);
+/// `_finish-kill` never waits longer than this, whatever it is given.
+const MAX_FINISH_WAIT: Duration = Duration::from_secs(120);
+const NOTIFY_TITLE: &str = "Balance ton port";
+
+/// Posts a notification (title, subtitle, body).
+type Notifier<'a> = dyn Fn(&str, &str, &str) + std::panic::RefUnwindSafe + 'a;
+
+/// The real notifier is `osascript`, detached and not waited for. Tests set
+/// `BTP_TEST_NOTIFY_FILE` to get one line per notification in that file
+/// instead (osascript never runs then).
+fn notifier() -> Box<Notifier<'static>> {
+    if let Some(path) = std::env::var_os("BTP_TEST_NOTIFY_FILE") {
+        return Box::new(move |title, subtitle, body| {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = writeln!(f, "{title}|{subtitle}|{body}");
+            }
+        });
+    }
+    Box::new(|title, subtitle, body| {
+        // The text goes in as arguments, never into the script source.
+        let mut cmd = std::process::Command::new("/usr/bin/osascript");
+        cmd.args([
+            "-e",
+            "on run argv",
+            "-e",
+            "display notification (item 1 of argv) with title (item 2 of argv) subtitle (item 3 of argv)",
+            "-e",
+            "end run",
+            body,
+            title,
+            subtitle,
+        ]);
+        if let Err(e) = spawn_detached(cmd) {
+            eprintln!("btp: could not post the notification: {e}");
+        }
+    })
+}
+
+/// Runs `cmd` fully detached: double fork (the intermediate process exits
+/// at once and is reaped here), new session, stdio to /dev/null. Returns as
+/// soon as the grandchild has exec'd.
+fn spawn_detached(mut cmd: std::process::Command) -> io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: only async-signal-safe calls (setsid, fork, _exit) between
+    // fork and exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            match libc::fork() {
+                -1 => Err(io::Error::last_os_error()),
+                0 => Ok(()),
+                _ => libc::_exit(0),
+            }
+        });
+    }
+    let mut child = cmd.spawn()?;
+    child.wait()?;
+    Ok(())
+}
+
+/// Claude Code's SessionEnd `reason` values that mean the process stops.
+/// `clear` and `resume` keep the process (a new conversation); anything
+/// unknown does nothing either (the normal rules still apply).
+fn ends_process(reason: &str) -> bool {
+    matches!(reason, "prompt_input_exit" | "other" | "logout")
+}
+
+/// `<pid>:<start time>` pairs; malformed ones, and pids <= 1, are dropped.
+fn parse_targets(raw: &[String]) -> Vec<(i32, u64)> {
+    raw.iter()
+        .filter_map(|t| {
+            let (pid, start) = t.split_once(':')?;
+            let pid: i32 = pid.parse().ok()?;
+            let start: u64 = start.parse().ok()?;
+            (pid > 1).then_some((pid, start))
+        })
+        .collect()
+}
+
+/// At most this many servers are named per list in a notification.
+const NAMED_MAX: usize = 4;
+
+fn name_list(items: Vec<String>) -> String {
+    let more = items.len().saturating_sub(NAMED_MAX);
+    let shown = items
+        .into_iter()
+        .take(NAMED_MAX)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if more > 0 {
+        format!("{shown} and {more} more")
+    } else {
+        shown
+    }
+}
+
+/// The notification for a group: (subtitle, body).
+fn notification_text(g: &SessionEndedGroup) -> (String, String) {
+    let mut parts = Vec::new();
+    if !g.stopped.is_empty() {
+        let names = g
+            .stopped
+            .iter()
+            .map(|s| format!("{} :{}", s.tool_label, s.port))
+            .collect();
+        parts.push(format!("Stopped {}.", name_list(names)));
+    }
+    if !g.still_open.is_empty() {
+        let names = g
+            .still_open
+            .iter()
+            .map(|s| {
+                let why = if s.in_use { "in use" } else { "kept" };
+                format!("{} :{} ({why})", s.tool_label, s.port)
+            })
+            .collect();
+        parts.push(format!("Still open: {}.", name_list(names)));
+    }
+    let subtitle = if g.session_name.is_empty() {
+        "Session ended".to_string()
+    } else {
+        format!("Session ended: {}", g.session_name)
+    };
+    (subtitle, parts.join(" "))
+}
+
+/// One line per kill, newest first: `12 min ago  :5173 vite (app) [session ended]`.
+fn render_recent(kills: &[KillRecord], now: u64) -> String {
+    if kills.is_empty() {
+        return "no kills yet\n".to_string();
+    }
+    kills
+        .iter()
+        .map(|k| {
+            let age = ago(now.saturating_sub(k.at_ms));
+            let age = if age.starts_with('<') {
+                "just now".to_string()
+            } else {
+                format!("{age} ago")
+            };
+            format!("{age}  {}\n", describe_kill(k))
+        })
+        .collect()
+}
+
+fn session_end(dir: std::path::PathBuf, a: &SessionEndArgs, notify: &Notifier) {
+    if !ends_process(&a.reason) {
+        return;
+    }
+    let started = Instant::now();
+    let budget = EndBudget {
+        sample_window: SAMPLE_WINDOW,
+        sample_every: SAMPLE_EVERY,
+        term_until: started + TERM_BUDGET,
+    };
+    let mut w = Watcher::new(MacOs, dir);
+    let me = std::process::id() as i32;
+    let report = match w.session_end(
+        me,
+        a.session_pid,
+        a.session_id.as_deref(),
+        now_ms(),
+        &budget,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("btp: session-end: {e}");
+            return;
+        }
+    };
+    // The SIGKILL stage first: it matters more than the message.
+    if !report.survivors.is_empty() {
+        let grace_ms = w.config().kill_grace_s.saturating_mul(1000);
+        let deadline = now_ms().saturating_sub(started.elapsed().as_millis() as u64) + grace_ms;
+        match std::env::current_exe() {
+            Ok(exe) => {
+                let mut cmd = std::process::Command::new(exe);
+                cmd.arg("_finish-kill")
+                    .arg("--deadline-ms")
+                    .arg(deadline.to_string())
+                    .args(report.survivors.iter().map(|(p, s)| format!("{p}:{s}")));
+                if let Err(e) = spawn_detached(cmd) {
+                    eprintln!("btp: could not start the SIGKILL stage: {e}");
+                }
+            }
+            Err(e) => eprintln!("btp: could not start the SIGKILL stage: {e}"),
+        }
+    }
+    if report.post_notification {
+        if let Some(g) = &report.group {
+            let (subtitle, body) = notification_text(g);
+            notify(NOTIFY_TITLE, &subtitle, &body);
+        }
+    }
 }
 
 /// Reports a `config.toml` that could not be used (stderr).
@@ -396,6 +746,162 @@ mod tests {
         assert_eq!(state_label(&view(1, false, 0)), "session dead");
         assert_eq!(state_label(&view(1, true, 1_000)), "active");
         assert_eq!(state_label(&view(1, true, 600_000)), "idle");
+    }
+
+    #[test]
+    fn only_a_real_stop_ends_the_process() {
+        for r in ["prompt_input_exit", "other", "logout"] {
+            assert!(ends_process(r), "{r}");
+        }
+        for r in [
+            "clear",
+            "resume",
+            "bypass_permissions_disabled",
+            "",
+            "OTHER",
+        ] {
+            assert!(!ends_process(r), "{r}");
+        }
+    }
+
+    #[test]
+    fn finish_kill_targets_parse_strictly() {
+        let raw: Vec<String> = [
+            "12:34", "bad", "1:5", "0:5", "-3:5", "7:x", "8:9:10", "40:41",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(parse_targets(&raw), vec![(12, 34), (40, 41)]);
+    }
+
+    fn group(stopped: &[(&str, u16)], open: &[(&str, u16, bool)]) -> SessionEndedGroup {
+        use btp_core::state::GroupServer;
+        let key = ServerKey {
+            pid: 9,
+            start_time: 9,
+        };
+        SessionEndedGroup {
+            session_pid: 1,
+            session_proc_start: "x".into(),
+            conversation_id: "c".into(),
+            session_name: "web-app".into(),
+            at_ms: 0,
+            stopped: stopped
+                .iter()
+                .map(|&(l, port)| GroupServer {
+                    key,
+                    port,
+                    tool_label: l.into(),
+                    in_use: false,
+                })
+                .collect(),
+            still_open: open
+                .iter()
+                .map(|&(l, port, in_use)| GroupServer {
+                    key,
+                    port,
+                    tool_label: l.into(),
+                    in_use,
+                })
+                .collect(),
+            delivered: true,
+        }
+    }
+
+    #[test]
+    fn notification_names_stopped_and_still_open_servers() {
+        let (sub, body) = notification_text(&group(
+            &[("Vite", 5173), ("Astro", 4322)],
+            &[("Expo (Metro)", 8081, true), ("Bun dev", 3000, false)],
+        ));
+        assert_eq!(sub, "Session ended: web-app");
+        assert_eq!(
+            body,
+            "Stopped Vite :5173, Astro :4322. Still open: Expo (Metro) :8081 (in use), Bun dev :3000 (kept)."
+        );
+        let (_, body) = notification_text(&group(&[("Vite", 5173)], &[]));
+        assert_eq!(body, "Stopped Vite :5173.");
+        let (_, body) = notification_text(&group(&[], &[("Vite", 5173, true)]));
+        assert_eq!(body, "Still open: Vite :5173 (in use).");
+    }
+
+    #[test]
+    fn notification_caps_long_lists() {
+        let many: Vec<(&str, u16)> = (0..6).map(|i| ("Vite", 5000 + i)).collect();
+        let (_, body) = notification_text(&group(&many, &[]));
+        assert_eq!(
+            body,
+            "Stopped Vite :5000, Vite :5001, Vite :5002, Vite :5003 and 2 more."
+        );
+    }
+
+    #[test]
+    fn recent_lists_kills_newest_first_with_their_age() {
+        let rec = |port, reason, at_ms| KillRecord {
+            port,
+            command: "vite".into(),
+            worktree: "/repo/app".into(),
+            reason,
+            at_ms,
+        };
+        let now = 1_000 * 60_000;
+        let text = render_recent(
+            &[
+                rec(5173, KillReason::SessionEnded, now - 12 * 60_000),
+                rec(3000, KillReason::Manual, now - 2 * 3_600_000),
+            ],
+            now,
+        );
+        assert_eq!(
+            text,
+            "12 min ago  :5173 vite (app) [session ended]\n2 h ago  :3000 vite (app) [manual]\n"
+        );
+        assert_eq!(render_recent(&[], now), "no kills yet\n");
+    }
+
+    #[test]
+    fn clear_and_resume_do_nothing_at_all() {
+        let d = tempfile::tempdir().unwrap();
+        let called = std::sync::atomic::AtomicBool::new(false);
+        let notify = |_: &str, _: &str, _: &str| {
+            called.store(true, std::sync::atomic::Ordering::SeqCst);
+        };
+        for reason in ["clear", "resume"] {
+            let a = SessionEndArgs {
+                session_pid: std::process::id() as i32,
+                reason: reason.into(),
+                session_id: None,
+            };
+            session_end(d.path().to_path_buf(), &a, &notify);
+        }
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+        // Nothing read or written: the data dir stays empty.
+        assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_session_pid_that_is_not_an_ancestor_does_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let called = std::sync::atomic::AtomicBool::new(false);
+        let notify = |_: &str, _: &str, _: &str| {
+            called.store(true, std::sync::atomic::Ordering::SeqCst);
+        };
+        let a = SessionEndArgs {
+            session_pid: child.id() as i32,
+            reason: "prompt_input_exit".into(),
+            session_id: None,
+        };
+        session_end(d.path().to_path_buf(), &a, &notify);
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(child.try_wait().unwrap().is_none(), "never signalled");
+        assert!(!d.path().join("state.json").exists());
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[test]

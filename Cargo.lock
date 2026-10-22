@@ -202,6 +202,7 @@ dependencies = [
  "btp-core",
  "clap",
  "ctrlc",
+ "libc",
  "predicates",
  "serde",
  "serde_json",

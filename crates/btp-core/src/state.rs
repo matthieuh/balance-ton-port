@@ -1,4 +1,4 @@
-use crate::model::{KillReason, TrackedServer};
+use crate::model::{KillReason, ServerKey, TrackedServer};
 use fs4::FileExt;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -6,6 +6,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 const MAX_RECENT_KILLS: usize = 5;
+/// Session-ended groups kept in the state (oldest dropped first).
+const MAX_SESSION_ENDED: usize = 20;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KillRecord {
@@ -22,6 +24,45 @@ pub struct State {
     pub servers: Vec<TrackedServer>,
     #[serde(default)]
     pub recent_kills: Vec<KillRecord>,
+    /// What each session end did, for one grouped notification per ended
+    /// session (oldest first).
+    #[serde(default)]
+    pub session_ended: Vec<SessionEndedGroup>,
+}
+
+/// One server named in a session-ended group.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupServer {
+    pub key: ServerKey,
+    pub port: u16,
+    pub tool_label: String,
+    /// Still open only: `true` when a connection kept it (a browser tab),
+    /// `false` when it was kept on purpose (Keep or a keep note).
+    #[serde(default)]
+    pub in_use: bool,
+}
+
+/// What `btp session-end` did for one Claude Code process that quit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionEndedGroup {
+    pub session_pid: i32,
+    pub session_proc_start: String,
+    /// The conversation id the hook passed, empty when it passed none.
+    #[serde(default)]
+    pub conversation_id: String,
+    #[serde(default)]
+    pub session_name: String,
+    pub at_ms: u64,
+    /// Servers sent SIGTERM.
+    #[serde(default)]
+    pub stopped: Vec<GroupServer>,
+    /// Servers of that session left running.
+    #[serde(default)]
+    pub still_open: Vec<GroupServer>,
+    /// The notification went out (posted by the hook itself when no app
+    /// held the watch lock, else set by the app once delivered).
+    #[serde(default)]
+    pub delivered: bool,
 }
 
 impl State {
@@ -29,6 +70,13 @@ impl State {
     pub fn record_kill(&mut self, r: KillRecord) {
         self.recent_kills.insert(0, r);
         self.recent_kills.truncate(MAX_RECENT_KILLS);
+    }
+
+    /// Appends a group and keeps the 20 newest.
+    pub fn record_session_ended(&mut self, g: SessionEndedGroup) {
+        self.session_ended.push(g);
+        let extra = self.session_ended.len().saturating_sub(MAX_SESSION_ENDED);
+        self.session_ended.drain(..extra);
     }
 }
 

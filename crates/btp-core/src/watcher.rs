@@ -21,6 +21,9 @@ use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+mod session;
+pub use session::{EndBudget, NoteCmd, NoteOutcome, SessionEndReport, StaleServer};
+
 /// One tracked server as the UI and the CLI show it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ServerView {
@@ -278,8 +281,20 @@ fn signal_checked(p: &dyn Platform, pid: i32, start_time: u64, sig: i32) -> bool
 /// reused pid is never hit. Returns `false`, sending nothing, when `key` is
 /// no longer the running process.
 pub fn kill_tree(p: &dyn Platform, key: ServerKey, grace: Duration, cfg: &Config) -> bool {
-    if !same_process(p, key.pid, key.start_time) {
+    let Some(targets) = term_tree(p, key, cfg) else {
         return false;
+    };
+    finish_kill(p, &targets, Instant::now() + grace);
+    true
+}
+
+/// The first stage of `kill_tree`: snapshots the tree as (pid, start time)
+/// and sends SIGTERM to each target, start time re-checked right before.
+/// `None`, sending nothing more, when `key` is no longer the running process
+/// or refused the signal.
+pub fn term_tree(p: &dyn Platform, key: ServerKey, cfg: &Config) -> Option<Vec<(i32, u64)>> {
+    if !same_process(p, key.pid, key.start_time) {
+        return None;
     }
     let mut targets = vec![(key.pid, key.start_time)];
     // A Claude Code process started from the server (and whatever it runs)
@@ -288,28 +303,44 @@ pub fn kill_tree(p: &dyn Platform, key: ServerKey, grace: Duration, cfg: &Config
     // nor anything they run.
     targets.extend(own_descendants(p, key.pid, &|c| is_excluded(c, cfg)));
     if !signal_checked(p, key.pid, key.start_time, libc::SIGTERM) {
-        return false;
+        return None;
     }
     for &(pid, start) in &targets[1..] {
         signal_checked(p, pid, start, libc::SIGTERM);
     }
-    let deadline = Instant::now() + grace;
-    let survivors = |targets: &[(i32, u64)]| -> Vec<(i32, u64)> {
-        targets
-            .iter()
-            .copied()
-            .filter(|&(pid, start)| same_process(p, pid, start))
-            .collect()
-    };
-    let mut left = survivors(&targets);
-    while !left.is_empty() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(100).min(grace));
-        left = survivors(&left);
+    Some(targets)
+}
+
+/// The targets that are still the very process snapshotted.
+fn survivors(p: &dyn Platform, targets: &[(i32, u64)]) -> Vec<(i32, u64)> {
+    targets
+        .iter()
+        .copied()
+        .filter(|&(pid, start)| same_process(p, pid, start))
+        .collect()
+}
+
+/// Polls every 100 ms until every target is gone or `deadline` passed;
+/// returns the survivors.
+pub fn wait_gone(p: &dyn Platform, targets: &[(i32, u64)], deadline: Instant) -> Vec<(i32, u64)> {
+    let mut left = survivors(p, targets);
+    loop {
+        let now = Instant::now();
+        if left.is_empty() || now >= deadline {
+            return left;
+        }
+        std::thread::sleep(Duration::from_millis(100).min(deadline - now));
+        left = survivors(p, &left);
     }
-    for (pid, start) in left {
+}
+
+/// The last stage of `kill_tree`: waits for the targets until `deadline`,
+/// then SIGKILL to each survivor whose start time still matches. Never
+/// pid <= 1 or ourselves.
+pub fn finish_kill(p: &dyn Platform, targets: &[(i32, u64)], deadline: Instant) {
+    for (pid, start) in wait_gone(p, targets, deadline) {
         signal_checked(p, pid, start, libc::SIGKILL);
     }
-    true
 }
 
 /// Exclusive ownership of the watch loop (the app or `btp watch`). Released
@@ -356,6 +387,23 @@ pub fn acquire_watch_lock(dir: &Path, owner: &str) -> io::Result<WatchLock> {
     }
 }
 
+/// `true` while another process (the app or `btp watch`) holds
+/// `watch.lock`. Probes with a try-lock released at once, never writes the
+/// owner name. `false` when the file cannot be opened.
+pub fn watch_lock_held(dir: &Path) -> bool {
+    let Ok(file) = File::open(dir.join("watch.lock")) else {
+        return false;
+    };
+    match FileExt::try_lock(&file) {
+        Ok(()) => {
+            let _ = FileExt::unlock(&file);
+            false
+        }
+        Err(TryLockError::WouldBlock) => true,
+        Err(TryLockError::Error(_)) => false,
+    }
+}
+
 /// Milliseconds since the Unix epoch, from the system clock.
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -376,6 +424,7 @@ enum Mode {
 }
 
 /// A live Claude Code session (its process verified) and its worktree.
+#[derive(Clone)]
 struct LiveSession {
     session: ClaudeSession,
     root: PathBuf,
@@ -768,12 +817,32 @@ impl<P: Platform> Watcher<P> {
         cfg: &Config,
         now_ms: u64,
     ) -> io::Result<(Vec<KillRecord>, HashSet<ServerKey>)> {
-        if targets.is_empty() {
-            return Ok((Vec::new(), HashSet::new()));
-        }
         let grace = Duration::from_secs(cfg.kill_grace_s);
-        let mut killed = Vec::new();
-        let mut dropped = HashSet::new();
+        let done = self.execute_staged(targets, cfg, now_ms, Stage::Full(grace))?;
+        Ok((
+            done.killed.into_iter().map(|(_, r)| r).collect(),
+            done.dropped,
+        ))
+    }
+
+    /// `execute` with a choice of stage: the whole kill per target, or
+    /// SIGTERM to every target then one shared wait until a deadline, the
+    /// survivors returned for a later SIGKILL (`finish_kill`). Every target
+    /// gets the same checks as a pass first: config re-read from disk,
+    /// exclusions on the command, any port of the tree and the ancestors
+    /// below the session.
+    pub(crate) fn execute_staged(
+        &self,
+        targets: Vec<(TrackedServer, KillReason)>,
+        cfg: &Config,
+        now_ms: u64,
+        stage: Stage,
+    ) -> io::Result<Executed> {
+        let mut out = Executed::default();
+        if targets.is_empty() {
+            return Ok(out);
+        }
+        let mut termed = Vec::new();
         for (s, reason) in &targets {
             // Kills can wait seconds each: an exclusion saved meanwhile
             // still protects the next target, with the same check as a pass
@@ -781,11 +850,21 @@ impl<P: Platform> Watcher<P> {
             let fresh = read_config(&self.data_dir).unwrap_or_else(|_| cfg.clone());
             let tree = tree_of(&self.platform, s, &self.platform.listeners());
             if self.excluded_now(s, &tree, &fresh) {
-                dropped.insert(s.key);
+                out.dropped.insert(s.key);
                 continue;
             }
-            if kill_tree(&self.platform, s.key, grace, &fresh) {
-                killed.push(record(s, reason.clone(), now_ms));
+            let sent = match stage {
+                Stage::Full(grace) => kill_tree(&self.platform, s.key, grace, &fresh),
+                Stage::TermUntil(_) => match term_tree(&self.platform, s.key, &fresh) {
+                    Some(t) => {
+                        termed.extend(t);
+                        true
+                    }
+                    None => false,
+                },
+            };
+            if sent {
+                out.killed.push((s.key, record(s, reason.clone(), now_ms)));
             } else if same_process(&self.platform, s.key.pid, s.key.start_time) {
                 // Still our process but the signal was refused (EPERM):
                 // keep tracking it so a later pass can retry.
@@ -795,19 +874,41 @@ impl<P: Platform> Watcher<P> {
                 );
                 continue;
             }
-            dropped.insert(s.key);
+            out.dropped.insert(s.key);
+        }
+        if let Stage::TermUntil(deadline) = stage {
+            out.survivors = wait_gone(&self.platform, &termed, deadline);
         }
         with_state(&self.data_dir, |state| {
-            state.servers.retain(|s| !dropped.contains(&s.key));
-            for r in &killed {
+            state.servers.retain(|s| !out.dropped.contains(&s.key));
+            for (_, r) in &out.killed {
                 state.record_kill(r.clone());
             }
         })?;
-        for r in &killed {
+        for (_, r) in &out.killed {
             append_kill_log(&self.data_dir, r)?;
         }
-        Ok((killed, dropped))
+        Ok(out)
     }
+}
+
+/// How far `execute_staged` goes.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Stage {
+    /// SIGTERM, grace, SIGKILL, one target after the other.
+    Full(Duration),
+    /// SIGTERM to every target, then wait until the deadline at most.
+    TermUntil(Instant),
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct Executed {
+    /// Signalled servers, in target order.
+    pub killed: Vec<(ServerKey, KillRecord)>,
+    /// No longer tracked (signalled, gone or excluded).
+    pub dropped: HashSet<ServerKey>,
+    /// `TermUntil` only: processes still running at the deadline.
+    pub survivors: Vec<(i32, u64)>,
 }
 
 /// Resolved path, so `/tmp/x` and `/private/tmp/x` compare equal; the path
@@ -893,49 +994,49 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    const MIN: u64 = 60_000;
+    pub(super) const MIN: u64 = 60_000;
     /// Fake wall clock, milliseconds.
-    const T0: u64 = 1_800_000_000_000;
+    pub(super) const T0: u64 = 1_800_000_000_000;
     /// Base process start time, microseconds.
-    const START: u64 = 1_790_000_000_000_000;
+    pub(super) const START: u64 = 1_790_000_000_000_000;
     /// One second in microseconds: `procStart` has a one-second resolution.
-    const SEC: u64 = 1_000_000;
-    const TERM: i32 = libc::SIGTERM;
-    const KILL: i32 = libc::SIGKILL;
+    pub(super) const SEC: u64 = 1_000_000;
+    pub(super) const TERM: i32 = libc::SIGTERM;
+    pub(super) const KILL: i32 = libc::SIGKILL;
 
     /// launchd(1) > zsh(10) > claude(20, session "sess-a") > `bun run dev`
     /// (30, listens on 3000) > workerd (31). The server runs in
     /// `<repo>/wt/apps/web`, `<repo>/wt` being a linked worktree.
-    struct Fx {
-        data: TempDir,
-        claude: TempDir,
-        repo: TempDir,
-        wt: PathBuf,
-        w: Watcher<FakePlatform>,
+    pub(super) struct Fx {
+        pub(super) data: TempDir,
+        pub(super) claude: TempDir,
+        pub(super) repo: TempDir,
+        pub(super) wt: PathBuf,
+        pub(super) w: Watcher<FakePlatform>,
     }
 
     impl Fx {
-        fn p(&self) -> &FakePlatform {
+        pub(super) fn p(&self) -> &FakePlatform {
             self.w.platform()
         }
 
-        fn session(&self, pid: i32, id: &str, cwd: &Path, start: u64) {
+        pub(super) fn session(&self, pid: i32, id: &str, cwd: &Path, start: u64) {
             write_session(self.claude.path(), pid, id, cwd, start);
         }
 
-        fn cfg(&self) -> Config {
+        pub(super) fn cfg(&self) -> Config {
             crate::config::read_config(self.data.path()).unwrap()
         }
 
-        fn state_servers(&self) -> Vec<TrackedServer> {
+        pub(super) fn state_servers(&self) -> Vec<TrackedServer> {
             with_state(self.data.path(), |s| s.servers.clone()).unwrap()
         }
 
-        fn state_kills(&self) -> Vec<KillRecord> {
+        pub(super) fn state_kills(&self) -> Vec<KillRecord> {
             with_state(self.data.path(), |s| s.recent_kills.clone()).unwrap()
         }
 
-        fn kill_log(&self) -> Vec<KillRecord> {
+        pub(super) fn kill_log(&self) -> Vec<KillRecord> {
             let Ok(text) = fs::read_to_string(self.data.path().join("kills.log")) else {
                 return Vec::new();
             };
@@ -945,7 +1046,7 @@ mod tests {
         }
     }
 
-    fn write_session(claude: &Path, pid: i32, id: &str, cwd: &Path, start: u64) {
+    pub(super) fn write_session(claude: &Path, pid: i32, id: &str, cwd: &Path, start: u64) {
         let dir = claude.join("sessions");
         fs::create_dir_all(&dir).unwrap();
         let v = serde_json::json!({
@@ -959,7 +1060,7 @@ mod tests {
         fs::write(dir.join(format!("{pid}.json")), v.to_string()).unwrap();
     }
 
-    fn fx() -> Fx {
+    pub(super) fn fx() -> Fx {
         let data = tempfile::tempdir().unwrap();
         let claude = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
@@ -1005,7 +1106,7 @@ mod tests {
         }
     }
 
-    fn key30() -> ServerKey {
+    pub(super) fn key30() -> ServerKey {
         ServerKey {
             pid: 30,
             start_time: START + 30 * SEC,
