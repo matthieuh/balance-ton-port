@@ -435,10 +435,7 @@ mod tests {
     #[test]
     fn session_name_falls_back_to_cwd_basename() {
         let cwd = Path::new("/Users/me/Workspace/my-app");
-        assert_eq!(
-            session_display_name(Some("my-app-1d"), cwd),
-            "my-app-1d"
-        );
+        assert_eq!(session_display_name(Some("my-app-1d"), cwd), "my-app-1d");
         assert_eq!(session_display_name(Some("  "), cwd), "my-app");
         assert_eq!(session_display_name(None, cwd), "my-app");
         assert_eq!(session_display_name(None, Path::new("/")), "/");
