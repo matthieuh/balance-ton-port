@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Fills the Homebrew templates in packaging/homebrew/ with a release's version
-# and archive checksums, ready to copy into matthieuh/homebrew-tap.
+# and artifact checksums (btp tarball, app .dmg), ready to copy into matthieuh/homebrew-tap.
 #
-#   scripts/render-homebrew.sh <version> <btp tarball sha256> <app zip sha256> <out dir>
+#   scripts/render-homebrew.sh <version> <btp tarball sha256> <app dmg sha256> <out dir>
 #
 # Writes <out dir>/btp.rb (formula) and <out dir>/balance-ton-port.rb (cask).
 # The release workflow runs it and attaches both files to the GitHub release.
 set -euo pipefail
 
 if [ "$#" -ne 4 ]; then
-    echo "usage: $0 <version> <btp-sha256> <app-sha256> <out-dir>" >&2
+    echo "usage: $0 <version> <btp-sha256> <app-dmg-sha256> <out-dir>" >&2
     exit 2
 fi
 VERSION="$1"

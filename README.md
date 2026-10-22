@@ -16,6 +16,8 @@ A server is a process tree: the listening process started under the session plus
 
 ## Install
 
+Menu bar app: download `BalanceTonPort-<version>.dmg` from [GitHub Releases](https://github.com/matthieuh/balance-ton-port/releases), open it and drag Balance ton port to Applications. The image and the app are signed with a Developer ID and notarized. The `btp` CLI is attached to the same release as `btp-<version>-macos-universal.tar.gz`.
+
 Homebrew (coming with the first release):
 
 ```bash
@@ -96,7 +98,7 @@ The idle alert (trigger 3) needs notifications allowed for Balance ton port. The
 
 ## Releasing
 
-CI (`.github/workflows/ci.yml`) runs fmt, clippy, the Rust tests and the Swift tests on every push and pull request. A `v*` tag runs `.github/workflows/release.yml`: universal `btp` and app, signed with the HAPPYSOLVERS SAS Developer ID, notarized, app stapled, then a GitHub release with `btp-<v>-macos-universal.tar.gz`, `BalanceTonPort-<v>.zip`, their `.sha256` files and the filled Homebrew formula and cask.
+CI (`.github/workflows/ci.yml`) runs fmt, clippy, the Rust tests and the Swift tests on every push and pull request. A `v*` tag runs `.github/workflows/release.yml`: universal `btp` and app, signed with the HAPPYSOLVERS SAS Developer ID, notarized, app stapled, app packed by `scripts/make-dmg.sh` into `BalanceTonPort-<v>.dmg` (app plus an Applications link), the dmg signed, notarized and stapled too, then a GitHub release with `btp-<v>-macos-universal.tar.gz`, `BalanceTonPort-<v>.dmg`, their `.sha256` files, the filled Homebrew formula and cask, and notes generated from the merged pull requests. A tag with a hyphen (`v0.2.0-beta.1`) is published as a prerelease. Nothing is published unless every step passed.
 
 ### Repository secrets (one time)
 
@@ -119,7 +121,7 @@ Settings > Secrets and variables > Actions, or `gh secret set NAME`:
    git tag v0.1.0 && git push --tags
    ```
 
-3. Check the release: download the zip, then `spctl -a -vv "Balance ton port.app"` must say `accepted, source=Notarized Developer ID`.
+3. Check the release: download the dmg, `spctl -a -t open --context context:primary-signature -vv BalanceTonPort-0.1.0.dmg` must say `accepted, source=Notarized Developer ID`; open it, drag the app to Applications, then `spctl -a -vv "/Applications/Balance ton port.app"` must say the same.
 
 ### Publishing to Homebrew
 

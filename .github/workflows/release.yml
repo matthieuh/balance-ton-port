@@ -149,23 +149,46 @@ jobs:
           xcrun stapler validate "$DIST/$APP_NAME.app"
           spctl -a -vv -t exec "$DIST/$APP_NAME.app"
 
+      - name: Disk image
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -o pipefail
+          IDENTITY="Developer ID Application: HAPPYSOLVERS SAS ($APPLE_TEAM_ID)"
+          # The app inside is already signed, notarized and stapled.
+          DMG_PATH="$("$GITHUB_WORKSPACE/scripts/make-dmg.sh" "$DIST/$APP_NAME.app" "$VERSION" "$DIST")"
+          codesign --force --timestamp --keychain "$KEYCHAIN" --sign "$IDENTITY" "$DMG_PATH"
+          codesign --verify --strict --verbose=2 "$DMG_PATH"
+          xcrun notarytool submit "$DMG_PATH" \
+            --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" \
+            --wait --timeout 30m --output-format json | tee "$RUNNER_TEMP/notary-dmg.json"
+          STATUS="$(jq -r .status "$RUNNER_TEMP/notary-dmg.json")"
+          if [ "$STATUS" != "Accepted" ]; then
+            ID="$(jq -r .id "$RUNNER_TEMP/notary-dmg.json")"
+            xcrun notarytool log "$ID" \
+              --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" || true
+            echo "::error::dmg notarization $STATUS"
+            exit 1
+          fi
+          xcrun stapler staple "$DMG_PATH"
+          xcrun stapler validate "$DMG_PATH"
+          spctl -a -t open --context context:primary-signature -vv "$DMG_PATH"
+          echo "APP_DMG=$(basename "$DMG_PATH")" >> "$GITHUB_ENV"
+
       - name: Package
         run: |
           cd "$DIST"
           BTP_TGZ="btp-$VERSION-macos-universal.tar.gz"
-          APP_ZIP="BalanceTonPort-$VERSION.zip"
           cp "$GITHUB_WORKSPACE/LICENSE" "$GITHUB_WORKSPACE/README.md" .
           tar -czf "$BTP_TGZ" btp LICENSE README.md
-          ditto -c -k --keepParent "$APP_NAME.app" "$APP_ZIP"
           shasum -a 256 "$BTP_TGZ" > "$BTP_TGZ.sha256"
-          shasum -a 256 "$APP_ZIP" > "$APP_ZIP.sha256"
+          shasum -a 256 "$APP_DMG" > "$APP_DMG.sha256"
           cat ./*.sha256
           "$GITHUB_WORKSPACE/scripts/render-homebrew.sh" "$VERSION" \
-            "$(cut -d' ' -f1 "$BTP_TGZ.sha256")" "$(cut -d' ' -f1 "$APP_ZIP.sha256")" homebrew
-          {
-            echo "BTP_TGZ=$BTP_TGZ"
-            echo "APP_ZIP=$APP_ZIP"
-          } >> "$GITHUB_ENV"
+            "$(cut -d' ' -f1 "$BTP_TGZ.sha256")" "$(cut -d' ' -f1 "$APP_DMG.sha256")" homebrew
+          echo "BTP_TGZ=$BTP_TGZ" >> "$GITHUB_ENV"
 
       - name: GitHub release
         env:
@@ -175,6 +198,8 @@ jobs:
           {
             echo "## Install"
             echo
+            echo "Download \`$APP_DMG\`, open it and drag Balance ton port to Applications. Or with Homebrew:"
+            echo
             echo '```bash'
             echo "brew install matthieuh/tap/btp"
             echo "brew install --cask matthieuh/tap/balance-ton-port"
@@ -183,12 +208,19 @@ jobs:
             echo "## SHA-256"
             echo
             echo '```'
-            cat "$BTP_TGZ.sha256" "$APP_ZIP.sha256"
+            cat "$BTP_TGZ.sha256" "$APP_DMG.sha256"
             echo '```'
           } > notes.md
+          PRERELEASE=()
+          # A tag with a hyphen (v0.2.0-beta.1) is a prerelease.
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            PRERELEASE=(--prerelease)
+          fi
+          # --generate-notes appends the generated changelog to notes.md.
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            --title "$GITHUB_REF_NAME" --notes-file notes.md --verify-tag \
-            "$BTP_TGZ" "$BTP_TGZ.sha256" "$APP_ZIP" "$APP_ZIP.sha256" \
+            --title "$GITHUB_REF_NAME" --notes-file notes.md --generate-notes \
+            --verify-tag ${PRERELEASE[@]+"${PRERELEASE[@]}"} \
+            "$BTP_TGZ" "$BTP_TGZ.sha256" "$APP_DMG" "$APP_DMG.sha256" \
             homebrew/btp.rb homebrew/balance-ton-port.rb
 
       - name: Clean up keychain

@@ -5,7 +5,7 @@ cask "balance-ton-port" do
   version "0.0.0"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
 
-  url "https://github.com/matthieuh/balance-ton-port/releases/download/v#{version}/BalanceTonPort-#{version}.zip"
+  url "https://github.com/matthieuh/balance-ton-port/releases/download/v#{version}/BalanceTonPort-#{version}.dmg"
   name "Balance ton port"
   desc "Menu bar app that kills dev servers left behind by Claude Code sessions"
   homepage "https://github.com/matthieuh/balance-ton-port"
