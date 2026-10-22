@@ -14,6 +14,16 @@ Every 5 seconds it links new listening servers to the Claude Code session that s
 
 A server is a process tree: the listening process started under the session plus its children (for example Astro or wrangler with their `workerd` workers). A child listening on its own port is part of its parent's server, and "idle" means no established connection on any port of the whole tree. Kill is SIGTERM on that tree, then SIGKILL after 5 s for survivors; a Claude Code process found in the tree, or a process matching an excluded command (a `postgres` the dev server started, say), is never signalled, nor is anything it runs. The menu bar lists running servers and the last 5 kills with their reason.
 
+## How it decides
+
+- Only servers linked, at first sight, to a live Claude Code session are tracked; a Claude Code session is recognised by its session file and its process start time.
+- Worktree deleted: killed at once. Session dead: killed after 20 min without any established connection on its process tree. Session alive and idle 30 min: an alert, never a silent kill.
+- A server whose worktree another live session uses is left alone.
+- Excluded commands and ports are re-checked on every scan and right before each kill; excluded children and nested Claude Code processes are spared.
+- Every signal is preceded by a start time check, so a reused pid is never hit.
+
+The full design, limitations included, is in [docs/design.md](docs/design.md).
+
 ## Install
 
 Menu bar app: download `BalanceTonPort-<version>.dmg` from [GitHub Releases](https://github.com/matthieuh/balance-ton-port/releases), open it and drag Balance ton port to Applications. The image and the app are signed with a Developer ID and notarized. The `btp` CLI is attached to the same release as `btp-<version>-macos-universal.tar.gz`.
