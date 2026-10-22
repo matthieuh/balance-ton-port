@@ -109,7 +109,7 @@ jobs:
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          IDENTITY="Developer ID Application: HAPPYSOLVERS SAS ($APPLE_TEAM_ID)"
+          IDENTITY="Developer ID Application: HAPPYSOLVERS ($APPLE_TEAM_ID)"
           codesign --force --options runtime --timestamp \
             --keychain "$KEYCHAIN" --sign "$IDENTITY" \
             --identifier com.matthieuh.btp "$DIST/btp"
@@ -156,7 +156,7 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -o pipefail
-          IDENTITY="Developer ID Application: HAPPYSOLVERS SAS ($APPLE_TEAM_ID)"
+          IDENTITY="Developer ID Application: HAPPYSOLVERS ($APPLE_TEAM_ID)"
           # The app inside is already signed, notarized and stapled.
           DMG_PATH="$("$GITHUB_WORKSPACE/scripts/make-dmg.sh" "$DIST/$APP_NAME.app" "$VERSION" "$DIST")"
           codesign --force --timestamp --keychain "$KEYCHAIN" --sign "$IDENTITY" "$DMG_PATH"
