@@ -126,6 +126,8 @@ mod tests {
             last_active_ms: 0,
             kept: false,
             alerted: false,
+            note: None,
+            asked_stale: false,
         }
     }
 
@@ -214,6 +216,72 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(with_state(&dir, |s| s.servers.len()).unwrap(), 200);
+    }
+
+    #[test]
+    fn session_ended_reason_is_kind_session_ended() {
+        let json = serde_json::to_value(KillReason::SessionEnded).unwrap();
+        assert_eq!(json, serde_json::json!({"kind": "session_ended"}));
+        let back: KillReason = serde_json::from_value(json).unwrap();
+        assert_eq!(back, KillReason::SessionEnded);
+    }
+
+    #[test]
+    fn unknown_reason_kind_decodes_as_other() {
+        let r: KillReason =
+            serde_json::from_str(r#"{"kind": "made_up_later", "extra": 3}"#).unwrap();
+        assert_eq!(r, KillReason::Other);
+        let r: KillRecord = serde_json::from_str(
+            r#"{"port": 1, "command": "c", "worktree": "/w", "reason": {"kind": "nope"}, "at_ms": 2}"#,
+        )
+        .unwrap();
+        assert_eq!(r.reason, KillReason::Other);
+        let known: KillReason =
+            serde_json::from_str(r#"{"kind": "dead_session_idle", "idle_ms": 5}"#).unwrap();
+        assert_eq!(known, KillReason::DeadSessionIdle { idle_ms: 5 });
+    }
+
+    #[test]
+    fn legacy_state_without_new_fields_loads() {
+        let d = tempfile::tempdir().unwrap();
+        let legacy = r#"{
+          "servers": [{
+            "key": {"pid": 7, "start_time": 1},
+            "port": 3000, "command": "node", "worktree": "/tmp/w",
+            "session_id": "s", "session_pid": 1,
+            "session_proc_start": "x", "session_name": "x",
+            "first_seen_ms": 0, "last_active_ms": 0,
+            "kept": true, "alerted": false
+          }],
+          "recent_kills": [{"port": 3000, "command": "node", "worktree": "/tmp/w",
+                            "reason": {"kind": "manual"}, "at_ms": 1}]
+        }"#;
+        fs::write(d.path().join("state.json"), legacy).unwrap();
+        let (servers, kills) =
+            with_state(d.path(), |s| (s.servers.clone(), s.recent_kills.clone())).unwrap();
+        assert!(!d.path().join("state.json.corrupt").exists());
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].note, None);
+        assert!(!servers[0].asked_stale);
+        assert!(servers[0].kept);
+        assert_eq!(kills[0].reason, KillReason::Manual);
+    }
+
+    #[test]
+    fn note_and_asked_stale_round_trip() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = server(7);
+        s.note = Some(crate::model::Note {
+            keep: true,
+            done: false,
+            reason: Some("testing the form".into()),
+            set_at_ms: 42,
+        });
+        s.asked_stale = true;
+        let saved = s.clone();
+        with_state(d.path(), |st| st.servers.push(s)).unwrap();
+        let back = with_state(d.path(), |st| st.servers.clone()).unwrap();
+        assert_eq!(back, vec![saved]);
     }
 
     #[test]

@@ -9,7 +9,7 @@
 use crate::config::{effective_claude_dirs_with, read_config, Config};
 use crate::decide::{decide, touch};
 use crate::labels::{location_label, session_display_name, tool_label};
-use crate::model::{Action, KillReason, KillTarget, Observation, ServerKey, TrackedServer};
+use crate::model::{Action, KillReason, KillTarget, Note, Observation, ServerKey, TrackedServer};
 use crate::platform::{ancestry, format_proc_start, Listener, Platform, ProcInfo};
 use crate::sessions::{default_config_dirs, read_sessions, session_idle_ms, ClaudeSession};
 use crate::state::{append_kill_log, with_state, KillRecord, State};
@@ -63,7 +63,25 @@ pub struct TickReport {
     pub config_error: Option<String>,
 }
 
-fn is_excluded(command: &str, cfg: &Config) -> bool {
+/// Two notes of rows folded into one server: the cautious side wins (keep
+/// if either keeps, done only if both are done).
+fn merge_notes(a: Option<Note>, b: Option<Note>) -> Option<Note> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(Note {
+            keep: a.keep || b.keep,
+            done: a.done && b.done,
+            reason: if b.keep && !a.keep {
+                b.reason
+            } else {
+                a.reason.or(b.reason)
+            },
+            set_at_ms: a.set_at_ms.max(b.set_at_ms),
+        }),
+        (a, b) => a.or(b),
+    }
+}
+
+pub(crate) fn is_excluded(command: &str, cfg: &Config) -> bool {
     let command = command.to_lowercase();
     cfg.exclude_commands
         .iter()
@@ -137,6 +155,8 @@ pub fn link(
         last_active_ms: now_ms,
         kept: false,
         alerted: false,
+        note: None,
+        asked_stale: false,
     })
 }
 
@@ -607,6 +627,8 @@ impl<P: Platform> Watcher<P> {
             let o = &mut state.servers[owner];
             o.last_active_ms = o.last_active_ms.max(c.last_active_ms);
             o.kept |= c.kept;
+            o.asked_stale |= c.asked_stale;
+            o.note = merge_notes(o.note.take(), c.note);
         }
     }
 
@@ -1018,6 +1040,8 @@ mod tests {
                 last_active_ms: T0,
                 kept: false,
                 alerted: false,
+                note: None,
+                asked_stale: false,
             }
         );
 
@@ -1523,6 +1547,8 @@ mod tests {
                 last_active_ms: 0,
                 kept: true,
                 alerted: false,
+                note: None,
+                asked_stale: false,
             })
         })
         .unwrap();
@@ -1584,6 +1610,28 @@ mod tests {
         f.p().remove_proc(20);
         assert!(f.w.tick(T0 + 20 * MIN).unwrap().killed.is_empty());
         assert!(f.p().is_alive(30));
+    }
+
+    #[test]
+    fn folded_notes_keep_the_cautious_side() {
+        let n = |keep, done, r: &str| {
+            Some(Note {
+                keep,
+                done,
+                reason: Some(r.into()),
+                set_at_ms: 1,
+            })
+        };
+        assert_eq!(merge_notes(None, None), None);
+        assert_eq!(merge_notes(None, n(false, true, "b")), n(false, true, "b"));
+        assert_eq!(
+            merge_notes(n(false, true, "a"), n(true, false, "b")),
+            n(true, false, "b")
+        );
+        assert_eq!(
+            merge_notes(n(false, true, "a"), n(false, true, "b")),
+            n(false, true, "a")
+        );
     }
 
     #[test]

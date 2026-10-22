@@ -106,6 +106,8 @@ pub fn reason_label(r: &KillReason) -> String {
             format!("dead session + idle {}", format_idle(*idle_ms))
         }
         KillReason::Manual => "manual".to_string(),
+        KillReason::SessionEnded => "session ended".to_string(),
+        KillReason::Other => "other".to_string(),
     }
 }
 

@@ -39,7 +39,7 @@ pub fn decide(
             }
             continue;
         }
-        if !s.kept && !s.alerted {
+        if !s.is_kept() && !s.alerted {
             let idle = port_idle.max(o.session_idle_ms.unwrap_or(0));
             if idle >= alert_ms {
                 actions.push(Action::Alert { key, idle_ms: idle });
@@ -81,6 +81,8 @@ mod tests {
             last_active_ms: 0,
             kept: false,
             alerted: false,
+            note: None,
+            asked_stale: false,
         }
     }
 
@@ -211,6 +213,35 @@ mod tests {
         let mut s = server(1);
         s.kept = true;
         assert!(run(&s, &obs(1), 500 * MIN).is_empty());
+    }
+
+    #[test]
+    fn keep_note_never_alerts() {
+        let mut s = server(1);
+        s.note = Some(crate::model::Note {
+            keep: true,
+            done: false,
+            reason: None,
+            set_at_ms: 0,
+        });
+        assert!(run(&s, &obs(1), 500 * MIN).is_empty());
+    }
+
+    #[test]
+    fn notes_never_change_the_dead_session_rule() {
+        let mut o = obs(1);
+        o.session_alive = false;
+        for (keep, done) in [(true, false), (false, true)] {
+            let mut s = server(1);
+            s.note = Some(crate::model::Note {
+                keep,
+                done,
+                reason: None,
+                set_at_ms: 0,
+            });
+            assert!(run(&s, &o, 19 * MIN).is_empty());
+            assert_eq!(run(&s, &o, 20 * MIN).len(), 1);
+        }
     }
 
     #[test]

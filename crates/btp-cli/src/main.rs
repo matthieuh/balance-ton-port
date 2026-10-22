@@ -289,6 +289,8 @@ fn describe_kill(r: &KillRecord) -> String {
             format!("session dead, idle {}", format_idle(*idle_ms))
         }
         KillReason::Manual => "manual".to_string(),
+        KillReason::SessionEnded => "session ended".to_string(),
+        KillReason::Other => "other".to_string(),
     };
     format!(
         ":{} {} ({}) [{reason}]",
