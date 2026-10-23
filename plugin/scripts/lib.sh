@@ -4,7 +4,7 @@
 # The first btp that ships the commands the hooks call (`session-end`,
 # `stale`, `note`, `recent`). See RELEASING.md before changing it.
 # BTP_PLUGIN_MIN_VERSION overrides it (for testing a dev build).
-BTP_MIN_VERSION="0.2.0"
+BTP_MIN_VERSION="0.3.0"
 BTP_MIN="${BTP_PLUGIN_MIN_VERSION:-$BTP_MIN_VERSION}"
 
 # shellcheck disable=SC2034 # used by install-btp.sh and session-start.sh
