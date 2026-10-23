@@ -141,9 +141,9 @@ The menu has a "Needs you" list with one card per server that needs a decision, 
 
 ## 13. Restart
 
-Restart stops a server and starts it again: the original argv in its original folder, with the environment read from the live process at the time of the restart (never stored, logged or printed). `argv[0]` is resolved with the process's own `PATH`. A restarted tracked server keeps its ownership: session, note, Keep and Postpone, plus a `restarted_from` record. A pending restart links the new process to its owner while that process lives (24 hours at most), so a child that listens late is still linked.
+Restart stops a server and starts it again: the original argv in its original folder, with the environment read from the live process at the time of the restart (never stored, logged or printed). `argv[0]` is resolved with the process's own `PATH`. A restarted tracked server keeps its ownership: session, note, Keep and Postpone, plus a `restarted_from` record. A pending restart links the new process to its owner while that process lives (24 hours at most), so a child that listens late is still linked. Pending restarts are kept in `state.json`, so they survive a restart of the app or of `btp watch`, and are dropped after 24 hours.
 
-A restart is refused when the folder is gone, the environment cannot be read, the port is still taken after the stop, an exclusion matches, or another restart of the same server is running. The server's output goes to `<data dir>/logs/` (mode 0600, because it may hold tokens; the 20 most recent files are kept). Restart is never in the hover capsule; it is in the more menu and on the leak card.
+A restart is refused when the folder is gone, the environment cannot be read, the command line cannot be read or its program found, the port is still taken 5 seconds after the stop (nothing is started), an exclusion matches (nothing is stopped or started), another restart or stop of the same server is already running, or the new process could not be started (the server then stays stopped). The server's output goes to `<data dir>/logs/` (mode 0600, because it may hold tokens; the 20 most recent files are kept). Restart is never in the hover capsule; it is in the more menu and on the leak card.
 
 **Session chip.** The detail view's session chip copies `cd '<folder>' && claude --resume <id>` (or `codex resume <id>`) to the clipboard. It never opens a terminal.
 
@@ -200,6 +200,7 @@ The plugin (`plugin/`) has two hooks, an install command and the agent skill.
 - Command exclusions are substrings of the whole command line, paths included: a project path containing `mcp` excludes its servers. That errs on the safe side.
 - Port activity is sampled once per pass. A short request that opens and closes between two passes is not seen, so a server used only by brief, rare requests can look idle.
 - The shared-worktree rule compares worktree roots only (see section 5).
+- A `btp watch` older than 0.3 ignores Postpone (it still stops on the usual countdown) and, when it rewrites `state.json`, drops the state 0.3 adds (postpones, pending restarts, `restarted_from` records, session folders). Run one version of `btp` and the app.
 - The kill log grows without bound, and the same kill can occasionally be recorded twice.
 - macOS only. The platform layer is behind a trait so that a Linux implementation (`/proc`) can follow.
 

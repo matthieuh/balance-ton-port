@@ -1,6 +1,6 @@
 {
   "name": "balance-ton-port",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Stops the idle dev servers of a Claude Code session when it quits, and ships the btp agent skill",
   "author": {
     "name": "Matthieu Hostache"
