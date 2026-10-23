@@ -180,6 +180,16 @@ func cardActionIsProminent(_ card: CardFfi) -> Bool {
     card.action == "restart"
 }
 
+/// A card's pill can act: Restart only when the core can restart it,
+/// Postpone only for an agent server, Stop unless excluded.
+func cardActionEnabled(_ card: CardFfi, _ s: ServerViewFfi) -> Bool {
+    switch card.action {
+    case "restart": return s.canRestart
+    case "postpone": return s.managed
+    default: return !s.excluded
+    }
+}
+
 /// A port's hue in 0..<1: the golden-ratio step from the port number, so
 /// neighbours differ and a port keeps its color across launches.
 func portHue(_ port: UInt16) -> Double {
@@ -325,6 +335,117 @@ func usageHelp(_ m: MemoryBarFfi) -> String {
     return "Dev servers \(mb(m.devBytes))\nOther apps \(mb(m.appsBytes))\nFree \(mb(m.freeBytes)) of \(mb(m.totalBytes))"
 }
 
+// MARK: - Menu actions
+
+/// What a ⋯ menu item does; `separator` is the line before Stop.
+enum MenuItemKind: Hashable, Sendable {
+    case open, restart, keep, ignoreAlert, details, separator, stop
+}
+
+struct MenuItem: Equatable, Sendable {
+    let kind: MenuItemKind
+    let title: String
+    let enabled: Bool
+}
+
+/// A card that is an alert, which "Ignore this alert" dismisses: a leak or
+/// an idle alert (the core refuses the others).
+func hasAlertCard(_ s: ServerViewFfi) -> Bool {
+    s.card?.kind == "leak" || s.card?.kind == "idle_alert"
+}
+
+/// The ⋯ menu, the same everywhere. Restart only when the core can restart
+/// it, Keep for agent servers, Ignore this alert with an alert card, Stop
+/// unless excluded. Details… waits for the detail view.
+func moreMenuItems(_ s: ServerViewFfi) -> [MenuItem] {
+    [
+        MenuItem(kind: .open, title: "\u{2197} Open in browser", enabled: true),
+        MenuItem(kind: .restart, title: "\u{27F3} Restart", enabled: s.canRestart),
+        MenuItem(kind: .keep, title: "\u{23F8} Keep (no alerts)", enabled: s.managed),
+        MenuItem(kind: .ignoreAlert, title: "\u{2298} Ignore this alert", enabled: hasAlertCard(s)),
+        MenuItem(kind: .details, title: "\u{24D8} Details\u{2026}", enabled: false),
+        MenuItem(kind: .separator, title: "", enabled: false),
+        MenuItem(kind: .stop, title: "\u{25A0} Stop", enabled: !s.excluded),
+    ]
+}
+
+/// The hover capsule's buttons. Restart is never one of them.
+enum CapsuleButton: Hashable, Sendable {
+    case open, stop, more
+}
+
+func capsuleButtons(_ s: ServerViewFfi) -> [CapsuleButton] {
+    s.excluded ? [.open, .more] : [.open, .stop, .more]
+}
+
+/// `http://localhost:3000/`.
+func openURL(_ s: ServerViewFfi) -> URL {
+    URL(string: "http://localhost:\(String(s.port))/")!
+}
+
+enum ConfirmAction: Equatable, Sendable {
+    case stop, restart
+}
+
+/// Stop and Restart ask first only for a server no agent started.
+func needsConfirmation(_ s: ServerViewFfi) -> Bool {
+    !s.managed
+}
+
+/// `Stop client-portal :3000?`, why it asks, and the button.
+func confirmationText(_ s: ServerViewFfi, action: ConfirmAction) -> (title: String, message: String, button: String) {
+    let verb = action == .stop ? "Stop" : "Restart"
+    return (
+        "\(verb) \(titleParts(s).title) \(portLabel(s.port))?",
+        "No agent started it. Balance ton port never stops it on its own.",
+        verb
+    )
+}
+
+/// What the row shows in place of its status while a Restart runs, and
+/// after one that was refused (for `blockedNoteDuration`).
+enum RowNote: Equatable, Sendable {
+    case restarting
+    case blocked(String)
+}
+
+let blockedNoteDuration: TimeInterval = 4
+
+func rowNoteText(_ note: RowNote) -> String {
+    switch note {
+    case .restarting: return "restarting\u{2026}"
+    case .blocked(let copy): return copy
+    }
+}
+
+/// The row right after "Postpone 1 h", until the next pass: one hour left,
+/// and no "about to stop" card any more.
+func postponedView(_ s: ServerViewFfi) -> ServerViewFfi {
+    var v = s
+    v.killInMs = 3_600_000
+    v.postponed = true
+    v.statusText = "stops in 60 min"
+    if v.card?.kind == "about_to_stop" { v.card = nil }
+    return v
+}
+
+/// The row right after Keep: no countdown, and only a leak or a session
+/// ended but open still shows a card.
+func keptView(_ s: ServerViewFfi) -> ServerViewFfi {
+    var v = s
+    v.killInMs = nil
+    v.statusText = "kept by you"
+    if v.card?.kind != "leak" && v.card?.kind != "session_ended_open" { v.card = nil }
+    return v
+}
+
+/// The row right after "Ignore this alert": its alert card goes.
+func alertIgnoredView(_ s: ServerViewFfi) -> ServerViewFfi {
+    var v = s
+    if hasAlertCard(v) { v.card = nil }
+    return v
+}
+
 // MARK: - Notifications
 
 /// "Astro on port 4322 (revva \u{203A} web) hasn't been used for 30 min."
@@ -333,6 +454,21 @@ func usageHelp(_ m: MemoryBarFfi) -> String {
 func notificationBody(_ s: ServerViewFfi) -> String {
     let minutes = s.idleMs / 60_000
     return "\(s.toolLabel) on port \(String(s.port)) (\(s.locationLabel)) hasn't been used for \(minutes) min."
+}
+
+/// `Revva web :3010 is using 2.3 GB`, or `Vite :5173 grew 600 MB in 10 min`
+/// when the leak is the growth.
+func leakNotificationBody(_ s: ServerViewFfi) -> String {
+    let name = "\(titleParts(s).title) \(portLabel(s.port))"
+    if s.card?.reason.hasPrefix("Growing") == true {
+        return "\(name) grew \(memoryLabel(UInt64(max(0, s.growthBytes)))) in 10 min"
+    }
+    return "\(name) is using \(memoryLabel(s.rssBytes))"
+}
+
+/// The leak notification's identifier: a repeat replaces the earlier one.
+func leakRequestID(_ id: ServerID) -> String {
+    "leak-\(id.pid)-\(id.startTime)"
 }
 
 /// What a notification carries to find its server again. The start time is a
@@ -393,10 +529,13 @@ func sessionEndedID(fromUserInfo info: [AnyHashable: Any]) -> SessionEndedID? {
 
 // MARK: - Notification buttons
 
-/// The idle-server notification's buttons.
+/// The idle-server (Kill, Keep) and leak (Restart, Ignore) notifications'
+/// buttons.
 enum NotificationAction: Sendable, Equatable {
     case kill
     case keep
+    case restart
+    case ignoreAlert
 }
 
 /// The session-ended notification's buttons.
@@ -411,9 +550,12 @@ enum SessionEndedAction: Sendable, Equatable {
 enum NotificationIDs {
     static let idleCategory = "IDLE_SERVER"
     static let sessionEndedCategory = "SESSION_ENDED"
+    static let leakCategory = "LEAK"
     static let kill = "KILL"
     static let keep = "KEEP"
     static let stopNow = "STOP_NOW"
+    static let restart = "RESTART"
+    static let ignore = "IGNORE"
 }
 
 /// Where a pressed notification button goes.
@@ -437,6 +579,8 @@ func notificationRoute(actionIdentifier: String, userInfo info: [AnyHashable: An
     switch actionIdentifier {
     case NotificationIDs.kill: return .server(.kill, id)
     case NotificationIDs.keep: return .server(.keep, id)
+    case NotificationIDs.restart: return .server(.restart, id)
+    case NotificationIDs.ignore: return .server(.ignoreAlert, id)
     default: return nil
     }
 }
@@ -596,6 +740,10 @@ func missedKillNotice(_ id: ServerID, tracked: [ServerID], fromNotification: Boo
     }
     return tracked.contains { $0.pid == id.pid } ? nil : "That server was already gone."
 }
+
+/// The menu's note when a leak notification's Restart finds its server
+/// gone from the last pass.
+let missedRestartNotice = "Nothing to restart: this server changed since the notification"
 
 // MARK: - Settings
 

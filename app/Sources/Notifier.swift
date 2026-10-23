@@ -4,7 +4,7 @@ import os
 
 private typealias IDs = NotificationIDs
 
-/// Posts the "idle server" alerts and the "session ended" groups, and routes
+/// Posts the "idle server" alerts, the leaks and the "session ended" groups, and routes
 /// their buttons back to the model. When notifications are not allowed,
 /// nothing is posted and `post` reports nothing delivered: the menu row says
 /// so and stays the way to act on the server.
@@ -22,12 +22,19 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         let kill = UNNotificationAction(identifier: IDs.kill, title: "Kill", options: [.destructive])
         let keep = UNNotificationAction(identifier: IDs.keep, title: "Keep", options: [])
         let stopNow = UNNotificationAction(identifier: IDs.stopNow, title: "Stop now", options: [.destructive])
+        // Restart may ask first (a server no agent started): it brings the
+        // app forward.
+        let restart = UNNotificationAction(identifier: IDs.restart, title: "Restart", options: [.foreground])
+        let ignore = UNNotificationAction(identifier: IDs.ignore, title: "Ignore", options: [])
         center.setNotificationCategories([
             UNNotificationCategory(
                 identifier: IDs.idleCategory, actions: [kill, keep], intentIdentifiers: [], options: []
             ),
             UNNotificationCategory(
                 identifier: IDs.sessionEndedCategory, actions: [stopNow, keep], intentIdentifiers: [], options: []
+            ),
+            UNNotificationCategory(
+                identifier: IDs.leakCategory, actions: [restart, ignore], intentIdentifiers: [], options: []
             ),
         ])
     }
@@ -87,6 +94,30 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
                 content: content,
                 trigger: nil
             )
+            do {
+                try await center.add(request)
+                delivered.append(server.id)
+            } catch {
+                log.error("could not post: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+        return delivered
+    }
+
+    /// One notification per leak ("Vite :5173 is using 2.3 GB"), with
+    /// Restart and Ignore; returns the servers whose notification was added.
+    /// Nothing is posted when notifications are not allowed.
+    func postLeaks(_ servers: [ServerViewFfi]) async -> [ServerID] {
+        guard await canPost() else { return [] }
+        var delivered: [ServerID] = []
+        for server in servers {
+            let content = UNMutableNotificationContent()
+            content.title = "Balance ton port"
+            content.body = leakNotificationBody(server)
+            content.categoryIdentifier = IDs.leakCategory
+            content.sound = .default
+            content.userInfo = notificationUserInfo(server.id)
+            let request = UNNotificationRequest(identifier: leakRequestID(server.id), content: content, trigger: nil)
             do {
                 try await center.add(request)
                 delivered.append(server.id)

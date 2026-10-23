@@ -1,21 +1,24 @@
 import SwiftUI
 
 /// The capsule a hovered row shows in place of its gauge: Open, Stop (not
-/// for an excluded server) and ⋯. Restart lives in ⋯ only.
+/// for an excluded server) and ⋯ (`capsuleButtons`). Restart lives in ⋯
+/// only.
 struct RowCapsule: View {
     let server: ServerViewFfi
-    var onKeep: (() -> Void)?
-    var onStop: (() -> Void)?
+    @EnvironmentObject private var model: CoreModel
 
     var body: some View {
         HStack(spacing: 2) {
-            pill("\u{2197} Open", color: .primary.opacity(0.8)) {}
-                .disabled(true)
-            if !server.excluded {
-                pill("\u{25A0} Stop", color: .red) { onStop?() }
-                    .disabled(onStop == nil)
+            ForEach(capsuleButtons(server), id: \.self) { button in
+                switch button {
+                case .open:
+                    pill("\u{2197} Open", color: .primary.opacity(0.8)) { model.open(server) }
+                case .stop:
+                    pill("\u{25A0} Stop", color: .red) { model.stop(server) }
+                case .more:
+                    MoreMenu(server: server, bare: true)
+                }
             }
-            MoreMenu(server: server, onKeep: onKeep, onStop: onStop, bare: true)
         }
         .padding(3)
         .background(Color.primary.opacity(0.08), in: Capsule())

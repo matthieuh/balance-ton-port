@@ -59,8 +59,7 @@ struct ServerRowView: View {
     let server: ServerViewFfi
     let favicon: NSImage?
     let notificationsOff: Bool
-    var onKeep: (() -> Void)?
-    var onStop: (() -> Void)?
+    var note: RowNote?
     @State private var hovering = false
 
     var body: some View {
@@ -68,11 +67,14 @@ struct ServerRowView: View {
             ServerIcon(server: server, favicon: favicon)
             VStack(alignment: .leading, spacing: 1) {
                 ServerTitle(server: server)
-                ServerSubtitle(server: server, status: rowStatus(server, notificationsOff: notificationsOff))
+                ServerSubtitle(
+                    server: server,
+                    status: note.map(rowNoteText) ?? rowStatus(server, notificationsOff: notificationsOff)
+                )
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             if hovering {
-                RowCapsule(server: server, onKeep: onKeep, onStop: onStop)
+                RowCapsule(server: server)
             } else {
                 gauge
                 Text(verbatim: memoryLabel(server.rssBytes))

@@ -1,24 +1,22 @@
 import SwiftUI
 
-/// The ⋯ button and its menu, the same for every server. Keep and Stop call
-/// through for agent servers; items without an action yet are disabled.
+/// The ⋯ button and its menu, the same for every server
+/// (`moreMenuItems`). Details… waits for the detail view (Task 11).
 struct MoreMenu: View {
     let server: ServerViewFfi
-    var onKeep: (() -> Void)?
-    var onStop: (() -> Void)?
     /// Drawn without its own circle (inside the row capsule).
     var bare = false
+    @EnvironmentObject private var model: CoreModel
 
     var body: some View {
         Menu {
-            Button("\u{2197} Open in browser") {}.disabled(true)
-            Button("\u{27F3} Restart") {}.disabled(true)
-            Button("\u{23F8} Keep (no alerts)") { onKeep?() }.disabled(onKeep == nil)
-            Button("\u{2298} Ignore this alert") {}.disabled(true)
-            Divider()
-            Button("\u{24D8} Details\u{2026}") {}.disabled(true)
-            if !server.excluded {
-                Button("\u{25A0} Stop", role: .destructive) { onStop?() }.disabled(onStop == nil)
+            ForEach(moreMenuItems(server), id: \.kind) { item in
+                if item.kind == .separator {
+                    Divider()
+                } else {
+                    Button(item.title, role: item.kind == .stop ? .destructive : nil) { perform(item.kind) }
+                        .disabled(!item.enabled)
+                }
             }
         } label: {
             Text(verbatim: "\u{22EF}")
@@ -31,6 +29,18 @@ struct MoreMenu: View {
         .menuIndicator(.hidden)
         .buttonStyle(PressableStyle())
         .fixedSize()
+    }
+
+    private func perform(_ kind: MenuItemKind) {
+        switch kind {
+        case .open: model.open(server)
+        case .restart: model.restart(server)
+        case .keep: model.keep(server)
+        case .ignoreAlert: model.ignoreAlert(server)
+        case .stop: model.stop(server)
+        // The detail view comes with Task 11; the item is disabled until then.
+        case .details, .separator: break
+        }
     }
 }
 

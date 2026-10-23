@@ -2,14 +2,14 @@ import AppKit
 import SwiftUI
 
 /// A server that needs a decision: what it is, why, and the one suggested
-/// action (plus ⋯). Only Stop on an agent server acts yet; the other pills
-/// are disabled until their actions exist.
+/// action (plus ⋯). While a Restart runs, and for a moment after a refused
+/// one, the reason line says so instead.
 struct NeedsYouCard: View {
     let server: ServerViewFfi
     let card: CardFfi
     let favicon: NSImage?
-    var onKeep: (() -> Void)?
-    var onStop: (() -> Void)?
+    var note: RowNote?
+    @EnvironmentObject private var model: CoreModel
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
@@ -26,13 +26,13 @@ struct NeedsYouCard: View {
                 .padding(.leading, cardIndent)
                 .padding(.top, 3)
             HStack(spacing: 8) {
-                Text(verbatim: card.reason)
+                Text(verbatim: note.map(rowNoteText) ?? card.reason)
                     .font(.system(size: 12))
                     .foregroundStyle(tint.opacity(scheme == .dark ? 0.85 : 1))
                     .lineLimit(2)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 actionPill(tint: tint)
-                MoreMenu(server: server, onKeep: onKeep, onStop: onStop)
+                MoreMenu(server: server)
             }
             .padding(.leading, cardIndent)
             .padding(.top, 9)
@@ -50,8 +50,7 @@ struct NeedsYouCard: View {
 
     private func actionPill(tint: Color) -> some View {
         let prominent = cardActionIsProminent(card)
-        let action = card.action == "stop" ? onStop : nil
-        return Button { action?() } label: {
+        return Button(action: perform) {
             Text(verbatim: cardActionLabel(card))
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(prominent ? Color.black.opacity(0.85) : Color.primary)
@@ -61,6 +60,14 @@ struct NeedsYouCard: View {
                 .contentShape(Capsule())
         }
         .buttonStyle(PressableStyle())
-        .disabled(action == nil)
+        .disabled(!cardActionEnabled(card, server) || note == .restarting)
+    }
+
+    private func perform() {
+        switch card.action {
+        case "restart": model.restart(server)
+        case "postpone": model.postpone(server)
+        default: model.stop(server)
+        }
     }
 }
