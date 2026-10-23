@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 /// A server that needs a decision: what it is, why, and the one suggested
-/// action (plus ⋯). While a Restart runs, and for a moment after a refused
+/// action (plus ⋯); a click elsewhere opens the detail. While a Restart runs, and for a moment after a refused
 /// one, the reason line says so instead.
 struct NeedsYouCard: View {
     let server: ServerViewFfi
@@ -10,6 +10,7 @@ struct NeedsYouCard: View {
     let favicon: NSImage?
     var note: RowNote?
     @EnvironmentObject private var model: CoreModel
+    @EnvironmentObject private var nav: MenuNavigation
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
@@ -45,6 +46,9 @@ struct NeedsYouCard: View {
                 .overlay(shape.strokeBorder(tint.opacity(0.22), lineWidth: 1))
                 .shadow(color: .black.opacity(scheme == .dark ? 0.3 : 0.08), radius: 7, y: 4)
         }
+        .contentShape(RoundedRectangle(cornerRadius: cardRadius, style: .continuous))
+        .onTapGesture { nav.open(server.id) }
+        .accessibilityAction(named: "Details") { nav.open(server.id) }
         .help(rowHelp(server))
     }
 

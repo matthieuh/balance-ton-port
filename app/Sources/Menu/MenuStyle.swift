@@ -1,3 +1,4 @@
+import ImageIO
 import SwiftUI
 
 // The menu's colors and icon tiles: pure, compiled into both the app and
@@ -88,5 +89,60 @@ extension Color {
             green: Double((hex >> 8) & 0xFF) / 255,
             blue: Double(hex & 0xFF) / 255
         )
+    }
+}
+
+// MARK: - Detail
+
+/// The two most common colors of an image's opaque pixels, each channel
+/// quantized to 16 levels, as `0xRRGGBB`; most common first. Empty when the
+/// bytes are not an image or every pixel is transparent.
+func dominantRGB(_ data: Data) -> [UInt32] {
+    guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+          let image = CGImageSourceCreateImageAtIndex(source, 0, nil),
+          let space = CGColorSpace(name: CGColorSpace.sRGB)
+    else { return [] }
+    // A favicon is small; a big image is sampled at 64 pt.
+    let w = min(image.width, 64), h = min(image.height, 64)
+    guard w > 0, h > 0 else { return [] }
+    var pixels = [UInt8](repeating: 0, count: w * h * 4)
+    let drawn = pixels.withUnsafeMutableBytes { buffer -> Bool in
+        guard let ctx = CGContext(
+            data: buffer.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+            space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return false }
+        ctx.interpolationQuality = .none
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return true
+    }
+    guard drawn else { return [] }
+    var counts: [UInt32: Int] = [:]
+    for i in stride(from: 0, to: pixels.count, by: 4) {
+        let a = UInt32(pixels[i + 3])
+        guard a >= 128 else { continue }
+        // Un-premultiply, then keep the top 4 bits (x 17 gives 0x00...0xFF).
+        func q(_ c: UInt8) -> UInt32 { (min(255, UInt32(c) * 255 / a) >> 4) * 17 }
+        counts[q(pixels[i]) << 16 | q(pixels[i + 1]) << 8 | q(pixels[i + 2]), default: 0] += 1
+    }
+    return counts.sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }
+        .prefix(2).map(\.key)
+}
+
+/// The hero's gradient colors from the favicon (`dominantRGB`), else
+/// `fallback` (the port's color).
+func dominantColors(_ png: Data, fallback: Color) -> [Color] {
+    let rgb = dominantRGB(png)
+    return rgb.isEmpty ? [fallback] : rgb.map { Color(hex: $0) }
+}
+
+/// An event's rule and label on the memory chart.
+func eventColor(_ kind: String) -> Color {
+    switch kind {
+    case "started": return Color(hex: 0xF0A472)
+    case "session_ended": return Color(hex: 0xFF8A8F)
+    case "alert": return Color(hex: 0xE9B764)
+    case "restarted": return .blue
+    case "browser_connected": return .green
+    default: return Color(hex: 0x9A9EAB)
     }
 }

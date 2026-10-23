@@ -54,12 +54,13 @@ struct ServerTitle: View {
 }
 
 /// An "All good" row: icon, title and subtitle, then the memory gauge and
-/// size, which the hover capsule replaces.
+/// size, which the hover capsule replaces. A click opens the detail.
 struct ServerRowView: View {
     let server: ServerViewFfi
     let favicon: NSImage?
     let notificationsOff: Bool
     var note: RowNote?
+    @EnvironmentObject private var nav: MenuNavigation
     @State private var hovering = false
 
     var body: some View {
@@ -91,6 +92,8 @@ struct ServerRowView: View {
             in: RoundedRectangle(cornerRadius: rowRadius, style: .continuous)
         )
         .contentShape(Rectangle())
+        .onTapGesture { nav.open(server.id) }
+        .accessibilityAction(named: "Details") { nav.open(server.id) }
         .onHover { hovering = $0 }
         .help(rowHelp(server))
     }
