@@ -10,19 +10,20 @@ use crate::agents::claude::ClaudeAgent;
 use crate::agents::codex::{classify_codex, env_thread, CodexAgent, CodexRole};
 use crate::agents::{is_agent_cli, session_idle_ms, Agent, AgentKind, AgentSession};
 use crate::config::{effective_claude_dirs_with, read_config, Config};
-use crate::decide::{decide, touch};
-use crate::display::{needs_you, NeedsYou};
-use crate::history::{leak, AlertKind, EventKind, History, LeakAlerts, ProcId, ServerEvent};
+use crate::decide::{decide, idle_alert_holds, idle_period_over, touch};
+use crate::display::{needs_you_cards, NeedsYou};
+use crate::history::{AlertKind, EventKind, History, LeakAlerts, ProcId, ServerEvent};
 use crate::labels::{location_label, session_display_name, tool_label};
 use crate::model::{Action, KillReason, KillTarget, Note, Observation, ServerKey, TrackedServer};
 use crate::observed::{observed_servers_cached, ObservedServer, SystemCache};
 use crate::platform::{ancestry, format_proc_start, Listener, Platform, ProcInfo, ProcResources};
 use crate::probe::{PageMeta, ProbeCache, ProbeOutcome};
+use crate::session_end::session_ended_open;
 use crate::sessions::default_config_dirs;
 use crate::state::{append_kill_log, with_state, KillRecord, State};
 use crate::worktree::{worktree_root, MetaCache};
 use fs4::{FileExt, TryLockError};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -568,6 +569,11 @@ pub struct Watcher<P: Platform> {
     last_observed: Vec<ObservedServer>,
     /// Leak alerts, in memory only.
     leaks: LeakAlerts,
+    /// Idle alert cards dismissed with "Ignore this alert", until the idle
+    /// period ends.
+    idle_ignored: HashSet<ServerKey>,
+    /// The cards of the last `tick` or `observe`, for `ignore_alert`.
+    last_cards: HashMap<ServerKey, NeedsYou>,
 }
 
 impl<P: Platform> Watcher<P> {
@@ -588,6 +594,8 @@ impl<P: Platform> Watcher<P> {
             system: SystemCache::default(),
             last_observed: Vec::new(),
             leaks: LeakAlerts::default(),
+            idle_ignored: HashSet::new(),
+            last_cards: HashMap::new(),
         }
     }
 
@@ -835,28 +843,37 @@ impl<P: Platform> Watcher<P> {
         self.leaks.mark_notified(key);
     }
 
-    /// "Ignore this alert": dismisses the server's current alert only. A
-    /// leak card shown by the last pass is dismissed until memory grows
-    /// another 500 MB; otherwise the idle alert is marked as delivered
-    /// (`mark_alerted`), until the server is used again.
-    pub fn ignore_alert(&mut self, key: ServerKey) -> io::Result<()> {
-        if self.leaks.is_shown(key) {
-            let rss = self.history.samples(key).last().map_or(0, |s| s.rss_bytes);
-            self.leaks.ignore(key, rss);
-            return Ok(());
+    /// "Ignore this alert": dismisses the alert of the card the last pass
+    /// showed for this server, and only that one. A leak card stays away
+    /// until memory grows another 500 MB (or the leak ends for 10 min and
+    /// comes back); an idle alert card until the idle period ends and a new
+    /// one starts. Any other card (about to stop, session ended but open)
+    /// is not an alert: `false`, nothing changes.
+    pub fn ignore_alert(&mut self, key: ServerKey) -> bool {
+        match self.last_cards.get(&key) {
+            Some(NeedsYou::Leak { .. }) => {
+                let rss = self.history.samples(key).last().map_or(0, |s| s.rss_bytes);
+                self.leaks.ignore(key, rss);
+            }
+            Some(NeedsYou::IdleAlert { .. }) => {
+                self.idle_ignored.insert(key);
+            }
+            _ => return false,
         }
-        self.mark_alerted(key)
+        self.last_cards.remove(&key);
+        true
     }
 
     /// "Postpone 1 h": the dead-session countdown of this server restarts
     /// for one hour from now; afterwards the rule applies as usual. Keep and
-    /// the note are left as they are.
-    pub fn postpone(&mut self, key: ServerKey) -> io::Result<()> {
+    /// the note are left as they are. `Ok(false)` when the server is not
+    /// tracked (nothing changed).
+    pub fn postpone(&mut self, key: ServerKey) -> io::Result<bool> {
         self.postpone_at(key, now_ms())
     }
 
     /// `postpone` at `now_ms`.
-    pub fn postpone_at(&mut self, key: ServerKey, now_ms: u64) -> io::Result<()> {
+    pub fn postpone_at(&mut self, key: ServerKey, now_ms: u64) -> io::Result<bool> {
         let found = with_state(&self.data_dir, |state| {
             let mut found = false;
             for s in state.servers.iter_mut().filter(|s| s.key == key) {
@@ -874,7 +891,7 @@ impl<P: Platform> Watcher<P> {
                 },
             );
         }
-        Ok(())
+        Ok(found)
     }
 
     /// No more alerts for this server until it restarts.
@@ -1072,7 +1089,7 @@ impl<P: Platform> Watcher<P> {
     fn run(&mut self, now_ms: u64, mode: Mode) -> io::Result<TickReport> {
         let scan = self.scan();
         let listeners = self.platform.listeners();
-        let (mut report, to_kill, feeds, tracked, reused, ended_open) =
+        let (mut report, to_kill, feeds, tracked, idle_over, ended_open, idle_holds) =
             with_state(&self.data_dir, |state| {
                 let trees = self.refresh(state, &scan, &listeners, now_ms);
                 let obs: Vec<Observation> = state
@@ -1081,32 +1098,23 @@ impl<P: Platform> Watcher<P> {
                     .zip(&trees)
                     .map(|(s, t)| self.observe_one(s, t, &scan, now_ms))
                     .collect();
-                // A server used again after its idle alert can alert again.
-                let mut reused = Vec::new();
+                // Once its idle period is over, a server can alert again.
+                let mut idle_over = Vec::new();
                 for (s, o) in state.servers.iter_mut().zip(&obs) {
                     if o.alive {
                         touch(s, o, now_ms);
-                        if o.established > 0 && s.alerted {
-                            s.alerted = false;
-                            reused.push(s.key);
-                        }
+                    }
+                    if idle_period_over(s, o, now_ms, &scan.cfg) {
+                        s.alerted = false;
+                        idle_over.push(s.key);
                     }
                 }
-                // Still open after its session ended: listed as kept running in
-                // a recorded session end, its session still dead, and a
-                // connection open on it this pass.
-                let ended_open: HashSet<ServerKey> = state
+                let ended_open = session_ended_open(&state.servers, &obs, &state.session_ended);
+                let idle_holds: HashSet<ServerKey> = state
                     .servers
                     .iter()
                     .zip(&obs)
-                    .filter(|(s, o)| {
-                        !o.session_alive
-                            && o.established > 0
-                            && state
-                                .session_ended
-                                .iter()
-                                .any(|g| g.still_open.iter().any(|x| x.key == s.key))
-                    })
+                    .filter(|(s, o)| idle_alert_holds(s, o, now_ms, &scan.cfg))
                     .map(|(s, _)| s.key)
                     .collect();
                 let mut report = TickReport {
@@ -1170,8 +1178,9 @@ impl<P: Platform> Watcher<P> {
                     to_kill,
                     feeds,
                     tracked_pids(&trees),
-                    reused,
+                    idle_over,
                     ended_open,
+                    idle_holds,
                 )
             })?;
         let mut feeds = feeds;
@@ -1180,17 +1189,49 @@ impl<P: Platform> Watcher<P> {
             self.last_observed = report.observed.clone();
             feeds.extend(report.observed.iter().map(|o| self.observed_feed(o)));
         }
-        for key in reused {
+        for key in idle_over {
             self.history.reset_alert(key, AlertKind::Idle);
+            self.idle_ignored.remove(&key);
         }
         self.feed_history(&feeds, &report, now_ms);
         if mode != Mode::Sweep {
-            self.leaks_and_needs(&mut report, &ended_open, &scan.cfg, now_ms);
+            let keys: Vec<ServerKey> = report
+                .servers
+                .iter()
+                .map(|v| v.key)
+                .chain(report.observed.iter().map(|o| o.key))
+                .collect();
+            let leaks = self.leaks.pass(&self.history, &keys, &scan.cfg, now_ms);
+            for &key in &leaks.rearmed {
+                self.history.reset_alert(key, AlertKind::Leak);
+            }
+            for &key in &leaks.due {
+                self.history.note_alert(key, now_ms, AlertKind::Leak);
+            }
+            // An idle alert card: reported now, or delivered and still
+            // applying, unless ignored.
+            let idle_alerts: HashSet<ServerKey> = report
+                .alerts
+                .iter()
+                .map(|a| a.key)
+                .chain(idle_holds)
+                .filter(|k| !self.idle_ignored.contains(k))
+                .collect();
+            report.needs_you = needs_you_cards(
+                &report.servers,
+                &report.observed,
+                &leaks.shown,
+                &ended_open,
+                &idle_alerts,
+            );
+            report.leaks = leaks.due;
+            self.last_cards = report.needs_you.iter().cloned().collect();
         }
         let mut live: HashSet<ServerKey> = report.servers.iter().map(|v| v.key).collect();
         live.extend(self.last_observed.iter().map(|o| o.key));
         self.history.retain(&live, now_ms);
         self.leaks.retain(&live);
+        self.idle_ignored.retain(|k| live.contains(k));
         // An excluded server (a database, say) is never probed.
         self.probe_targets = report.servers.iter().map(|v| (v.key, v.port)).collect();
         self.probe_targets.extend(
@@ -1213,46 +1254,6 @@ impl<P: Platform> Watcher<P> {
         report.leaks.retain(|k| !gone.contains(k));
         report.needs_you.retain(|(k, _)| !gone.contains(k));
         Ok(report)
-    }
-
-    /// Updates the leak alerts from this pass's history, reports the leaks
-    /// due a notification, and builds every "Needs you" card.
-    fn leaks_and_needs(
-        &mut self,
-        report: &mut TickReport,
-        ended_open: &HashSet<ServerKey>,
-        cfg: &Config,
-        now_ms: u64,
-    ) {
-        let mut due = Vec::new();
-        let mut leak_of = |w: &mut Self, key: ServerKey| {
-            let rss = w.history.samples(key).last().map_or(0, |s| s.rss_bytes);
-            let growth = w.history.growth_bytes(key, now_ms);
-            let u = w.leaks.update(key, rss, leak(rss, growth, cfg));
-            if u.rearmed {
-                w.history.reset_alert(key, AlertKind::Leak);
-            }
-            if u.notify {
-                due.push(key);
-                w.history.note_alert(key, now_ms, AlertKind::Leak);
-            }
-            u.shown
-        };
-        let mut cards = Vec::new();
-        for v in &report.servers {
-            let l = leak_of(self, v.key);
-            let idle_alert = report.alerts.iter().any(|a| a.key == v.key);
-            if let Some(n) = needs_you(v, l, ended_open.contains(&v.key), idle_alert) {
-                cards.push((v.key, n));
-            }
-        }
-        for o in &report.observed {
-            if let Some(l) = leak_of(self, o.key) {
-                cards.push((o.key, NeedsYou::from(l)));
-            }
-        }
-        report.leaks = due;
-        report.needs_you = cards;
     }
 
     /// Feeds the history from one pass: a sample and the connection count of
@@ -3223,7 +3224,7 @@ mod tests {
             card(&r, key30()),
             Some(NeedsYou::AboutToStop { in_ms: MIN })
         );
-        f.w.postpone_at(key30(), at).unwrap();
+        assert!(f.w.postpone_at(key30(), at).unwrap());
         let r = f.w.tick(at).unwrap();
         assert_eq!(r.servers[0].kill_in_ms, Some(3_600_000));
         assert_eq!(r.servers[0].postponed_until_ms, Some(at + POSTPONE_MS));
@@ -3249,7 +3250,7 @@ mod tests {
             pid: 30,
             start_time: 1,
         };
-        f.w.postpone_at(other, T0).unwrap();
+        assert!(!f.w.postpone_at(other, T0).unwrap());
         assert_eq!(count_events(&f, other, &EventKind::Postponed), 0);
     }
 
@@ -3309,7 +3310,7 @@ mod tests {
         f.p().set_resources(30, 3000 * MB, 0);
         f.w.tick(T0).unwrap();
         f.w.mark_leak_notified(key30());
-        f.w.ignore_alert(key30()).unwrap();
+        assert!(f.w.ignore_alert(key30()));
         // The idle alert is not touched by ignoring a leak.
         assert!(!f.state_servers()[0].alerted);
         let r = f.w.tick(T0 + MIN).unwrap();
@@ -3326,33 +3327,102 @@ mod tests {
         assert_eq!(count_events(&f, key30(), &leak), 2);
     }
 
-    #[test]
-    fn ignore_idle_alert_marks_alerted() {
-        let mut f = fx();
-        f.w.tick(T0).unwrap();
-        let r = f.w.tick(T0 + 30 * MIN).unwrap();
-        assert_eq!(
-            card(&r, key30()),
-            Some(NeedsYou::IdleAlert {
-                idle_ms: 30 * MIN,
-                agent: AgentKind::ClaudeCode
-            })
-        );
-        f.w.ignore_alert(key30()).unwrap();
-        assert!(f.state_servers()[0].alerted);
-        let r = f.w.tick(T0 + 31 * MIN).unwrap();
-        assert!(r.alerts.is_empty() && r.needs_you.is_empty());
-        // Used again: the alert re-arms, and the history shows both.
-        f.p().set_established(30, 3000, 1);
-        let r = f.w.tick(T0 + 32 * MIN).unwrap();
-        assert!(r.servers[0].in_use);
-        assert!(!f.state_servers()[0].alerted);
-        f.p().set_established(30, 3000, 0);
-        assert_eq!(f.w.tick(T0 + 62 * MIN).unwrap().alerts.len(), 1);
+    /// The session of the fixture reports itself idle since `since`.
+    fn idle_session(f: &Fx, since: u64) {
+        let v = serde_json::json!({
+            "pid": 20,
+            "sessionId": "sess-a",
+            "cwd": f.wt,
+            "status": "idle",
+            "statusUpdatedAt": since,
+            "procStart": format_proc_start(START + 20 * SEC),
+        });
+        fs::write(f.claude.path().join("sessions/20.json"), v.to_string()).unwrap();
+    }
+
+    fn idle_events(f: &Fx) -> usize {
         let idle = EventKind::Alert {
             alert: AlertKind::Idle,
         };
-        assert_eq!(count_events(&f, key30(), &idle), 2);
+        count_events(f, key30(), &idle)
+    }
+
+    #[test]
+    fn open_connection_with_an_idle_session_alerts_once() {
+        let mut f = fx();
+        f.w.tick(T0).unwrap();
+        // A browser tab stays connected while the session sits idle.
+        f.p().set_established(30, 3000, 1);
+        idle_session(&f, T0);
+        let r = f.w.tick(T0 + 30 * MIN).unwrap();
+        assert_eq!(r.alerts.len(), 1);
+        f.w.mark_alerted(key30()).unwrap();
+        let mut reported = 0;
+        for i in 1..=20 {
+            let r = f.w.tick(T0 + 30 * MIN + i * MIN).unwrap();
+            reported += r.alerts.len();
+            assert!(f.state_servers()[0].alerted, "pass {i}");
+        }
+        assert_eq!(reported, 0);
+        assert_eq!(idle_events(&f), 1);
+        // The session is used again: the period is over, the alert re-arms.
+        write_session(f.claude.path(), 20, "sess-a", &f.wt, START + 20 * SEC);
+        f.w.tick(T0 + 60 * MIN).unwrap();
+        assert!(!f.state_servers()[0].alerted);
+        idle_session(&f, T0 + 60 * MIN);
+        assert_eq!(f.w.tick(T0 + 90 * MIN).unwrap().alerts.len(), 1);
+        assert_eq!(idle_events(&f), 2);
+    }
+
+    #[test]
+    fn idle_card_survives_delivery_until_ignored() {
+        let mut f = fx();
+        f.w.tick(T0).unwrap();
+        let idle_card = |idle_ms| NeedsYou::IdleAlert {
+            idle_ms,
+            agent: AgentKind::ClaudeCode,
+        };
+        let r = f.w.tick(T0 + 30 * MIN).unwrap();
+        assert_eq!(card(&r, key30()), Some(idle_card(30 * MIN)));
+        // Delivered: the notification is gone, the card stays.
+        f.w.mark_alerted(key30()).unwrap();
+        let r = f.w.tick(T0 + 31 * MIN).unwrap();
+        assert!(r.alerts.is_empty());
+        assert_eq!(card(&r, key30()), Some(idle_card(31 * MIN)));
+        // Ignored: the card goes, `alerted` is untouched.
+        assert!(f.w.ignore_alert(key30()));
+        let r = f.w.tick(T0 + 32 * MIN).unwrap();
+        assert!(r.alerts.is_empty() && r.needs_you.is_empty());
+        assert!(f.state_servers()[0].alerted);
+        // Used again, then idle again: a new alert and a new card.
+        f.p().set_established(30, 3000, 1);
+        let r = f.w.tick(T0 + 33 * MIN).unwrap();
+        assert!(r.servers[0].in_use && r.needs_you.is_empty());
+        assert!(!f.state_servers()[0].alerted);
+        f.p().set_established(30, 3000, 0);
+        let r = f.w.tick(T0 + 63 * MIN).unwrap();
+        assert_eq!(r.alerts.len(), 1);
+        assert_eq!(card(&r, key30()), Some(idle_card(30 * MIN)));
+        assert_eq!(idle_events(&f), 2);
+    }
+
+    #[test]
+    fn ignore_alert_leaves_non_alert_cards_alone() {
+        let mut f = fx();
+        f.w.tick(T0).unwrap();
+        f.p().remove_proc(20);
+        let r = f.w.tick(T0 + 15 * MIN).unwrap();
+        let stop = Some(NeedsYou::AboutToStop { in_ms: 5 * MIN });
+        assert_eq!(card(&r, key30()), stop);
+        assert!(!f.w.ignore_alert(key30()));
+        let r = f.w.tick(T0 + 15 * MIN).unwrap();
+        assert_eq!(card(&r, key30()), stop);
+        assert!(f.w.idle_ignored.is_empty());
+        // An unknown server has no card.
+        assert!(!f.w.ignore_alert(ServerKey {
+            pid: 1,
+            start_time: 1
+        }));
     }
 
     #[test]
@@ -3384,6 +3454,7 @@ mod tests {
         .unwrap();
         let r = f.w.tick(T0 + 2 * MIN).unwrap();
         assert_eq!(card(&r, key30()), Some(NeedsYou::SessionEndedOpen));
+        assert!(!f.w.ignore_alert(key30()));
         // Closed: no longer open, not about to stop yet.
         f.p().set_established(30, 3000, 0);
         assert!(f.w.tick(T0 + 3 * MIN).unwrap().needs_you.is_empty());
@@ -3396,7 +3467,7 @@ mod tests {
         let r = f.w.tick(T0).unwrap();
         assert!(r.leaks.contains(&key50()));
         assert!(matches!(card(&r, key50()), Some(NeedsYou::Leak { .. })));
-        f.w.ignore_alert(key50()).unwrap();
+        assert!(f.w.ignore_alert(key50()));
         assert_eq!(card(&f.w.tick(T0 + MIN).unwrap(), key50()), None);
         // Idle a long time: never an idle alert or a countdown.
         f.p().set_resources(50, 10 * MB, 0);

@@ -4,6 +4,32 @@
 //! follow the dead-session rule, see `Watcher::session_end`.)
 
 use crate::model::{Observation, ServerKey, TrackedServer};
+use crate::state::SessionEndedGroup;
+use std::collections::HashSet;
+
+/// Servers still open after their session ended (a "Needs you" card): each
+/// is listed as kept running in a recorded session end, its own session is
+/// still dead, and a connection is open on it now. `obs` in `servers`
+/// order.
+pub fn session_ended_open(
+    servers: &[TrackedServer],
+    obs: &[Observation],
+    groups: &[SessionEndedGroup],
+) -> HashSet<ServerKey> {
+    servers
+        .iter()
+        .zip(obs)
+        .filter(|(s, o)| {
+            o.alive
+                && !o.session_alive
+                && o.established > 0
+                && groups
+                    .iter()
+                    .any(|g| g.still_open.iter().any(|x| x.key == s.key))
+        })
+        .map(|(s, _)| s.key)
+        .collect()
+}
 
 /// A server of an earlier conversation is offered (tier 3) once it has been
 /// idle for more than this.
@@ -178,5 +204,40 @@ mod tests {
         let mut t = old(2);
         t.session_proc_start = "Thu Oct 22 09:00:00 2026".into();
         assert!(stale(&[s, t], &[obs(1), obs(2)]).is_empty());
+    }
+
+    #[test]
+    fn session_ended_open_needs_a_group_a_dead_session_and_a_connection() {
+        use crate::state::GroupServer;
+        let group = SessionEndedGroup {
+            session_pid: PID,
+            session_proc_start: START.into(),
+            conversation_id: String::new(),
+            session_name: "wt".into(),
+            at_ms: NOW,
+            stopped: Vec::new(),
+            still_open: vec![GroupServer {
+                key: key(1),
+                port: 3000,
+                tool_label: "Vite".into(),
+                in_use: true,
+            }],
+            delivered: true,
+            agent: crate::agents::AgentKind::ClaudeCode,
+        };
+        let open = |o: Observation, groups: &[SessionEndedGroup]| {
+            session_ended_open(&[server(1)], &[o], groups).contains(&key(1))
+        };
+        let mut o = obs(1);
+        o.session_alive = false;
+        o.established = 1;
+        assert!(open(o.clone(), std::slice::from_ref(&group)));
+        assert!(!open(o.clone(), &[]));
+        let mut closed = o.clone();
+        closed.established = 0;
+        assert!(!open(closed, std::slice::from_ref(&group)));
+        let mut alive = o;
+        alive.session_alive = true;
+        assert!(!open(alive, std::slice::from_ref(&group)));
     }
 }
