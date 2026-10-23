@@ -135,14 +135,42 @@ func dominantColors(_ png: Data, fallback: Color) -> [Color] {
     return rgb.isEmpty ? [fallback] : rgb.map { Color(hex: $0) }
 }
 
-/// An event's rule and label on the memory chart.
-func eventColor(_ kind: String) -> Color {
+/// A card's text on its tint: the mockup's pastel on the dark panel, a
+/// deeper shade on the light one, so it stays readable.
+func cardTextColor(_ card: CardFfi, dark: Bool) -> Color {
+    switch card.kind {
+    case "leak", "idle_alert": return Color(hex: dark ? 0xE9B764 : 0x9A5B00)
+    default: return Color(hex: dark ? 0xFF9AA0 : 0xB4232F)
+    }
+}
+
+/// The session chip's text: the agent's color, deeper on the light panel.
+func agentChipColor(_ agent: String, dark: Bool) -> Color {
+    switch agent {
+    case "codex": return dark ? .blue : Color(hex: 0x1F5FBF)
+    default: return dark ? .orange : Color(hex: 0xB8571A)
+    }
+}
+
+/// The text of the detail's Stop button on its rose fill.
+func stopTextColor(dark: Bool) -> Color {
+    Color(hex: dark ? 0xFF9AA0 : 0xB4232F)
+}
+
+/// The memory chart's dotted leak line.
+func leakLineColor(dark: Bool) -> Color {
+    Color(hex: dark ? 0xE9B764 : 0xB07A10)
+}
+
+/// An event's rule and label on the memory chart, deeper on the light
+/// panel.
+func eventColor(_ kind: String, dark: Bool = true) -> Color {
     switch kind {
-    case "started": return Color(hex: 0xF0A472)
-    case "session_ended": return Color(hex: 0xFF8A8F)
-    case "alert": return Color(hex: 0xE9B764)
-    case "restarted": return .blue
-    case "browser_connected": return .green
-    default: return Color(hex: 0x9A9EAB)
+    case "started": return Color(hex: dark ? 0xF0A472 : 0xB8571A)
+    case "session_ended": return Color(hex: dark ? 0xFF8A8F : 0xC0303C)
+    case "alert": return Color(hex: dark ? 0xE9B764 : 0x9A5B00)
+    case "restarted": return Color(hex: dark ? 0x7AB8FF : 0x1F5FBF)
+    case "browser_connected": return Color(hex: dark ? 0x7FD6A0 : 0x1E7A45)
+    default: return Color(hex: dark ? 0x9A9EAB : 0x5E6270)
     }
 }

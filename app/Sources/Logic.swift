@@ -475,11 +475,16 @@ enum DetailButton: Hashable, Sendable {
 }
 
 /// The detail's one sentence: what is going on with this server and why.
-/// A leak first, then a server no agent started, in use, kept, its
-/// session's state.
+/// A leak first, then in use, a server no agent started, kept, its
+/// session's state. Built from the row's fields; Keep and a keep note have
+/// no field of their own in the FFI, so they are read from `statusText`
+/// (`kept by you`, `kept by Claude: "<reason>"`).
 func statusSentence(_ s: ServerViewFfi) -> String {
-    if s.card?.kind == "leak", let reason = s.card?.reason {
-        return reason + "."
+    if s.card?.kind == "leak" {
+        if s.leakKind == "growth" {
+            return "Growing fast: +\(memoryLabel(UInt64(max(0, s.growthBytes)))) in 10 min."
+        }
+        return "Using \(memoryLabel(s.rssBytes))."
     }
     if s.inUse { return "In use: a browser is connected." }
     if !s.managed { return "Not started by an agent. Balance ton port never stops it on its own." }
@@ -490,8 +495,8 @@ func statusSentence(_ s: ServerViewFfi) -> String {
     if !s.sessionAlive {
         return "Its \(s.agentLabel) session ended and nothing has connected for \(idle)."
     }
-    if s.state == "idle" {
-        return "Its \(s.agentLabel) session is open; nothing has connected for \(idle)."
+    if s.card?.kind == "idle_alert" {
+        return "Its \(s.agentLabel) session has been idle \(idle). Nothing stops it while the session is open."
     }
     return "Its \(s.agentLabel) session is open."
 }
@@ -623,6 +628,25 @@ func detailMaxHeight(screenHeight: CGFloat) -> CGFloat {
     max(300, screenHeight - 40)
 }
 
+/// At most about `maxPoints` samples for the chart: the samples are cut
+/// into equal buckets of time order, and each bucket keeps its lowest and
+/// its highest sample (in time order), so a spike stays visible.
+func downsample(_ samples: [SampleFfi], maxPoints: Int = 200) -> [SampleFfi] {
+    guard maxPoints >= 2, samples.count > maxPoints else { return samples }
+    let buckets = maxPoints / 2
+    var out: [SampleFfi] = []
+    out.reserveCapacity(buckets * 2)
+    for b in 0..<buckets {
+        let lo = samples.count * b / buckets, hi = samples.count * (b + 1) / buckets
+        guard lo < hi else { continue }
+        let slice = samples[lo..<hi]
+        let minI = slice.indices.min { slice[$0].rssBytes < slice[$1].rssBytes }!
+        let maxI = slice.indices.max { slice[$0].rssBytes < slice[$1].rssBytes }!
+        for i in Set([minI, maxI]).sorted() { out.append(samples[i]) }
+    }
+    return out
+}
+
 // MARK: - Page preview
 
 /// A live preview is taken only for a server a browser already uses: the
@@ -650,6 +674,47 @@ func previewAllows(_ url: URL, port: UInt16) -> Bool {
         return false
     }
     return host == "localhost" || host == "127.0.0.1"
+}
+
+/// The one identifier the preview's rule list is stored under: compiling
+/// for another port replaces it, so the store holds a single list.
+let previewRuleListID = "btp-preview"
+
+/// Run in the preview's main frame at document start, before the page's own
+/// scripts: turns DNS prefetching off, removes resource hints (preconnect,
+/// dns-prefetch, prefetch, preload, prerender, modulepreload) that point
+/// anywhere but the server's own origin, now and as they are added, and
+/// takes service workers away (WKWebView has no switch for them). Content
+/// rules block requests but not a hint's bare connection or lookup.
+func previewUserScript(port: UInt16) -> String {
+    let p = String(port)
+    return """
+    (function () {
+      var allowed = ["http://localhost:\(p)", "http://127.0.0.1:\(p)"];
+      var hints = /(^|\\s)(preconnect|dns-prefetch|prefetch|preload|prerender|modulepreload)(\\s|$)/i;
+      function ok(href) {
+        try { return allowed.indexOf(new URL(href, location.href).origin) >= 0; } catch (e) { return false; }
+      }
+      function clean(node) {
+        if (node.nodeType !== 1) return;
+        var links = node.matches && node.matches("link") ? [node] : [];
+        if (node.querySelectorAll) links = links.concat(Array.prototype.slice.call(node.querySelectorAll("link")));
+        links.forEach(function (l) {
+          if (hints.test(l.getAttribute("rel") || "") && !ok(l.getAttribute("href") || "")) l.remove();
+        });
+      }
+      var meta = document.createElement("meta");
+      meta.httpEquiv = "x-dns-prefetch-control";
+      meta.content = "off";
+      (document.head || document.documentElement).appendChild(meta);
+      new MutationObserver(function (records) {
+        records.forEach(function (r) { r.addedNodes.forEach(clean); });
+      }).observe(document.documentElement, { childList: true, subtree: true });
+      try {
+        Object.defineProperty(navigator, "serviceWorker", { get: function () { return undefined; } });
+      } catch (e) {}
+    })();
+    """
 }
 
 /// A content rule list that blocks every load (subresources included)

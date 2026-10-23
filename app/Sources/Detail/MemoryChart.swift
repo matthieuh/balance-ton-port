@@ -13,13 +13,16 @@ struct MemoryChart: View {
     let rssBytes: UInt64
     let cpuPct: Float
     let health: String
+    /// The chart's right edge; now, except in a rendering from a fixture.
+    var end = Date()
+    @Environment(\.colorScheme) private var scheme
 
     var body: some View {
-        let end = Date()
+        let dark = scheme == .dark
         let start = end.addingTimeInterval(-historyWindow)
         let shown = events.filter { date($0.atMs) >= start }
+        let points = downsample(samples)
         let scale = chartScale(maxBytes: max(rssBytes, samples.map(\.rssBytes).max() ?? 0), lineBytes: lineBytes)
-        let lineY = scale.lineOnScale ? Double(lineBytes) : scale.upper
         let color = healthColor(health)
         VStack(alignment: .leading, spacing: 4) {
             HStack {
@@ -33,26 +36,23 @@ struct MemoryChart: View {
             .font(.system(size: 11))
             .foregroundStyle(.secondary)
             Chart {
-                ForEach(Array(samples.enumerated()), id: \.offset) { _, s in
+                ForEach(Array(points.enumerated()), id: \.offset) { _, s in
                     AreaMark(x: .value("Time", date(s.atMs)), y: .value("Memory", Double(s.rssBytes)))
-                        .foregroundStyle(color.opacity(0.1))
+                        .foregroundStyle(color.opacity(0.12))
                         .interpolationMethod(.monotone)
                     LineMark(x: .value("Time", date(s.atMs)), y: .value("Memory", Double(s.rssBytes)))
                         .foregroundStyle(color)
                         .lineStyle(StrokeStyle(lineWidth: 2))
                         .interpolationMethod(.monotone)
                 }
-                RuleMark(y: .value("Leak line", lineY))
-                    .foregroundStyle(Color(hex: 0xE9B764).opacity(0.6))
+                // Pinned to the top when the line is far above a small
+                // server (`chartScale`), as in the mockup.
+                RuleMark(y: .value("Leak line", scale.lineOnScale ? Double(lineBytes) : scale.upper))
+                    .foregroundStyle(leakLineColor(dark: dark).opacity(dark ? 0.6 : 0.8))
                     .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 4]))
-                    .annotation(position: .bottom, alignment: .trailing, spacing: 1) {
-                        Text(verbatim: (scale.lineOnScale ? "" : "\u{2191} ") + leakLineLabel(lineBytes))
-                            .font(.system(size: 9))
-                            .foregroundStyle(Color(hex: 0xE9B764).opacity(0.8))
-                    }
                 ForEach(Array(shown.enumerated()), id: \.offset) { _, e in
                     RuleMark(x: .value("Event", date(e.atMs)))
-                        .foregroundStyle(eventColor(e.kind).opacity(0.65))
+                        .foregroundStyle(eventColor(e.kind, dark: dark).opacity(dark ? 0.65 : 0.75))
                         .lineStyle(StrokeStyle(lineWidth: 1))
                 }
             }
@@ -62,22 +62,29 @@ struct MemoryChart: View {
             .chartYAxis(.hidden)
             .chartLegend(.hidden)
             .frame(height: 86)
-            labels(shown, start: start)
+            labels(shown, start: start, dark: dark)
         }
     }
 
-    /// The events' labels under the chart, the latest kept when they crowd.
-    private func labels(_ shown: [EventFfi], start: Date) -> some View {
+    /// The events' labels under the chart, each starting at its rule (ending
+    /// at it in the right part of the chart); the latest kept when they
+    /// crowd.
+    private func labels(_ shown: [EventFfi], start: Date, dark: Bool) -> some View {
         let positions = shown.map { date($0.atMs).timeIntervalSince(start) / historyWindow }
         let kept = labelledEvents(at: positions, minGap: 0.2)
         return GeometryReader { geo in
             ForEach(kept, id: \.self) { i in
-                Text(verbatim: eventChartLabel(shown[i]))
+                let x = positions[i] * geo.size.width
+                let label = Text(verbatim: eventChartLabel(shown[i]))
                     .font(.system(size: 10))
-                    .foregroundStyle(eventColor(shown[i].kind))
+                    .foregroundStyle(eventColor(shown[i].kind, dark: dark))
                     .lineLimit(1)
                     .fixedSize()
-                    .offset(x: min(max(0, positions[i] * geo.size.width - 4), geo.size.width - 84))
+                if positions[i] > 0.7 {
+                    label.frame(width: max(0, x), alignment: .trailing)
+                } else {
+                    label.frame(width: geo.size.width, alignment: .leading).offset(x: x)
+                }
             }
         }
         .frame(height: shown.isEmpty ? 0 : 16)

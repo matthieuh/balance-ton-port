@@ -16,60 +16,105 @@ final class MenuNavigation: ObservableObject {
     }
 }
 
-/// One server's story inside the menu panel (mockup v2): hero, status
-/// card, memory chart with its events, fact chips, command and processes,
-/// then the two buttons for the situation. Its data is fetched on the core
-/// queue on every pass.
+/// One server's story inside the menu panel (mockup v2), with what it
+/// fetches: the resume command, favicon colors and config once per opened
+/// server, history and events on every pass, the processes only while
+/// their list is open.
 struct DetailView: View {
     let server: ServerViewFfi
     @EnvironmentObject private var model: CoreModel
     @EnvironmentObject private var nav: MenuNavigation
     @ObservedObject private var previews = PreviewStore.shared
-    @Environment(\.colorScheme) private var scheme
-    @State private var data = DetailData()
+    @State private var once = DetailOnce()
+    @State private var live = DetailLive()
     @State private var showProcesses = false
     @State private var contentHeight: CGFloat = 0
 
     var body: some View {
         ScrollView(.vertical) {
-            content
-                .background(GeometryReader { geo in
-                    Color.clear.preference(key: DetailHeightKey.self, value: geo.size.height)
-                })
+            DetailContent(
+                server: server, once: once, live: live, favicon: model.icons[server.id],
+                preview: previews.image(for: server.id), note: model.rowNotes[server.id],
+                restarting: model.isRestarting(server.id), showProcesses: $showProcesses,
+                onBack: { nav.back() }, more: AnyView(MoreMenu(server: server, inDetail: true, onImage: false)),
+                moreOnImage: AnyView(MoreMenu(server: server, inDetail: true, onImage: true)),
+                perform: perform
+            )
+            .background(GeometryReader { geo in
+                Color.clear.preference(key: DetailHeightKey.self, value: geo.size.height)
+            })
         }
         .scrollIndicators(.automatic)
+        // Opaque, as the mockup: the panel's translucent material would
+        // veil the detail in light mode.
+        .background(Color(nsColor: .windowBackgroundColor))
         .frame(height: min(contentHeight, detailMaxHeight(screenHeight: NSScreen.main?.visibleFrame.height ?? 800)))
         .onPreferenceChange(DetailHeightKey.self) { contentHeight = $0 }
         .frame(width: panelWidth)
         .background(EscapeKey { nav.back() })
-        .task(id: TaskKey(id: server.id, pass: model.passesDone)) {
-            data = await model.detail(server.id)
+        .task(id: server.id) {
+            once = await model.detailOnce(server.id)
+        }
+        .task(id: LiveKey(id: server.id, pass: model.passesDone, processes: showProcesses)) {
+            live = await model.detailLive(server.id, processes: showProcesses)
             previews.refresh(server)
         }
+        .onDisappear { previews.drop(server.id) }
     }
 
-    private var content: some View {
+    /// Every button goes through the menu's own actions (confirmations,
+    /// restarting state, blocked copy).
+    private func perform(_ b: DetailButton) {
+        switch b {
+        case .open: model.open(server)
+        case .stop, .stopNow: model.stop(server)
+        case .restart: model.restart(server)
+        case .postpone: model.postpone(server)
+        }
+    }
+}
+
+/// The detail itself, from plain values: hero, status card, memory chart
+/// with its events, fact chips, command and processes, then the two
+/// buttons for the situation.
+struct DetailContent: View {
+    let server: ServerViewFfi
+    let once: DetailOnce
+    let live: DetailLive
+    let favicon: NSImage?
+    let preview: NSImage?
+    let note: RowNote?
+    let restarting: Bool
+    @Binding var showProcesses: Bool
+    let onBack: () -> Void
+    /// The ⋯ menu, drawn on the gradient or over a preview.
+    let more: AnyView
+    let moreOnImage: AnyView
+    let perform: (DetailButton) -> Void
+    @Environment(\.colorScheme) private var scheme
+
+    var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HeroView(
-                server: server, favicon: model.icons[server.id], iconData: data.icon,
-                preview: previews.image(for: server.id)
+                server: server, favicon: favicon, iconRGB: once.iconRGB, preview: preview,
+                onBack: onBack, more: preview == nil ? more : moreOnImage
             )
             VStack(alignment: .leading, spacing: 0) {
                 StatusCard(
-                    server: server, note: model.rowNotes[server.id],
-                    totalMs: countdownTotalMs(server, deadSessionIdleS: data.deadSessionIdleS),
-                    perform: perform
+                    server: server, note: note,
+                    totalMs: countdownTotalMs(server, deadSessionIdleS: once.deadSessionIdleS),
+                    restarting: restarting, perform: perform
                 )
                 MemoryChart(
-                    samples: data.history, events: data.events, lineBytes: data.leakLineBytes,
+                    samples: live.history, events: live.events, lineBytes: once.leakLineBytes,
                     rssBytes: server.rssBytes, cpuPct: server.cpuPct, health: server.health
                 )
                 .padding(.top, 14)
-                FactChips(server: server, resumeCommand: data.resumeCommand)
+                FactChips(server: server, resumeCommand: once.resumeCommand)
                     .padding(.vertical, 12)
                 commandRow
                 if showProcesses {
-                    ProcessList(processes: data.processes)
+                    ProcessList(processes: live.processes)
                         .padding(.bottom, 6)
                 }
                 buttons.padding(.top, 6)
@@ -78,6 +123,7 @@ struct DetailView: View {
             .padding(.top, 12)
             .padding(.bottom, panelPadding)
         }
+        .frame(width: panelWidth)
     }
 
     private var commandRow: some View {
@@ -94,6 +140,7 @@ struct DetailView: View {
                     withAnimation(.easeOut(duration: 0.15)) { showProcesses.toggle() }
                 } label: {
                     Text(verbatim: processesLabel(Int(server.processCount)))
+                        .frame(minHeight: minHitHeight)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(PressableStyle())
@@ -101,12 +148,11 @@ struct DetailView: View {
             }
             .font(.system(size: 12))
             .foregroundStyle(.secondary)
-            .padding(.vertical, 8)
+            .padding(.vertical, 4)
         }
     }
 
     private var buttons: some View {
-        let restarting = model.isRestarting(server.id)
         let all = bottomButtons(server)
         return HStack(spacing: 8) {
             ForEach(Array(all.enumerated()), id: \.element) { index, b in
@@ -114,7 +160,7 @@ struct DetailView: View {
                 Button { perform(b) } label: {
                     Text(verbatim: b.title)
                         .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(main ? Color(nsColor: .windowBackgroundColor) : Color.pink)
+                        .foregroundStyle(main ? Color(nsColor: .windowBackgroundColor) : stopTextColor(dark: scheme == .dark))
                         .padding(.horizontal, 16)
                         .frame(maxWidth: main ? .infinity : nil)
                         .frame(height: detailButtonHeight)
@@ -129,26 +175,19 @@ struct DetailView: View {
             }
         }
     }
-
-    /// Every button goes through the menu's own actions (confirmations,
-    /// restarting state, blocked copy).
-    private func perform(_ b: DetailButton) {
-        switch b {
-        case .open: model.open(server)
-        case .stop, .stopNow: model.stop(server)
-        case .restart: model.restart(server)
-        case .postpone: model.postpone(server)
-        }
-    }
 }
+
+/// The smallest hit area of a chip or a text button.
+let minHitHeight: CGFloat = 26
 
 /// The bottom buttons: the 28 pt top of the app's button range.
 let detailButtonHeight: CGFloat = 28
 let detailButtonRadius: CGFloat = 8
 
-private struct TaskKey: Equatable {
+private struct LiveKey: Equatable {
     let id: ServerID
     let pass: Int
+    let processes: Bool
 }
 
 private struct DetailHeightKey: PreferenceKey {

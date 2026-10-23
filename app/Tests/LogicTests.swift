@@ -2,6 +2,7 @@ import AppKit
 import Foundation
 import SwiftUI
 import UserNotifications
+import WebKit
 import XCTest
 
 private func server(
@@ -899,20 +900,20 @@ private func detailServer(
 
 final class DetailTests: XCTestCase {
     func testStatusSentences() {
+        let mb: UInt64 = 1_048_576
         XCTAssertEqual(
             statusSentence(detailServer(killInMs: 8 * 60_000, card: "about_to_stop", action: "postpone")),
             "Its Claude session ended and nothing has connected for 12 min."
         )
         XCTAssertEqual(statusSentence(detailServer(inUse: true, statusText: "in use")), "In use: a browser is connected.")
-        XCTAssertEqual(
-            statusSentence(detailServer(
-                inUse: true, card: "leak", action: "restart", reason: "Growing fast: +600 MB in 10 min"
-            )),
-            "Growing fast: +600 MB in 10 min."
-        )
-        XCTAssertEqual(
-            statusSentence(detailServer(card: "leak", action: "restart", reason: "Using 2.3 GB")), "Using 2.3 GB."
-        )
+        var growth = detailServer(inUse: true, card: "leak", action: "restart", reason: "ignored")
+        growth.leakKind = "growth"
+        growth.growthBytes = Int64(600 * mb)
+        XCTAssertEqual(statusSentence(growth), "Growing fast: +600 MB in 10 min.")
+        var size = detailServer(card: "leak", action: "restart", reason: "Using 2.3 GB.")
+        size.leakKind = "size"
+        size.rssBytes = 2355 * mb
+        XCTAssertEqual(statusSentence(size), "Using 2.3 GB.", "built from the size, never a double period")
         XCTAssertEqual(
             statusSentence(detailServer(sessionAlive: true, statusText: "kept by Claude: \"watching the build\"")),
             "Kept by Claude: \"watching the build\". No alerts."
@@ -932,13 +933,52 @@ final class DetailTests: XCTestCase {
             "Its Codex session ended and nothing has connected for 12 min."
         )
         XCTAssertEqual(
+            statusSentence(detailServer(sessionAlive: true, idleMs: 23 * 3_600_000, card: "idle_alert")),
+            "Its Claude session has been idle 23 h. Nothing stops it while the session is open."
+        )
+        XCTAssertEqual(
             statusSentence(detailServer(sessionAlive: true, idleMs: 34 * 60_000, statusText: "idle 34 min")),
-            "Its Claude session is open; nothing has connected for 34 min."
+            "Its Claude session is open.", "no alert: no idle story"
         )
         XCTAssertEqual(
             statusSentence(detailServer(sessionAlive: true, idleMs: 0, statusText: "active", state: "active")),
             "Its Claude session is open."
         )
+    }
+
+    func testDownsampleKeepsSpikes() {
+        let flat = (0..<1000).map { SampleFfi(atMs: UInt64($0) * 1000, rssBytes: 100, cpuPct: 0) }
+        var spiky = flat
+        spiky[537].rssBytes = 9000
+        spiky[538].rssBytes = 1
+        let d = downsample(spiky)
+        XCTAssertLessThanOrEqual(d.count, 200)
+        XCTAssertTrue(d.contains { $0.rssBytes == 9000 }, "the spike stays")
+        XCTAssertTrue(d.contains { $0.rssBytes == 1 }, "the dip stays")
+        XCTAssertEqual(d.map(\.atMs), d.map(\.atMs).sorted(), "time order")
+        XCTAssertEqual(d.first?.atMs, 0)
+        XCTAssertEqual(downsample(Array(flat.prefix(150))).count, 150, "short histories untouched")
+    }
+
+    func testPreviewUserScriptRemovesHintsAndServiceWorkers() {
+        let js = previewUserScript(port: 3010)
+        XCTAssertTrue(js.contains("x-dns-prefetch-control"))
+        XCTAssertTrue(js.contains("preconnect|dns-prefetch|prefetch|preload|prerender|modulepreload"))
+        XCTAssertTrue(js.contains("\"http://localhost:3010\", \"http://127.0.0.1:3010\""))
+        XCTAssertTrue(js.contains("MutationObserver"))
+        XCTAssertTrue(js.contains("serviceWorker"))
+    }
+
+    @MainActor
+    func testPreviewRulesCompile() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("btp-rules-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = try XCTUnwrap(WKContentRuleListStore(url: dir))
+        let list = try await store.compileContentRuleList(
+            forIdentifier: previewRuleListID, encodedContentRuleList: previewContentRules(port: 3010)
+        )
+        XCTAssertEqual(list?.identifier, previewRuleListID)
     }
 
     func testStatusTitle() {
