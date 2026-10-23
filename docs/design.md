@@ -1,6 +1,6 @@
 # Balance ton port: design
 
-This document describes how Balance ton port works today (v0.1). It is for contributors and for anyone who wants to know exactly when the tool kills something, and when it never will.
+This document describes how Balance ton port works today. It is for contributors and for anyone who wants to know exactly when the tool kills something, and when it never will.
 
 ## 1. Intent
 
@@ -9,7 +9,7 @@ Coding-agent sessions (Claude Code, Codex CLI) start dev servers (Astro, wrangle
 Balance ton port cleans up automatically and asks only when it cannot be sure. Its rules, in order of importance:
 
 - Never kill a server someone is still using.
-- Never touch anything that was not started from a supported agent session: a Metro started in a plain terminal, Postgres, Docker, system services.
+- Never stop automatically anything an agent did not start: a Metro started in a plain terminal, Postgres, Docker, system services. The app lists such servers (section 9), but only you can stop them, one at a time, after a confirmation.
 - Cost next to nothing while idle: no subprocesses, no `lsof` loop, only direct system calls once per scan.
 
 It ships as a macOS menu bar app and a `btp` CLI, both built on one Rust core, plus an agent skill that teaches coding agents to use `btp` instead of `lsof | xargs kill`.
@@ -113,16 +113,51 @@ A pass does not consume alerts: it reports every server due one, on every pass, 
 
 `btp watch` prints each alert once and marks it as delivered. `btp sweep` ignores the alert trigger without marking anything, so the app still alerts later.
 
-## 9. State, config and locking
+## 9. Observed servers
+
+The app also lists the servers no agent started. An observed server is any TCP listener of the current user, except a process whose executable is under `/System`, `/usr/libexec` or `/usr/sbin`, or inside an `*.app/Contents/` bundle (an executable whose path cannot be read counts as a system one). Observed listeners are grouped by process tree like tracked servers; grouping stops at an agent CLI or at a process matching an excluded command, so a nested agent session or a database is never folded into a dev server.
+
+Observed servers are never stopped automatically. The row shows `in use`, `idle N min` or `excluded`; an excluded one (command or port, section 6) has no Stop. Stop and Restart exist only in the app, one server at a time, and ask for a confirmation first: Return and Escape both cancel, so a stray key press stops nothing. `btp kill` and `btp sweep` refuse observed servers (an untracked port or pid exits 1), and so does the skill.
+
+## 10. Postpone
+
+An about-to-stop server (a scheduled stop within 10 minutes) offers `Postpone 1 h`: the countdown restarts for one hour from the click. A server whose worktree was deleted still stops at once (trigger 2). Afterwards the dead-session rule applies as usual. The postpone is kept in the state file, and the waiter started by `btp session-end` honors it. Keep keeps its meaning ("stop alerting me") and lives in the more menu.
+
+## 11. Alerts in the app
+
+The menu has a "Needs you" list with one card per server that needs a decision, in this priority: a leak, a server whose session ended but is still open (a browser tab holds it), a stop within 10 minutes, the idle alert. Each card suggests one action (Restart, Postpone or Stop). A kept server shows no stop or idle card (it still shows a leak, or a session that ended but is still open).
+
+**Idle alert.** It re-arms only when the idle value the alert rule uses (section 5, trigger 5) drops below the threshold, so a long-lived connection during an idle session does not cause a new notification on every pass. Its card stays until you choose Ignore this alert or the server is used again.
+
+**Leaks.** A server leaks when its memory (the whole tree) is above `leak_memory_mb` (default 2048), or has grown by more than `leak_growth_mb` (default 500) in the last 10 minutes. The minimums are 100 and 50. Health is green below 500 MB, amber from 500 MB, red when it leaks. A leak raises one notification per leak episode. Ignore this alert dismisses the current alert only; it re-arms when memory grows another 500 MB. The leak state resets after 10 minutes without a leak, so a leak that flaps does not notify twice in a row. The leak state lives in memory: a relaunch of the app can notify an ongoing leak once more. Observed servers can leak too.
+
+## 12. History and probes
+
+**History.** Each pass samples the memory and CPU of every server's whole process tree. The samples, and the lifecycle events (started, browser connected or closed, session ended, alert, restarted, postponed), are kept in memory for 2 hours and never written to disk. They feed the growth rule and the chart of the detail view.
+
+**Probes.** To show a title and a favicon, the app fetches the page of a server over http at `127.0.0.1` or `::1`, on the server's own port only. A probe has one deadline of 800 ms. A probe is never counted as use: the app's own connections to a port are ignored when measuring activity (dual-stack aware). A port that answers with something other than HTTP is probed once and never again while the server lives; a timeout or a refusal is retried later. Excluded servers are never probed.
+
+**Preview.** The detail view shows a live preview of the page only for a server that already has a browser connected. It is rendered offscreen in a web view where everything except localhost on that port is blocked: content rules, a script that removes preconnect and prefetch hints, service workers disabled. A preview is cached for 3 minutes. The connection of the preview is opened by WebKit's networking process, not by the app, so it can count as use for a few seconds. That never changes a decision, because the server was already in use when the preview was taken.
+
+## 13. Restart
+
+Restart stops a server and starts it again: the original argv in its original folder, with the environment read from the live process at the time of the restart (never stored, logged or printed). `argv[0]` is resolved with the process's own `PATH`. A restarted tracked server keeps its ownership: session, note, Keep and Postpone, plus a `restarted_from` record. A pending restart links the new process to its owner while that process lives (24 hours at most), so a child that listens late is still linked.
+
+A restart is refused when the folder is gone, the environment cannot be read, the port is still taken after the stop, an exclusion matches, or another restart of the same server is running. The server's output goes to `<data dir>/logs/` (mode 0600, because it may hold tokens; the 20 most recent files are kept). Restart is never in the hover capsule; it is in the more menu and on the leak card.
+
+**Session chip.** The detail view's session chip copies `cd '<folder>' && claude --resume <id>` (or `codex resume <id>`) to the clipboard. It never opens a terminal.
+
+## 14. State, config and locking
 
 Everything lives in `~/Library/Application Support/balance-ton-port/` (overridable with `BTP_DATA_DIR`):
 
 | File | Content |
 |---|---|
 | `config.toml` | Settings, shared by the app and the CLI |
-| `state.json` | Tracked servers (links, idle clocks, Keep and alerted marks) and the last 5 kills |
+| `state.json` | Tracked servers (links, idle clocks, Keep, Postpone and alerted marks) and the last 5 kills |
 | `state.lock` | Exclusive lock held while `state.json` is read and rewritten |
 | `kills.log` | One JSON line per kill |
+| `logs/` | Output of restarted servers, one file per restart (mode 0600, the 20 most recent kept) |
 | `watch.lock` | Held by the single watcher, with its name inside |
 
 `state.json` is written through a temp file and a rename. A corrupt file is moved to `state.json.corrupt` and the state starts empty; any other read error is returned so the state is never overwritten blindly.
@@ -131,7 +166,7 @@ Config minimums: 60 s for `dead_session_idle_s` and `alert_after_s`, 1 s for `ki
 
 **One watcher.** Only the holder of `watch.lock` runs killing passes. The app tries to take it on every pass; while `btp watch` holds it, the app only observes (links, activity and forgets are still recorded, no kill, no alert) and shows the list read-only, but its manual Kill button still works. `btp watch` refuses to start while the app holds the lock. `btp list`, `btp kill` and `btp sweep` work without any watcher: they run the same pass (link, observe, forget) on demand.
 
-## 10. Claude Code plugin and session end
+## 15. Claude Code plugin and session end
 
 The plugin (`plugin/`) has two hooks, an install command and the agent skill.
 
@@ -152,7 +187,7 @@ The plugin (`plugin/`) has two hooks, an install command and the agent skill.
 - A server reparented to launchd before the hook runs is left to the normal rules.
 - A server started with `&` or `nohup` is reparented at once, so it is never linked to the session and never tracked.
 
-## 11. Known limitations
+## 16. Known limitations
 
 - A Claude Code process with no session file in a watched dir (a `CLAUDE_CONFIG_DIR` whose `sessions/` folder is shared with another dir, an older Claude Code) is ignored: its servers are never tracked, so never killed, and never cleaned up either.
 - A server started in the background (`cmd &`) inside one shell command is reparented to launchd before the first scan and is not tracked, for Codex as for Claude Code. More generally, anything started and orphaned between two scans is missed.
@@ -168,7 +203,7 @@ The plugin (`plugin/`) has two hooks, an install command and the agent skill.
 - The kill log grows without bound, and the same kill can occasionally be recorded twice.
 - macOS only. The platform layer is behind a trait so that a Linux implementation (`/proc`) can follow.
 
-## 12. Architecture
+## 17. Architecture
 
 ```
 crates/btp-core   Rust library: platform layer, sessions, linking, decide, kill, state, config
@@ -178,10 +213,10 @@ app/              SwiftUI menu bar app (XcodeGen project)
 plugin/           the Claude Code plugin: hooks, install script, the agent skill (plugin/skills/)
 ```
 
-- `btp-core`: `platform` (a `Platform` trait; the macOS implementation uses libproc and sysctl for listening sockets, process info, ancestry, descendants and per-socket TCP states, plus `kill(2)`), `sessions` (session files and config dir discovery), `agents` (one module per agent: process recognition, live sessions and metadata for `claude` and `codex`, the rollout line 1 reader), `worktree`, `decide` (pure decision logic, unit-tested with fake clocks and fake process tables), `watcher` (link, refresh, observe, execute, the watch lock), `state`, `config`, and `labels`/`display` for readable names (`Expo (Metro)`, `repo › worktree`).
-- `btp-ffi`: a `Core` object exposing `tick`, `observe`, `kill_port`, `kill_server(pid, start_time)`, `mark_alerted`, `keep`, `config`/`set_config`, `recent_kills` and `acquire_watch`. `scripts/build-xcframework.sh` builds a universal static library, packs it as `BtpCore.xcframework` and generates the Swift bindings.
+- `btp-core`: `platform` (a `Platform` trait; the macOS implementation uses libproc and sysctl for listening sockets, process info, ancestry, descendants and per-socket TCP states, plus `kill(2)`), `sessions` (session files and config dir discovery), `agents` (one module per agent: process recognition, live sessions and metadata for `claude` and `codex`, the rollout line 1 reader), `worktree`, `decide` (pure decision logic, unit-tested with fake clocks and fake process tables), `watcher` (link, refresh, observe, execute, the watch lock), `history` (samples, events, leaks), `observed`, `probe` (title and favicon), `restart`, `state`, `config`, and `labels`/`display` for readable names (`Expo (Metro)`, `repo › worktree`).
+- `btp-ffi`: a `Core` object exposing `tick`, `observe`, `kill_port`, `kill_server(pid, start_time)`, `mark_alerted`, `keep`, `postpone`, `ignore_alert`, `mark_leak_notified`, `history`, `events`, `icon`, `processes`, `resume_command`, `restart`, `stop_observed`, `discovered_claude_dirs`, `config`/`set_config`, `claim_session_ended`, `unclaim_session_ended`, `stop_session_ended`, `keep_session_ended`, `recent_kills` and `acquire_watch`. `scripts/build-xcframework.sh` builds a universal static library, packs it as `BtpCore.xcframework` and generates the Swift bindings.
 - The app: `MenuBarExtra` in window style, `LSUIElement` (no Dock icon), launch at login through `SMAppService`, notifications with actions through `UNUserNotificationCenter`. It runs one pass at a time on a background queue and schedules the next one `scan_interval_s` after the previous one finished. One process, no daemon to install. macOS 14 or later.
 
-## 13. Release pipeline
+## 18. Release pipeline
 
 CI runs fmt, clippy, the Rust tests and the Swift tests on every push and pull request. A `v*` tag runs the release workflow: it checks that the tag matches the CLI and app versions, builds a universal `btp` and app, signs them with a Developer ID, notarizes and staples the app, packs it into `BalanceTonPort-<v>.dmg` (signed, notarized and stapled too), and publishes a GitHub release with the CLI tarball, the dmg, their `.sha256` files and the Homebrew formula and cask filled with the version and checksums; a tag with a hyphen is a prerelease, and nothing is published unless every step passed. See [RELEASING.md](../RELEASING.md) for the secrets and the steps.

@@ -14,6 +14,16 @@ Every 5 seconds it links new listening servers to the coding-agent session (Clau
 
 A server is a process tree: the listening process started under the session plus its children (for example Astro or wrangler with their `workerd` workers). A child listening on its own port is part of its parent's server, and "idle" means no established connection on any port of the whole tree. Kill is SIGTERM on that tree, then SIGKILL after 5 s for survivors; a process of any agent CLI (Claude Code, Codex) found in the tree, or a process matching an excluded command (a `postgres` the dev server started, say), is never signalled, nor is anything it runs. The menu bar lists running servers and the last 5 kills with their reason.
 
+## The menu bar app
+
+- **Needs you**: one card per server that needs a decision (a leak, a session that ended while a browser tab still holds the server, a stop within 10 minutes, the idle alert), each with one suggested action: Restart, Postpone 1 h or Stop. Ignore this alert dismisses the current alert only.
+- **Servers**: each row shows the name, the framework, the folder and branch, memory and CPU with a health color (green below 500 MB, amber from 500 MB, red on a leak), the agent badge (`Claude`, `Codex` or `no agent`), the status (`in use`, `idle 12 min`, `stops in 8 min`, `kept by you`, `excluded`) and a machine usage bar. The more menu has Open in browser, Restart, Keep, Ignore this alert, Details and Stop.
+- **Other servers**: listeners no agent started (a Metro from a plain terminal, a local database, any app's server) are shown too, so you can see what holds a port. They are never stopped automatically. Stop and Restart exist only in the app, after a confirmation (Return and Escape cancel); `btp kill`, `btp sweep` and the skill refuse them. System processes and `.app` bundles are not listed, and an excluded one has no Stop.
+- **Details**: the page title and favicon (fetched over localhost on the server's own port only, never counted as use), a live preview when a browser is already connected to the server, the last 2 hours of memory and CPU with events, the process list, the session (the session chip copies `cd '<folder>' && claude --resume <id>` or `codex resume <id>`, and never opens a terminal), Restart and Postpone 1 h.
+- **Postpone 1 h** restarts the countdown for one hour from the click (a deleted worktree still stops at once).
+- **Restart** runs the original command again in its folder, with the environment read from the live process at that moment (never stored or logged). The server keeps its session, note, Keep and Postpone. It is refused when the folder is gone, the environment cannot be read, the port stays taken or an exclusion matches. Output goes to `logs/` in the data dir (mode 0600, 20 most recent kept).
+- **Leak alerts**: a server above `leak_memory_mb` or growing more than `leak_growth_mb` in 10 minutes raises one notification per leak.
+
 ## How it decides
 
 - Only servers linked, at first sight, to a live Claude Code session are tracked; a Claude Code session is recognised by its session file and its process start time.
@@ -109,7 +119,7 @@ If you use a custom `CLAUDE_CONFIG_DIR`, copy it into that directory's `skills/`
 
 ## Safety rules
 
-- Never kills a process that was not started from a live coding-agent session.
+- Never stops automatically a process that was not started from a live coding-agent session. The app can stop such a server (shown under other servers) only when you ask, one at a time, after a confirmation; `btp kill` and `btp sweep` refuse it.
 - A server whose worktree is used by another live session is never touched.
 - Agent CLI processes (Claude Code, Codex) themselves are never tracked, and never signalled when found inside a server's process tree.
 - A child matching an excluded command (a database started by the dev server) is never signalled when its server is killed.
