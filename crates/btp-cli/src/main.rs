@@ -7,7 +7,7 @@ use btp_core::display::format_idle as ago;
 use btp_core::display::{format_idle, name_list, server_state as state_label, session_ended_body};
 use btp_core::labels::{location_label, tool_label};
 use btp_core::model::{KillReason, KillTarget, ServerKey, TrackedServer};
-use btp_core::platform::MacOs;
+use btp_core::platform::{MacOs, Platform};
 use btp_core::state::{is_read_only_error, read_state_readonly, KillRecord, SessionEndedGroup};
 use btp_core::watcher::{
     acquire_watch_lock, now_ms, NoteCmd, NoteOutcome, OwnKillOutcome, ServerView, TickReport,
@@ -458,6 +458,8 @@ fn watch(dir: std::path::PathBuf) -> Result<u8, Failure> {
     println!("watching (Ctrl-C to stop)");
     let mut last_config_error = None;
     while !stop.load(Ordering::SeqCst) {
+        // The app can start or quit while this runs.
+        w = w.with_ignored_peers(app_pids(&MacOs));
         match w.tick(now_ms()) {
             Ok(report) => {
                 if report.config_error != last_config_error {
@@ -493,10 +495,19 @@ const NOTIFY_TITLE: &str = "Balance ton port";
 /// Posts a notification (title, subtitle, body).
 type Notifier<'a> = dyn Fn(&str, &str, &str) + std::panic::RefUnwindSafe + 'a;
 
+/// The menu bar app's executable name (`PRODUCT_NAME` in app/project.yml).
+const APP_EXECUTABLE: &str = "Balance ton port";
+
+/// The running menu bar apps: their probe and preview connections never
+/// count as use in a CLI pass either.
+fn app_pids(p: &impl Platform) -> Vec<i32> {
+    p.pids_named(APP_EXECUTABLE)
+}
+
 /// The watcher on the real platform. Tests set `BTP_TEST_NO_CODEX` so that a
 /// live Codex session of the machine never shows up in them.
 fn new_watcher(dir: std::path::PathBuf) -> Watcher<MacOs> {
-    let w = Watcher::new(MacOs, dir);
+    let w = Watcher::new(MacOs, dir).with_ignored_peers(app_pids(&MacOs));
     if std::env::var_os("BTP_TEST_NO_CODEX").is_some() {
         w.without_codex()
     } else {
@@ -940,6 +951,27 @@ mod tests {
             note_reason: None,
             kept_by_user: false,
         }
+    }
+
+    #[test]
+    fn app_pids_finds_a_process_named_like_the_app() {
+        // A copy of `sleep` under the app's executable name, a child of
+        // this test: the name has spaces and is 16 bytes long.
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join(APP_EXECUTABLE);
+        std::fs::copy("/bin/sleep", &exe).unwrap();
+        let mut child = std::process::Command::new(&exe).arg("30").spawn().unwrap();
+        let pid = child.id() as i32;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut found = app_pids(&MacOs);
+        while !found.contains(&pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            found = app_pids(&MacOs);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(found.contains(&pid), "{pid} not in {found:?}");
+        assert!(!app_pids(&MacOs).contains(&(std::process::id() as i32)));
     }
 
     #[test]
