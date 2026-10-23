@@ -12,8 +12,9 @@ use libproc::net_info::{SocketFDInfo, SocketInfoKind, TcpSIState, TcpSockInfo};
 use libproc::proc_pid::{listpidinfo, pidinfo};
 use libproc::processes::{pids_by_type, ProcFilter};
 use std::collections::HashSet;
-use std::ffi::CStr;
+use std::ffi::{CStr, OsStr};
 use std::os::raw::{c_char, c_int, c_void};
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -239,6 +240,10 @@ struct VnodeFdInfoWithPath {
     pvip: libc::vnode_info_path,
 }
 
+// `PROC_PIDFDVNODEPATHINFO_SIZE`: a layout drift would make every call fail
+// the size check and `open_paths` silently return nothing.
+const _: () = assert!(std::mem::size_of::<VnodeFdInfoWithPath>() == 1200);
+
 /// Paths of the vnode (file or directory) descriptors `pid` holds.
 fn vnode_paths(pid: i32) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -283,10 +288,8 @@ fn vnode_paths(pid: i32) -> Vec<PathBuf> {
             std::slice::from_raw_parts(raw.as_ptr().cast::<u8>(), std::mem::size_of_val(raw))
         };
         if let Ok(path) = CStr::from_bytes_until_nul(bytes) {
-            if let Ok(path) = path.to_str() {
-                if !path.is_empty() {
-                    out.push(PathBuf::from(path));
-                }
+            if !path.is_empty() {
+                out.push(PathBuf::from(OsStr::from_bytes(path.to_bytes())));
             }
         }
     }
