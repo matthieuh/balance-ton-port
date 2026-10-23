@@ -97,6 +97,13 @@ fn zz_helper() {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
+    if mode == "connect" {
+        let port: u16 = std::env::var("BTP_TEST_CONNECT").unwrap().parse().unwrap();
+        let _c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
     let v4 = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = v4.local_addr().unwrap().port();
     // Same port on IPv6 too, to check that listeners() reports it once.
@@ -440,4 +447,43 @@ fn established_excluding_ignores_connections_from_listed_pid() {
     assert_eq!(MacOs.established_excluding(h.pid(), h.port, &[me]), 0);
     assert_eq!(MacOs.established_excluding(h.pid(), h.port, &[999_999]), 2);
     assert_eq!(MacOs.established_excluding(h.pid(), h.port, &[]), 2);
+}
+
+#[test]
+fn established_excluding_handles_v4_and_v6_clients() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = spawn_helper("listen", dir.path());
+    let me = std::process::id() as i32;
+    let _c4 = TcpStream::connect(("127.0.0.1", h.port)).unwrap();
+    assert!(wait_until(|| MacOs.established(h.pid(), h.port) == 1));
+    assert_eq!(MacOs.established_excluding(h.pid(), h.port, &[me]), 0);
+    let _c6 = TcpStream::connect((Ipv6Addr::LOCALHOST, h.port)).unwrap();
+    assert!(wait_until(|| MacOs.established(h.pid(), h.port) == 2));
+    assert_eq!(MacOs.established_excluding(h.pid(), h.port, &[me]), 0);
+}
+
+#[test]
+fn established_excluding_keeps_connections_from_other_processes() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = spawn_helper("listen", dir.path());
+    let me = std::process::id() as i32;
+    let _mine = TcpStream::connect(("127.0.0.1", h.port)).unwrap();
+    // A second process that connects and holds the connection.
+    let mut other = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "zz_helper", "--nocapture", "--test-threads=1"])
+        .env(HELPER_ENV, "connect")
+        .env("BTP_TEST_CONNECT", h.port.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let ok = wait_until(|| MacOs.established(h.pid(), h.port) == 2);
+    let excluding = MacOs.established_excluding(h.pid(), h.port, &[me]);
+    let both = MacOs.established_excluding(h.pid(), h.port, &[me, other.id() as i32]);
+    let _ = other.kill();
+    let _ = other.wait();
+    assert!(ok);
+    assert_eq!(excluding, 1);
+    assert_eq!(both, 0);
 }

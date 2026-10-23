@@ -75,7 +75,8 @@ pub trait Platform {
     fn exe_path(&self, pid: i32) -> Option<PathBuf>;
     /// Like `established`, but a connection whose remote end is a loopback
     /// socket owned by one of `peer_pids` does not count. Only those pids
-    /// are scanned.
+    /// are scanned. The default ignores a non-empty `peer_pids`: a platform
+    /// that can read peer sockets must override it.
     fn established_excluding(&self, pid: i32, port: u16, peer_pids: &[i32]) -> u32 {
         let _ = peer_pids;
         self.established(pid, port)

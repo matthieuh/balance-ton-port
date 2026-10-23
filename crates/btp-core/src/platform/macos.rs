@@ -78,6 +78,31 @@ fn remote_port(tcp: &TcpSockInfo) -> u16 {
     u16::from_be(tcp.tcpsi_ini.insi_fport as u16)
 }
 
+/// An address of a socket as 16 bytes, IPv4 as `::ffff:a.b.c.d`.
+fn normalized_addr(vflag: u8, addr: &libproc::net_info::InSIAddr) -> [u8; 16] {
+    const INI_IPV4: u8 = 1;
+    // SAFETY: both union members are plain integers of the same storage;
+    // any bit pattern is valid for either.
+    unsafe {
+        if vflag & INI_IPV4 == 0 {
+            return addr.ina_6.s6_addr;
+        }
+        let mut out = [0u8; 16];
+        out[10] = 0xff;
+        out[11] = 0xff;
+        out[12..].copy_from_slice(&addr.ina_46.i46a_addr4.s_addr.to_ne_bytes());
+        out
+    }
+}
+
+fn local_addr(tcp: &TcpSockInfo) -> [u8; 16] {
+    normalized_addr(tcp.tcpsi_ini.insi_vflag, &tcp.tcpsi_ini.insi_laddr)
+}
+
+fn remote_addr(tcp: &TcpSockInfo) -> [u8; 16] {
+    normalized_addr(tcp.tcpsi_ini.insi_vflag, &tcp.tcpsi_ini.insi_faddr)
+}
+
 fn tcp_state(tcp: &TcpSockInfo) -> TcpSIState {
     TcpSIState::from(tcp.tcpsi_state)
 }
@@ -498,15 +523,18 @@ impl Platform for MacOs {
         if pid <= 0 {
             return 0;
         }
-        // The server's connections as (client port, IP family flag).
-        let mut conns: Vec<(u16, u8)> = Vec::new();
+        // The server's connections as (local addr, remote addr, remote port).
+        let mut conns: Vec<([u8; 16], [u8; 16], u16)> = Vec::new();
         for_each_tcp_socket(pid, |tcp| {
             if matches!(tcp_state(tcp), TcpSIState::Established) && local_port(tcp) == port {
-                conns.push((remote_port(tcp), tcp.tcpsi_ini.insi_vflag));
+                conns.push((local_addr(tcp), remote_addr(tcp), remote_port(tcp)));
             }
         });
         // A connection is the peer's when one of its sockets is the mirror
-        // image: local port = our remote port, remote port = our port.
+        // image: its local endpoint is our remote one and its remote
+        // endpoint is our local one. Addresses are normalized to 16 bytes
+        // (IPv4 as ::ffff:a.b.c.d), so a v4 client matches a v4-mapped
+        // accepted socket and the other way round.
         for &peer in peer_pids.iter().filter(|&&p| p > 0 && p != pid) {
             if conns.is_empty() {
                 break;
@@ -515,8 +543,12 @@ impl Platform for MacOs {
                 if !matches!(tcp_state(tcp), TcpSIState::Established) || remote_port(tcp) != port {
                     return;
                 }
-                let mirror = (local_port(tcp), tcp.tcpsi_ini.insi_vflag);
-                if let Some(i) = conns.iter().position(|&c| c == mirror) {
+                let (peer_l, peer_r) = (local_addr(tcp), remote_addr(tcp));
+                let lport = local_port(tcp);
+                if let Some(i) = conns
+                    .iter()
+                    .position(|&(l, r, rp)| rp == lport && r == peer_l && l == peer_r)
+                {
                     conns.swap_remove(i);
                 }
             });
