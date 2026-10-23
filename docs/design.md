@@ -36,13 +36,13 @@ The Claude Code CLI is recognised by its command line: argv[0] named `claude`, a
 
 ### Codex CLI
 
-A Codex session is the native `codex` binary (argv[0] path ending in `/codex`) running interactively. Codex is usually started through a shell wrapper that stays its parent; the wrapper is recognised as a wrapper and is never a session. `codex exec` and the like are non-interactive roles, `codex app-server` (the Codex desktop app) is never a session.
+Every native `codex` process (argv[0] path ending in `/codex`) running interactively (the TUI) or as `codex exec` / `codex review` is a session, with or without a thread lock; a `codex exec` started inside another live session belongs to that session instead. Codex is usually started through a shell wrapper that stays its parent; the wrapper is recognised as a wrapper and is never a session. `codex app-server` (the Codex desktop app) and the other service subcommands are never sessions.
 
-Codex has no session file. A session is the native process that holds a lock `<CODEX_HOME>/thread-writer-locks/<uuid>.lock` (`CODEX_HOME` is read from the process environment, default `~/.codex`); the uuid is the thread id, used as the conversation id. Liveness uses the same rule as for Claude Code: pid plus process start time.
+Codex has no session file. The thread id, used as the conversation id, comes from the lock the process holds, `<CODEX_HOME>/thread-writer-locks/<uuid>.lock` (`CODEX_HOME` is read from the process environment, default `~/.codex`); a process holding several locks keeps the others as further conversations. Liveness uses the same rule as for Claude Code: pid plus process start time.
 
 From the thread's rollout file (`<CODEX_HOME>/sessions/.../rollout-*-<uuid>.jsonl`) only line 1, the `session_meta` record, is read, for the thread id, the start timestamp, the cwd and the parent thread of a sub-thread. Nothing else of a rollout is read, parsed, stored or logged. When there is no lock yet, the newest rollout of the process's cwd stands in. The display name is the basename of the session cwd.
 
-Codex writes its transcript only at the end of a turn, so a running turn cannot be told from an idle session: the status of a Codex session is always unknown, and it never gets the idle alert (trigger 3). It is still covered by the dead-session rule and the worktree-deleted rule.
+Codex writes its transcript only at the end of a turn, so a running turn cannot be told from an idle session: the status of a Codex session is always unknown and its session idle time is never known. A live Codex session's server is alerted on port idle only, like a busy Claude Code session's (trigger 5). It is also covered by the dead-session rule and the worktree-deleted rule.
 
 ## 3. What a server is
 
@@ -55,17 +55,17 @@ On each scan, for every listening socket not already tracked, the core walks the
 - its port is excluded;
 - its working directory cannot be read.
 
-Ancestry comes first. A server that was reparented to launchd before it was seen (a daemonized dev server) has no ancestry left; for those only, the `CODEX_THREAD_ID` of its environment (read for the current user's processes only, and only that one value is kept) links it to a Codex session, and only when exactly one live Codex session holds that thread. Environments are not read when no Codex session is live.
+Linking is by ancestry only: a listener with no live session among its ancestors (a server reparented to launchd before it was seen, for example) is never linked, whatever its environment says. When the matched session is a Codex session, the `CODEX_THREAD_ID` of the listener's environment (or of the nearest process below the session that has one) picks which of that session's own threads the server belongs to; a value the session does not hold is ignored and the session's main thread is used. Environments are read only for a listener matched to a Codex session, for the current user's processes only, and only that one value is kept.
 
 An agent CLI (Claude Code or Codex) is never tracked as a server, and is spared, with its whole subtree, in a kill tree.
 
 The link records the server's (pid, start time) as its identity, its port and command line, its session (id, pid, start time, display name) and its worktree: the nearest ancestor of the server's working directory holding a `.git` entry (a directory for a main checkout, a file for a linked worktree), or the working directory itself outside a repository.
 
-A server is a process tree. A listener whose ancestor below the session is already a tracked server belongs to that server, and a tracked process's extra ports are part of it. If a child started listening before its parent, the two rows are folded into the topmost one on the next pass (this check runs on every pass). A Claude Code process found inside a server's tree, with its whole subtree, is left out of that server's pids and ports, so `btp kill <port>` never picks the outer server for a port the nested session's server holds.
+A server is a process tree. A listener whose ancestor below the session is already a tracked server belongs to that server, and a tracked process's extra ports are part of it. If a child started listening before its parent, the two rows are folded into the topmost one on the next pass (this check runs on every pass). A process of any agent CLI (Claude Code or Codex) found inside a server's tree, with its whole subtree, is left out of that server's pids and ports, so `btp kill <port>` never picks the outer server for a port the nested session's server holds.
 
 ## 4. Idle
 
-**Port idle**: no established TCP connection on any port of the tree, counted for every process of the tree. A nested Claude Code subtree still counts toward activity here (it errs on keeping). Every pass that sees at least one established connection resets the server's idle clock.
+**Port idle**: no established TCP connection on any port of the tree, counted for every process of the tree. A nested agent CLI subtree still counts toward activity here (it errs on keeping). Every pass that sees at least one established connection resets the server's idle clock.
 
 **Session idle**: the session file says `status: idle`; the idle time is now minus `statusUpdatedAt`. A `busy` session is not idle.
 
@@ -86,14 +86,14 @@ The shared-worktree rule matches worktrees, not connections. A server that anoth
 - `exclude_commands` (default `mcp`, `argent`, `postgres`, `redis-server`, `mysqld`, `mongod`): case-insensitive substrings of the full command line.
 - `exclude_ports` (default empty): a server is excluded when its main port, or any port of its tree, is in the list.
 
-Exclusions are checked when a listener is linked, again on every pass (a tracked server that now matches, or has an ancestor below its session that matches, is forgotten, never killed), and again right before each kill, with the config re-read from disk. When a server is killed, any descendant that matches an excluded command is spared with its subtree, as is any Claude Code process found in the tree: a database the dev server started is left running.
+Exclusions are checked when a listener is linked, again on every pass (a tracked server that now matches, or has an ancestor below its session that matches, is forgotten, never killed), and again right before each kill, with the config re-read from disk. When a server is killed, any descendant that matches an excluded command is spared with its subtree, as is any agent CLI process found in the tree: a database the dev server started is left running.
 
 ## 7. Killing
 
 `kill_tree`:
 
 1. Check that the server's pid still has the recorded start time; if not, send nothing.
-2. Snapshot the server and its own descendants as (pid, start time), leaving out Claude Code and excluded subtrees.
+2. Snapshot the server and its own descendants as (pid, start time), leaving out agent CLI and excluded subtrees.
 3. SIGTERM to each, re-checking the start time right before each signal.
 4. Poll every 100 ms until all are gone or `kill_grace_s` (default 5 s) has passed.
 5. SIGKILL to the survivors, again re-checking each start time first.
@@ -155,9 +155,9 @@ The plugin (`plugin/`) has two hooks, an install command and the agent skill.
 ## 11. Known limitations
 
 - A Claude Code process with no session file in a watched dir (a `CLAUDE_CONFIG_DIR` whose `sessions/` folder is shared with another dir, an older Claude Code) is ignored: its servers are never tracked, so never killed, and never cleaned up either.
-- A server started in the background (`cmd &`) inside one shell command is reparented to launchd before the first scan and is not tracked by ancestry; a Codex server is still linked by its `CODEX_THREAD_ID` when that thread is held by exactly one live session. More generally, anything started and orphaned between two scans is missed.
+- A server started in the background (`cmd &`) inside one shell command is reparented to launchd before the first scan and is not tracked, for Codex as for Claude Code. More generally, anything started and orphaned between two scans is missed.
 - Codex desktop app is not supported: its `codex` processes are never sessions, so its servers are never tracked.
-- Codex sessions never get the idle alert (their status is unknown, see section 2); session-end cleanup, the offer after `/clear` and the grouped notification are Claude Code only.
+- A live Codex session's servers are alerted on port idle only (its session idle time is unknown, see section 2), like a busy Claude Code session's; session-end cleanup, the offer after `/clear` and the grouped notification are Claude Code only.
 - A Codex session without a lock or a rollout yet has an empty conversation id.
 - The native Codex binary must be named `codex`; a vendor-triple name is not recognised.
 - A resumed Codex thread keeps the cwd recorded in its transcript, not the one it was resumed from.
