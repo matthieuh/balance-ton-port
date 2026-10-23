@@ -48,6 +48,7 @@ impl Sandbox {
         c.env("BTP_DATA_DIR", self.data.path())
             .env("HOME", self.data.path())
             .env("BTP_TEST_NOTIFY_FILE", self.notify_file())
+            .env("BTP_TEST_NO_CODEX", "1")
             .env("BTP_HOOK_DEBUG", "1")
             .env_remove("CLAUDE_CONFIG_DIR");
     }
@@ -61,6 +62,7 @@ impl Sandbox {
         c.env("BTP_DATA_DIR", self.data.path())
             .env("HOME", self.data.path())
             .env("BTP_TEST_NOTIFY_FILE", self.notify_file())
+            .env("BTP_TEST_NO_CODEX", "1")
             .env_remove("CLAUDE_CONFIG_DIR");
         c
     }

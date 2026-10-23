@@ -217,7 +217,7 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
     let dir = data_dir();
     match cmd {
         Cmd::List { json } => {
-            let pass = Watcher::new(MacOs, dir.clone())
+            let pass = new_watcher(dir.clone())
                 .observe(now_ms())
                 .and_then(|report| {
                     let kills = btp_core::state::with_state(&dir, |s| s.recent_kills.clone())?;
@@ -267,7 +267,7 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
         }
         Cmd::Kill(KillArgs { key: Some(key), .. }) => {
             require_writable(&dir)?;
-            let mut w = Watcher::new(MacOs, dir);
+            let mut w = new_watcher(dir);
             let out = w.kill_own(std::process::id() as i32, key)?;
             warn_config(w.config_error());
             match out {
@@ -294,7 +294,7 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
                 (None, Some(p)) => KillTarget::Pid(p),
                 _ => return Err(Failure::User("give a port or --pid <pid>".into())),
             };
-            let mut w = Watcher::new(MacOs, dir);
+            let mut w = new_watcher(dir);
             let killed = w.kill(target)?;
             warn_config(w.config_error());
             match killed {
@@ -310,7 +310,7 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
             }
         }
         Cmd::Sweep { dry_run } => {
-            let mut w = Watcher::new(MacOs, dir);
+            let mut w = new_watcher(dir);
             let report = if dry_run {
                 w.observe(now_ms())?
             } else {
@@ -352,7 +352,7 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
                 _ => return Err(Failure::User("give --keep [reason] or --done".into())),
             };
             require_writable(&dir)?;
-            let mut w = Watcher::new(MacOs, dir);
+            let mut w = new_watcher(dir);
             let thread = std::env::var("CODEX_THREAD_ID").ok();
             let out = w.note(
                 std::process::id() as i32,
@@ -387,7 +387,7 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
             conversation,
             session_pid,
         } => {
-            let mut w = Watcher::new(MacOs, dir);
+            let mut w = new_watcher(dir);
             let out = w.stale(
                 std::process::id() as i32,
                 session_pid,
@@ -454,7 +454,7 @@ fn watch(dir: std::path::PathBuf) -> Result<u8, Failure> {
     let flag = stop.clone();
     ctrlc::set_handler(move || flag.store(true, Ordering::SeqCst))
         .map_err(|e| Failure::Internal(e.to_string()))?;
-    let mut w = Watcher::new(MacOs, dir);
+    let mut w = new_watcher(dir);
     println!("watching (Ctrl-C to stop)");
     let mut last_config_error = None;
     while !stop.load(Ordering::SeqCst) {
@@ -492,6 +492,17 @@ const NOTIFY_TITLE: &str = "Balance ton port";
 
 /// Posts a notification (title, subtitle, body).
 type Notifier<'a> = dyn Fn(&str, &str, &str) + std::panic::RefUnwindSafe + 'a;
+
+/// The watcher on the real platform. Tests set `BTP_TEST_NO_CODEX` so that a
+/// live Codex session of the machine never shows up in them.
+fn new_watcher(dir: std::path::PathBuf) -> Watcher<MacOs> {
+    let w = Watcher::new(MacOs, dir);
+    if std::env::var_os("BTP_TEST_NO_CODEX").is_some() {
+        w.without_codex()
+    } else {
+        w
+    }
+}
 
 /// The real notifier is `osascript`, detached and not waited for. Tests set
 /// `BTP_TEST_NOTIFY_FILE` to get one line per notification in that file
@@ -653,7 +664,7 @@ fn session_end(dir: std::path::PathBuf, a: &SessionEndArgs, notify: &Notifier, d
         return;
     }
     let started = Instant::now();
-    let mut w = Watcher::new(MacOs, dir);
+    let mut w = new_watcher(dir);
     let me = std::process::id() as i32;
     let report = match w.session_end(me, a.session_pid, a.session_id.as_deref(), now_ms()) {
         Ok(r) => r,
@@ -735,7 +746,7 @@ fn sweep_later(
         return;
     };
     let mut trace = vec![format!("waiter for {pid} ({proc_start}) first due at {at}")];
-    let mut w = Watcher::new(MacOs, dir.clone());
+    let mut w = new_watcher(dir.clone());
     let cap = now_ms().saturating_add(WAITER_CAP_MS);
     let mut stopped = |kills: &[KillRecord]| {
         let (subtitle, body) = stopped_text(kills);

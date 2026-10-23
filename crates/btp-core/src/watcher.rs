@@ -502,6 +502,9 @@ pub struct Watcher<P: Platform> {
     discover: fn() -> Vec<PathBuf>,
     /// Codex's home (`~/.codex`) when the process env names none.
     codex_home: Option<PathBuf>,
+    /// Whether Codex sessions are followed (tests turn it off: a live Codex
+    /// names its own `CODEX_HOME`, so a temp home cannot hide it).
+    codex: bool,
     /// The last config read successfully: kept while `config.toml` is broken.
     last_good: Option<Config>,
     /// Why the last read of `config.toml` failed, cleared once it parses.
@@ -515,6 +518,7 @@ impl<P: Platform> Watcher<P> {
             data_dir,
             discover: default_config_dirs,
             codex_home: dirs::home_dir().map(|h| h.join(".codex")),
+            codex: true,
             last_good: None,
             config_error: None,
         }
@@ -531,6 +535,13 @@ impl<P: Platform> Watcher<P> {
     /// real `~/.codex` is never read).
     pub fn with_codex_home(mut self, home: Option<PathBuf>) -> Self {
         self.codex_home = home;
+        self
+    }
+
+    /// Stops following Codex sessions, so tests on the real platform never
+    /// see a live Codex session of the machine.
+    pub fn without_codex(mut self) -> Self {
+        self.codex = false;
         self
     }
 
@@ -667,14 +678,15 @@ impl<P: Platform> Watcher<P> {
 
     /// The agents whose sessions are followed, built from the current config.
     fn agents(&self, cfg: &Config) -> Vec<Box<dyn Agent>> {
-        vec![
-            Box::new(ClaudeAgent {
-                dirs: effective_claude_dirs_with((self.discover)(), cfg),
-            }),
-            Box::new(CodexAgent {
+        let mut agents: Vec<Box<dyn Agent>> = vec![Box::new(ClaudeAgent {
+            dirs: effective_claude_dirs_with((self.discover)(), cfg),
+        })];
+        if self.codex {
+            agents.push(Box::new(CodexAgent {
                 default_home: self.codex_home.clone(),
-            }),
-        ]
+            }));
+        }
+        agents
     }
 
     /// `pid` is running and started at `proc_start` (Claude's format).
