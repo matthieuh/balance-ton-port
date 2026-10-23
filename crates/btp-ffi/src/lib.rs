@@ -721,6 +721,7 @@ mod tests {
                 asked_stale: false,
                 agent: btp_core::agents::AgentKind::ClaudeCode,
                 postponed_until_ms: None,
+                restarted_from: None,
             });
             let open = |pid, port| GroupServer {
                 key: ServerKey { pid, start_time: 1 },
@@ -842,6 +843,7 @@ mod tests {
                 asked_stale: false,
                 agent: btp_core::agents::AgentKind::ClaudeCode,
                 postponed_until_ms: None,
+                restarted_from: None,
             });
             for (at_ms, start) in [(7, start_time + 1), (8, start_time)] {
                 s.record_session_ended(SessionEndedGroup {

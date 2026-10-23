@@ -34,7 +34,8 @@ pub struct TrackedServer {
     pub kept: bool,
     pub alerted: bool,
     /// The agent's intent for this server (`btp note`). Lives with this
-    /// process: a restart is a new row, so the note is gone.
+    /// process: a server restarted outside the app is a new row, so the note
+    /// is gone (the app's Restart carries it over).
     #[serde(default)]
     pub note: Option<Note>,
     /// Already offered once as a leftover of an earlier conversation of the
@@ -48,6 +49,10 @@ pub struct TrackedServer {
     /// Never delays a deleted worktree's kill.
     #[serde(default)]
     pub postponed_until_ms: Option<u64>,
+    /// The server this one was restarted from (the app's Restart), which
+    /// handed it its session, note, Keep and Postpone.
+    #[serde(default)]
+    pub restarted_from: Option<ServerKey>,
 }
 
 impl TrackedServer {

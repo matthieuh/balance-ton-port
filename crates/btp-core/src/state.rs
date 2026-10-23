@@ -1,5 +1,6 @@
 use crate::agents::AgentKind;
 use crate::model::{KillReason, ServerKey, TrackedServer};
+use crate::restart::PendingRestart;
 use fs4::FileExt;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -29,6 +30,10 @@ pub struct State {
     /// session (oldest first).
     #[serde(default)]
     pub session_ended: Vec<SessionEndedGroup>,
+    /// Restarted processes waiting for their listener (dropped after
+    /// `RESTART_LINK_MS`).
+    #[serde(default)]
+    pub pending_restarts: Vec<PendingRestart>,
 }
 
 /// One server named in a session-ended group.
@@ -283,6 +288,7 @@ mod tests {
             asked_stale: false,
             agent: crate::agents::AgentKind::ClaudeCode,
             postponed_until_ms: None,
+            restarted_from: None,
         }
     }
 
