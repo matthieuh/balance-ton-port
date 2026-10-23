@@ -10,13 +10,26 @@ private typealias IDs = NotificationIDs
 /// so and stays the way to act on the server.
 @MainActor
 final class Notifier: NSObject, UNUserNotificationCenterDelegate {
-    /// Called on the main actor when the user presses a button.
-    var onAction: ((NotificationRoute) -> Void)?
+    /// Made at launch (`AppDelegate`), before a notification button that
+    /// launched the app is delivered.
+    static let shared = Notifier()
+
+    /// Called on the main actor when the user presses a button. Presses
+    /// that arrive before it is set are kept and handed over then.
+    var onAction: ((NotificationRoute) -> Void)? {
+        didSet {
+            guard let onAction else { return }
+            let waiting = pending
+            pending = []
+            waiting.forEach(onAction)
+        }
+    }
+    private var pending: [NotificationRoute] = []
 
     private let center = UNUserNotificationCenter.current()
     private let log = Logger(subsystem: "com.matthieuh.balancetonport", category: "notifications")
 
-    override init() {
+    private override init() {
         super.init()
         center.delegate = self
         let kill = UNNotificationAction(identifier: IDs.kill, title: "Kill", options: [.destructive])
@@ -176,7 +189,13 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
             actionIdentifier: response.actionIdentifier,
             userInfo: response.notification.request.content.userInfo
         ) else { return }
-        await MainActor.run { self.onAction?(route) }
+        await MainActor.run {
+            if let onAction = self.onAction {
+                onAction(route)
+            } else {
+                self.pending.append(route)
+            }
+        }
     }
 
     /// Shows the banner even while the menu is open (the app is then active).

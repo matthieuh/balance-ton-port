@@ -60,7 +60,7 @@ struct NeedsYouCard: View {
                 .contentShape(Capsule())
         }
         .buttonStyle(PressableStyle())
-        .disabled(!cardActionEnabled(card, server) || note == .restarting)
+        .disabled(!cardActionEnabled(card, server, restarting: note == .restarting))
     }
 
     private func perform() {

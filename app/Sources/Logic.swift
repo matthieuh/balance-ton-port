@@ -180,13 +180,13 @@ func cardActionIsProminent(_ card: CardFfi) -> Bool {
     card.action == "restart"
 }
 
-/// A card's pill can act: Restart only when the core can restart it,
-/// Postpone only for an agent server, Stop unless excluded.
-func cardActionEnabled(_ card: CardFfi, _ s: ServerViewFfi) -> Bool {
+/// A card's pill can act: Restart and Stop as in the ⋯ menu, Postpone only
+/// for an agent server.
+func cardActionEnabled(_ card: CardFfi, _ s: ServerViewFfi, restarting: Bool = false) -> Bool {
     switch card.action {
-    case "restart": return s.canRestart
+    case "restart": return canRestartNow(s, restarting: restarting)
     case "postpone": return s.managed
-    default: return !s.excluded
+    default: return canStopNow(s, restarting: restarting)
     }
 }
 
@@ -354,18 +354,29 @@ func hasAlertCard(_ s: ServerViewFfi) -> Bool {
     s.card?.kind == "leak" || s.card?.kind == "idle_alert"
 }
 
+/// Stop is offered: not excluded, and no Restart of it running.
+func canStopNow(_ s: ServerViewFfi, restarting: Bool) -> Bool {
+    !s.excluded && !restarting
+}
+
+/// Restart is offered: the core can restart it, and none is running.
+func canRestartNow(_ s: ServerViewFfi, restarting: Bool) -> Bool {
+    s.canRestart && !restarting
+}
+
 /// The ⋯ menu, the same everywhere. Restart only when the core can restart
 /// it, Keep for agent servers, Ignore this alert with an alert card, Stop
-/// unless excluded. Details… waits for the detail view.
-func moreMenuItems(_ s: ServerViewFfi) -> [MenuItem] {
+/// unless excluded; neither Restart nor Stop while a Restart runs.
+/// Details… waits for the detail view.
+func moreMenuItems(_ s: ServerViewFfi, restarting: Bool = false) -> [MenuItem] {
     [
         MenuItem(kind: .open, title: "\u{2197} Open in browser", enabled: true),
-        MenuItem(kind: .restart, title: "\u{27F3} Restart", enabled: s.canRestart),
+        MenuItem(kind: .restart, title: "\u{27F3} Restart", enabled: canRestartNow(s, restarting: restarting)),
         MenuItem(kind: .keep, title: "\u{23F8} Keep (no alerts)", enabled: s.managed),
         MenuItem(kind: .ignoreAlert, title: "\u{2298} Ignore this alert", enabled: hasAlertCard(s)),
         MenuItem(kind: .details, title: "\u{24D8} Details\u{2026}", enabled: false),
         MenuItem(kind: .separator, title: "", enabled: false),
-        MenuItem(kind: .stop, title: "\u{25A0} Stop", enabled: !s.excluded),
+        MenuItem(kind: .stop, title: "\u{25A0} Stop", enabled: canStopNow(s, restarting: restarting)),
     ]
 }
 
@@ -457,10 +468,10 @@ func notificationBody(_ s: ServerViewFfi) -> String {
 }
 
 /// `Revva web :3010 is using 2.3 GB`, or `Vite :5173 grew 600 MB in 10 min`
-/// when the leak is the growth.
+/// when the core says the leak is the growth (`leakKind`).
 func leakNotificationBody(_ s: ServerViewFfi) -> String {
     let name = "\(titleParts(s).title) \(portLabel(s.port))"
-    if s.card?.reason.hasPrefix("Growing") == true {
+    if s.leakKind == "growth" {
         return "\(name) grew \(memoryLabel(UInt64(max(0, s.growthBytes)))) in 10 min"
     }
     return "\(name) is using \(memoryLabel(s.rssBytes))"

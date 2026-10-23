@@ -26,7 +26,7 @@ private func server(
         sessionAlive: sessionAlive, idleMs: idleMs, killInMs: killInMs, state: state,
         managed: true, excluded: false, framework: nil, title: toolLabel, hasIcon: false,
         branch: nil, rssBytes: 0, cpuPct: 0, growthBytes: 0, health: "green", inUse: false,
-        statusText: "idle 0 min", card: nil, canRestart: false, postponed: false,
+        statusText: "idle 0 min", card: nil, leakKind: nil, canRestart: false, postponed: false,
         uptimeMs: 0, processCount: 1
     )
 }
@@ -754,12 +754,19 @@ final class MenuActionTests: XCTestCase {
     func testLeakNotificationBody() {
         var big = menuServer(port: 3010, title: "Revva web")
         big.rssBytes = UInt64(2.3 * 1024 * 1_048_576)
+        big.growthBytes = 600 * 1_048_576
         big.card = CardFfi(kind: "leak", reason: "Using 2.3 GB", action: "restart")
-        XCTAssertEqual(leakNotificationBody(big), "Revva web :3010 is using 2.3 GB")
+        big.leakKind = "size"
+        XCTAssertEqual(leakNotificationBody(big), "Revva web :3010 is using 2.3 GB", "size, even when it grew")
         var growing = menuServer(port: 5173, title: "Vite")
         growing.growthBytes = 600 * 1_048_576
         growing.card = CardFfi(kind: "leak", reason: "Growing fast: +600 MB in 10 min", action: "restart")
+        growing.leakKind = "growth"
         XCTAssertEqual(leakNotificationBody(growing), "Vite :5173 grew 600 MB in 10 min")
+        var notALeak = growing
+        notALeak.card = CardFfi(kind: "idle_alert", reason: "Growing fast", action: "stop")
+        notALeak.leakKind = nil
+        XCTAssertEqual(leakNotificationBody(notALeak), "Vite :5173 is using 100 MB", "the kind, never a reason")
     }
 
     func testMoreMenuItemsOrderAndDisabledStates() {
@@ -785,6 +792,10 @@ final class MenuActionTests: XCTestCase {
             enabled(menuServer(card: "about_to_stop", action: "postpone")), [.open, .keep, .stop],
             "an about-to-stop card is not an alert"
         )
+        XCTAssertEqual(
+            moreMenuItems(s, restarting: true).filter(\.enabled).map(\.kind), [.open, .keep, .ignoreAlert],
+            "no Restart nor Stop while a Restart runs"
+        )
     }
 
     func testCapsuleHasNoRestart() {
@@ -803,6 +814,10 @@ final class MenuActionTests: XCTestCase {
         XCTAssertTrue(cardActionEnabled(observed.card!, observed), "Stop with a confirmation")
         let postpone = menuServer(card: "about_to_stop", action: "postpone")
         XCTAssertTrue(cardActionEnabled(postpone.card!, postpone))
+        XCTAssertFalse(cardActionEnabled(s.card!, s, restarting: true))
+        XCTAssertFalse(cardActionEnabled(observed.card!, observed, restarting: true))
+        XCTAssertTrue(canStopNow(observed, restarting: false))
+        XCTAssertFalse(canStopNow(observed, restarting: true))
     }
 
     func testOpenURL() {

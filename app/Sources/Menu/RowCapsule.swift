@@ -15,6 +15,7 @@ struct RowCapsule: View {
                     pill("\u{2197} Open", color: .primary.opacity(0.8)) { model.open(server) }
                 case .stop:
                     pill("\u{25A0} Stop", color: .red) { model.stop(server) }
+                        .disabled(!canStopNow(server, restarting: model.isRestarting(server.id)))
                 case .more:
                     MoreMenu(server: server, bare: true)
                 }
