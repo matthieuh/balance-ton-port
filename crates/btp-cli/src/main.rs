@@ -61,7 +61,7 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Tell btp your intent for a server of your own Claude Code session
+    /// Tell btp your intent for a server of your own coding-agent session
     Note(NoteArgs),
     /// Servers of an earlier conversation of your session, idle more than
     /// 5 min (JSON; each is listed once)
@@ -371,14 +371,14 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
                     Ok(0)
                 }
                 NoteOutcome::NoSession => Err(Failure::User(
-                    "not run from a Claude Code session: notes only apply to your own session's servers".into(),
+                    "not run from a coding-agent session: notes only apply to your own session's servers".into(),
                 )),
                 NoteOutcome::NotTracked => Err(Failure::User(format!(
                     "no tracked server on port {}",
                     a.port
                 ))),
                 NoteOutcome::OtherSession => Err(Failure::User(format!(
-                    "{} belongs to another session",
+                    "port {} belongs to another session: notes only apply to your own session's servers",
                     a.port
                 ))),
             }

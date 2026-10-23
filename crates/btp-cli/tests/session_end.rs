@@ -510,7 +510,7 @@ fn note_from_outside_the_session_is_refused() {
         .assert()
         .code(1);
     let err = String::from_utf8(out.get_output().stderr.clone()).unwrap();
-    assert!(err.contains("not run from a Claude Code session"), "{err}");
+    assert!(err.contains("not run from a coding-agent session"), "{err}");
     let state = std::fs::read_to_string(sb.data.path().join("state.json")).unwrap();
     assert!(state.contains("\"note\": null"), "{state}");
 }

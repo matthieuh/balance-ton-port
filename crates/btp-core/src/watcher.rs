@@ -106,14 +106,15 @@ pub(crate) fn is_excluded(command: &str, cfg: &Config) -> bool {
 /// by pid and by start time, so a stale session file whose pid now belongs
 /// to another process never links. A Codex session picks the conversation
 /// named by `CODEX_THREAD_ID` (read through `envs`, from the listener or the
-/// nearest ancestor below the session) when that session holds it. A server
-/// reparented to launchd (no ancestor matches) links through that same
-/// variable, only to the one live Codex session holding the thread.
+/// nearest ancestor below the session) when that session holds it.
 ///
-/// `None` when the listener is a session or an agent CLI itself, when a
-/// process between it and the session is an agent CLI (a Codex `exec` or
-/// launcher excepted) or matches an excluded command, when the port is
-/// excluded, or when the server's working directory cannot be read.
+/// `None` when no ancestor is a live session (a server reparented to
+/// launchd is never linked, whatever its environment), when the listener is
+/// a session or an agent CLI itself, when a process between it and the
+/// session is an agent CLI (a Codex `exec` or launcher excepted) or matches
+/// an excluded command, when the port is excluded, or when the server's
+/// working directory cannot be read. The environment is read only once a
+/// Codex session matched.
 pub fn link(
     listener: &Listener,
     chain: &[ProcInfo],
@@ -163,18 +164,7 @@ pub fn link(
                 .unwrap_or_else(|| session.conversation_id.clone());
             (session, conversation)
         }
-        None => {
-            // Only a Codex session can be found through the env: no read otherwise.
-            if !sessions.iter().any(|s| s.agent == AgentKind::Codex) || chain.iter().any(blocks) {
-                return None;
-            }
-            let thread = thread(chain.len())?;
-            let mut holders = sessions
-                .iter()
-                .filter(|s| s.agent == AgentKind::Codex && holds_thread(s, &thread));
-            let session = holders.next().filter(|_| holders.next().is_none())?;
-            (session, thread)
-        }
+        None => return None,
     };
     let cwd = server.cwd.as_deref()?;
     Some(TrackedServer {
@@ -315,8 +305,8 @@ fn signal_checked(p: &dyn Platform, pid: i32, start_time: u64, sig: i32) -> bool
         && p.signal(pid, sig)
 }
 
-/// SIGTERM to the server and its descendants (except a Claude Code process
-/// or a command `cfg` excludes, each with its subtree), then SIGKILL to whatever
+/// SIGTERM to the server and its descendants (except a process of any agent
+/// CLI or a command `cfg` excludes, each with its subtree), then SIGKILL to whatever
 /// survives `grace` (polled every 100 ms). Every target is snapshotted as
 /// (pid, start time) up front and re-checked right before each signal, so a
 /// reused pid is never hit. Returns `false`, sending nothing, when `key` is
@@ -1038,7 +1028,7 @@ mod tests {
     use crate::config::save_config;
     use crate::model::KillReason;
     use crate::platform::{ancestry, format_proc_start, FakePlatform};
-    use crate::sessions::read_sessions;
+    use crate::sessions::{read_sessions, SessionStatus};
     use crate::state::with_state;
     use std::fs;
     use tempfile::TempDir;
@@ -1266,28 +1256,24 @@ mod tests {
         assert_eq!(calls.get(), 0);
     }
 
-    #[test]
-    fn links_reparented_server_by_codex_thread_id() {
-        let mut f = codex_fx();
-        let web = f.wt.join("apps/web");
-        f.p().spawn(
-            310,
-            1,
-            START + 310 * SEC,
-            "node vite",
-            web.to_str().unwrap(),
-        );
-        f.p().add_listener(310, 5174);
-        f.p().set_env(310, &[("CODEX_THREAD_ID", "T1")]);
-        f.w.tick(T0).unwrap();
-        let s = server_of(&f, 310).expect("linked");
-        assert_eq!(s.agent, AgentKind::Codex);
-        assert_eq!((s.session_pid, s.session_id.as_str()), (300, "T1"));
+    /// The live Codex session of `codex_fx` (pid 300, thread T1).
+    fn codex_session(f: &Fx) -> AgentSession {
+        AgentSession {
+            agent: AgentKind::Codex,
+            pid: 300,
+            proc_start: format_proc_start(START + 300 * SEC),
+            conversation_id: "T1".into(),
+            other_conversations: Vec::new(),
+            cwd: f.wt.join("apps/web"),
+            name: String::new(),
+            status: SessionStatus::Unknown,
+            status_updated_at_ms: T0,
+        }
     }
 
     #[test]
-    fn env_thread_of_unknown_or_dead_session_does_not_link() {
-        let mut f = codex_fx();
+    fn env_never_read_without_a_matched_codex_session() {
+        let f = codex_fx();
         let web = f.wt.join("apps/web");
         f.p().spawn(
             310,
@@ -1296,26 +1282,26 @@ mod tests {
             "node vite",
             web.to_str().unwrap(),
         );
-        f.p().add_listener(310, 5174);
-        f.p().set_env(310, &[("CODEX_THREAD_ID", "T9")]);
-        f.w.tick(T0).unwrap();
-        assert_eq!(server_of(&f, 310), None);
-        // The right thread, but its session is gone.
-        f.p().set_env(310, &[("CODEX_THREAD_ID", "T1")]);
-        f.p().remove_proc(300);
-        f.w.tick(T0 + MIN).unwrap();
-        assert_eq!(server_of(&f, 310), None);
+        let chain = ancestry(f.p(), 310);
+        let calls = std::cell::Cell::new(0);
+        let envs = |_: i32| {
+            calls.set(calls.get() + 1);
+            Some(vec![("CODEX_THREAD_ID".to_string(), "T1".to_string())])
+        };
+        let l = Listener {
+            pid: 310,
+            port: 5174,
+        };
+        let mut live = sessions(&f);
+        live.push(codex_session(&f));
+        assert_eq!(link(&l, &chain, &envs, &live, &f.cfg(), T0), None);
+        assert_eq!(calls.get(), 0);
     }
 
     #[test]
-    fn thread_held_by_two_live_codex_sessions_does_not_link() {
+    fn reparented_server_with_a_live_codex_thread_env_is_not_linked() {
         let mut f = codex_fx();
         let web = f.wt.join("apps/web");
-        let lock = f.repo.path().join("codex-home/thread-writer-locks/T1.lock");
-        f.p()
-            .spawn(320, 10, START + 320 * SEC, "codex", web.to_str().unwrap());
-        f.p()
-            .set_open_paths(320, &[canonical(&lock).to_str().unwrap()]);
         f.p().spawn(
             310,
             1,
@@ -1327,6 +1313,36 @@ mod tests {
         f.p().set_env(310, &[("CODEX_THREAD_ID", "T1")]);
         f.w.tick(T0).unwrap();
         assert_eq!(server_of(&f, 310), None);
+    }
+
+    /// A user-started server in a shell that inherited `CODEX_THREAD_ID`
+    /// of a live Codex session, under `host` (not a session) > launchd.
+    fn server_in_inherited_shell_is_not_linked(host: &str) {
+        let mut f = codex_fx();
+        let web = f.wt.join("apps/web");
+        let web = web.to_str().unwrap();
+        f.p().spawn(400, 1, START + 400 * SEC, host, "/");
+        f.p().spawn(401, 400, START + 401 * SEC, "zsh", web);
+        f.p().spawn(402, 401, START + 402 * SEC, "node vite", web);
+        f.p().add_listener(402, 5175);
+        for pid in [401, 402] {
+            f.p().set_env(pid, &[("CODEX_THREAD_ID", "T1")]);
+        }
+        f.w.tick(T0).unwrap();
+        assert_eq!(server_of(&f, 402), None);
+        assert!(f.p().signals().is_empty());
+    }
+
+    #[test]
+    fn server_in_tmux_shell_with_codex_thread_env_is_not_linked() {
+        server_in_inherited_shell_is_not_linked("tmux");
+    }
+
+    #[test]
+    fn server_in_editor_shell_with_codex_thread_env_is_not_linked() {
+        server_in_inherited_shell_is_not_linked(
+            "/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper.app/Contents/MacOS/Code Helper",
+        );
     }
 
     #[test]

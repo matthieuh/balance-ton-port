@@ -413,9 +413,10 @@ impl<P: Platform> Watcher<P> {
         }
     }
 
-    /// The Claude Code process the caller descends from, as (pid, start
+    /// The agent session process the caller descends from, as (pid, start
     /// time in session-file format): its nearest ancestor that matches a
-    /// live session file. Failing that, `session_pid` when given and it is
+    /// live session, of agent `only` when given (a session of another agent
+    /// is passed over). Failing that, `session_pid` when given and it is
     /// a Claude Code ancestor of the caller: Claude Code rewrites its session
     /// file after `/clear` and `/resume` only once the SessionStart hook has
     /// run, so the proven process stands in for the file, as at session end.
@@ -423,6 +424,7 @@ impl<P: Platform> Watcher<P> {
         &self,
         caller_pid: i32,
         session_pid: Option<i32>,
+        only: Option<AgentKind>,
         scan: &Scan,
     ) -> Option<(i32, String)> {
         let chain = ancestry(&self.platform, caller_pid);
@@ -432,6 +434,7 @@ impl<P: Platform> Watcher<P> {
                 let started = format_proc_start(p.start_time);
                 scan.live
                     .iter()
+                    .filter(|l| only.is_none_or(|k| l.session.agent == k))
                     .find(|l| l.session.pid == p.pid && l.session.proc_start == started)
                     .map(|l| (l.session.pid, l.session.proc_start.clone()))
             })
@@ -458,7 +461,7 @@ impl<P: Platform> Watcher<P> {
         now_ms: u64,
     ) -> io::Result<NoteOutcome> {
         let scan = self.scan();
-        let ancestry_pick = self.caller_process(caller_pid, None, &scan);
+        let ancestry_pick = self.caller_process(caller_pid, None, None, &scan);
         let Some((caller_pid, caller_start)) =
             caller_session(env_thread, &scan.sessions(), ancestry_pick)
         else {
@@ -503,8 +506,8 @@ impl<P: Platform> Watcher<P> {
         })
     }
 
-    /// The leftovers of earlier conversations of the caller's live session
-    /// process (tier 3), each returned once: they are marked as asked.
+    /// The leftovers of earlier conversations of the caller's live Claude Code
+    /// session process (tier 3), each returned once: they are marked as asked.
     /// Excluded servers are never returned. `None` when the caller does not
     /// descend from a live session (see `caller_process` for `session_pid`).
     pub fn stale(
@@ -515,7 +518,8 @@ impl<P: Platform> Watcher<P> {
         now_ms: u64,
     ) -> io::Result<Option<Vec<StaleServer>>> {
         let scan = self.scan();
-        let Some((caller_pid, caller_start)) = self.caller_process(caller_pid, session_pid, &scan)
+        let Some((caller_pid, caller_start)) =
+            self.caller_process(caller_pid, session_pid, Some(AgentKind::ClaudeCode), &scan)
         else {
             return Ok(None);
         };
@@ -568,13 +572,15 @@ impl<P: Platform> Watcher<P> {
     }
 
     /// Kills exactly the process `key` (pid and start time), only when it is
-    /// a tracked server of the caller's own live session process. Used for
+    /// a tracked server of the caller's own live Claude Code session process. Used for
     /// the tier 3 "yes": whatever took the port since the offer is never
     /// touched, nor is another session's server.
     pub fn kill_own(&mut self, caller_pid: i32, key: ServerKey) -> io::Result<OwnKillOutcome> {
         let now = now_ms();
         let scan = self.scan();
-        let Some((caller_pid, caller_start)) = self.caller_process(caller_pid, None, &scan) else {
+        let Some((caller_pid, caller_start)) =
+            self.caller_process(caller_pid, None, Some(AgentKind::ClaudeCode), &scan)
+        else {
             return Ok(OwnKillOutcome::NoSession);
         };
         let listeners = self.platform.listeners();
@@ -1290,6 +1296,38 @@ mod tests {
         tracked(&mut f);
         f.p().spawn(51, 10, START + 51 * SEC, "btp stale", "/");
         assert_eq!(f.w.stale(51, Some(10), "sess-b", T0).unwrap(), None);
+    }
+
+    #[test]
+    fn tier_3_caller_never_resolves_to_a_codex_ancestor() {
+        let mut f = codex_fx();
+        codex_server_chain(&f);
+        f.w.tick(T0 - 30 * MIN).unwrap();
+        assert!(f.state_servers().iter().any(|s| s.key.pid == 304));
+        // A Claude process with no session file yet, in a Codex shell.
+        let web = f.wt.join("apps/web");
+        let web = web.to_str().unwrap();
+        f.p().spawn(330, 300, START + 330 * SEC, "zsh", web);
+        f.p().spawn(331, 330, START + 331 * SEC, "claude", web);
+        f.p()
+            .spawn(332, 331, START + 332 * SEC, "bash hook.sh", web);
+        let list = f.w.stale(332, Some(331), "sess-x", T0).unwrap();
+        assert!(list.unwrap_or_default().is_empty());
+        assert!(!f.state_servers().iter().any(|s| s.asked_stale));
+        let codex_key = ServerKey {
+            pid: 304,
+            start_time: START + 304 * SEC,
+        };
+        let out = f.w.kill_own(332, codex_key).unwrap();
+        assert!(
+            matches!(
+                out,
+                OwnKillOutcome::OtherSession | OwnKillOutcome::NoSession
+            ),
+            "{out:?}"
+        );
+        assert!(f.p().is_alive(304));
+        assert!(f.p().signals().is_empty());
     }
 
     #[test]

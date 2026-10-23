@@ -2,7 +2,6 @@
 //! where it runs (`location_label`) and which agent session started it
 //! (`session_display_name`). Pure functions, shared by the CLI and the app.
 
-use crate::agents::AgentKind;
 use std::path::Path;
 
 /// A readable name for a server from its command line, such as
@@ -220,27 +219,10 @@ pub fn session_display_name(name: Option<&str>, cwd: &Path) -> String {
     }
 }
 
-/// `Claude session "web"` / `Codex session "web"`.
-pub fn session_label(agent: AgentKind, name: &str) -> String {
-    format!("{} session \"{name}\"", agent.label())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
-
-    #[test]
-    fn session_label_per_agent() {
-        assert_eq!(
-            session_label(AgentKind::ClaudeCode, "web"),
-            "Claude session \"web\""
-        );
-        assert_eq!(
-            session_label(AgentKind::Codex, "web"),
-            "Codex session \"web\""
-        );
-    }
     use std::path::PathBuf;
 
     #[test]
