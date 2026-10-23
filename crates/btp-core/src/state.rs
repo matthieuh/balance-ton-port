@@ -30,8 +30,8 @@ pub struct State {
     /// session (oldest first).
     #[serde(default)]
     pub session_ended: Vec<SessionEndedGroup>,
-    /// Restarted processes waiting for their listener (dropped after
-    /// `RESTART_LINK_MS`).
+    /// Restarted processes waiting for their listener (dropped once the
+    /// process is gone, or after a day).
     #[serde(default)]
     pub pending_restarts: Vec<PendingRestart>,
 }

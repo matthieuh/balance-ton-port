@@ -8,16 +8,17 @@ use crate::model::{ServerKey, TrackedServer};
 use crate::platform::{Listener, Platform, ProcInfo};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::fs::OpenOptions;
+use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// How long a restarted process has to start listening before its pending
-/// link is dropped.
-pub const RESTART_LINK_MS: u64 = 120_000;
+/// A pending restart is kept while its process lives, at most this long.
+pub const RESTART_PENDING_MAX_MS: u64 = 86_400_000;
+/// Restart logs kept in `<data dir>/logs/` (the newest ones).
+pub const MAX_RESTART_LOGS: usize = 20;
 
 /// What a restart runs. No `Serialize` and no derived `Debug`: the
 /// environment must never reach a file, a log or an error message.
@@ -50,8 +51,12 @@ pub enum RestartBlocked {
     EnvUnreadable,
     /// Its command line cannot be read or its program found.
     ArgvUnreadable,
-    /// The port was still taken 5 s after the stop: nothing was started.
+    /// The port was still taken 5 s after the stop (or the stop was
+    /// refused): nothing was started.
     PortStillTaken,
+    /// An exclusion saved meanwhile matches it: it was neither stopped nor
+    /// started.
+    Excluded,
     /// The new process could not be started (the server is stopped).
     SpawnFailed,
 }
@@ -59,7 +64,7 @@ pub enum RestartBlocked {
 /// A restarted process waiting for its first listener, so that listener
 /// links to `owner` (a copy of the stopped server's row) instead of being
 /// linked from scratch. `owner` is `None` for an observed server: its new
-/// process stays observed.
+/// process stays observed. Kept while the process lives, at most a day.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingRestart {
     pub child_pid: i32,
@@ -73,8 +78,9 @@ pub struct PendingRestart {
 /// program.
 pub trait Spawner: Send + Sync {
     /// Starts `plan`, appending its stdout and stderr to `log`; returns the
-    /// new process's pid and start time (microseconds since the epoch).
-    fn spawn(&self, plan: &RestartPlan, log: &Path) -> io::Result<(i32, u64)>;
+    /// new process's pid and its start time as `p` reads it (microseconds
+    /// since the epoch). An error means nothing is left running.
+    fn spawn(&self, plan: &RestartPlan, log: &Path, p: &dyn Platform) -> io::Result<(i32, u64)>;
 }
 
 /// The real spawner: the plan's environment only, its folder, stdin from
@@ -83,13 +89,13 @@ pub trait Spawner: Send + Sync {
 pub struct CommandSpawner;
 
 impl Spawner for CommandSpawner {
-    fn spawn(&self, plan: &RestartPlan, log: &Path) -> io::Result<(i32, u64)> {
+    fn spawn(&self, plan: &RestartPlan, log: &Path, p: &dyn Platform) -> io::Result<(i32, u64)> {
         use std::os::unix::process::CommandExt;
         let (program, args) = plan
             .argv
             .split_first()
             .ok_or_else(|| io::Error::other("empty command line"))?;
-        let out = OpenOptions::new().create(true).append(true).open(log)?;
+        let out = open_log(log)?;
         let err = out.try_clone()?;
         let mut child = Command::new(program)
             .args(args)
@@ -102,30 +108,73 @@ impl Spawner for CommandSpawner {
             .process_group(0)
             .spawn()?;
         let pid = child.id() as i32;
-        let start = start_time_of(pid);
+        let Some(start) = p.proc_info(pid).map(|i| i.start_time) else {
+            // Not readable: never report a failure with it still running.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::other("the new process cannot be read"));
+        };
         // Reaped when it exits, so a stopped server leaves no zombie.
         std::thread::spawn(move || {
             let _ = child.wait();
         });
-        start
-            .map(|s| (pid, s))
-            .ok_or_else(|| io::Error::other("the new process exited at once"))
+        Ok((pid, start))
     }
 }
 
-#[cfg(target_os = "macos")]
-fn start_time_of(pid: i32) -> Option<u64> {
-    crate::platform::MacOs.proc_info(pid).map(|i| i.start_time)
+/// Opens a restart log for appending, readable by the user only.
+fn open_log(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
 }
 
-#[cfg(not(target_os = "macos"))]
-fn start_time_of(_pid: i32) -> Option<u64> {
-    None
+/// Creates the log of a restart, `<data dir>/logs/<port>-<unix ms>.log`
+/// (mode 0600), and keeps only the `MAX_RESTART_LOGS` newest `*.log` files
+/// of that folder. Returns its path.
+pub fn create_log(data_dir: &Path, port: u16, now_ms: u64) -> io::Result<PathBuf> {
+    let dir = data_dir.join("logs");
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{port}-{now_ms}.log"));
+    open_log(&path)?;
+    prune_logs(&dir, MAX_RESTART_LOGS);
+    Ok(path)
 }
 
-/// `<data dir>/logs/<port>-<unix ms>.log`.
-pub fn log_path(data_dir: &Path, port: u16, now_ms: u64) -> PathBuf {
-    data_dir.join("logs").join(format!("{port}-{now_ms}.log"))
+/// Deletes all but the `keep` newest `*.log` files of `dir`, newest by the
+/// time in their `<port>-<unix ms>` name, else by modification time.
+/// Nothing else is touched.
+pub fn prune_logs(dir: &Path, keep: usize) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut logs: Vec<(u64, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "log"))
+        .map(|p| (log_time(&p), p))
+        .collect();
+    logs.sort_by(|a, b| b.cmp(a));
+    for (_, old) in logs.into_iter().skip(keep) {
+        let _ = fs::remove_file(old);
+    }
+}
+
+fn log_time(path: &Path) -> u64 {
+    let named = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.rsplit_once('-'))
+        .and_then(|(_, ms)| ms.parse().ok());
+    named.unwrap_or_else(|| {
+        fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_millis() as u64)
+    })
 }
 
 /// The live process `key`, if it is still that process.
@@ -206,6 +255,14 @@ pub fn wait_port_free(p: &dyn Platform, port: u16, limit: Duration, interval: Du
         }
         std::thread::sleep(interval.min(deadline - now));
     }
+}
+
+/// Whether a pending restart is still worth keeping: its process is alive
+/// (same pid and start time) and it is less than a day old.
+pub fn pending_holds(p: &dyn Platform, r: &PendingRestart, now_ms: u64) -> bool {
+    now_ms.saturating_sub(r.at_ms) < RESTART_PENDING_MAX_MS
+        && p.proc_info(r.child_pid)
+            .is_some_and(|i| i.start_time == r.child_start)
 }
 
 /// The pending restart whose process is in `chain` (a listener's ancestry,
@@ -367,6 +424,31 @@ mod tests {
             Path::new(&plan.argv[0]),
             dir.path().join("./node_modules/.bin/vite")
         );
+    }
+
+    #[test]
+    fn logs_are_private_and_only_the_newest_20_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        for i in 0..25u64 {
+            fs::write(logs.join(format!("3000-{}.log", 1000 + i)), "").unwrap();
+        }
+        fs::write(logs.join("notes.txt"), "").unwrap();
+        fs::create_dir_all(logs.join("sub.log")).unwrap();
+        let path = create_log(dir.path(), 4000, 5000).unwrap();
+        assert_eq!(path, logs.join("4000-5000.log"));
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let mut names: Vec<String> = fs::read_dir(&logs)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        let mut want: Vec<String> = (1006..1025u64).map(|i| format!("3000-{i}.log")).collect();
+        want.extend(["4000-5000.log".into(), "notes.txt".into(), "sub.log".into()]);
+        want.sort();
+        assert_eq!(names, want);
     }
 
     #[test]
