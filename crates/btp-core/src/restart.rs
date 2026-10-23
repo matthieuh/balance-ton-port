@@ -4,15 +4,21 @@
 //! stored, logged or printed. A tracked server keeps its row (session, note,
 //! Keep, Postpone) through a `PendingRestart` that links the new listener.
 
-use crate::model::{ServerKey, TrackedServer};
+use crate::config::Config;
+use crate::model::{KillReason, ServerKey, TrackedServer};
+use crate::observed::ObservedServer;
 use crate::platform::{Listener, Platform, ProcInfo};
+use crate::state::with_state;
+use crate::watcher::{execute_kills, stop_observed_tree};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// A pending restart is kept while its process lives, at most this long.
@@ -220,6 +226,117 @@ pub fn can_restart(p: &dyn Platform, key: ServerKey) -> bool {
     live(p, key).is_some_and(|i| existing_cwd(&i).is_some()) && p.proc_env(key.pid).is_some()
 }
 
+/// `can_restart` for every pass: whether a process's environment can be
+/// read is remembered per process (it never changes), its folder is checked
+/// every time.
+#[derive(Debug, Default)]
+pub struct RestartCheck {
+    env_readable: HashMap<ServerKey, bool>,
+}
+
+impl RestartCheck {
+    pub fn can_restart(&mut self, p: &dyn Platform, key: ServerKey) -> bool {
+        if !live(p, key).is_some_and(|i| existing_cwd(&i).is_some()) {
+            return false;
+        }
+        *self
+            .env_readable
+            .entry(key)
+            .or_insert_with(|| p.proc_env(key.pid).is_some())
+    }
+
+    pub fn retain(&mut self, live: &std::collections::HashSet<ServerKey>) {
+        self.env_readable.retain(|k, _| live.contains(k));
+    }
+}
+
+/// What a restart stops: a tracked server's row (handed to its new
+/// process) or an observed server.
+pub enum RestartTarget {
+    Tracked(TrackedServer),
+    Observed(ObservedServer),
+}
+
+/// A restart checked and planned by `Watcher::prepare_restart`: the stop,
+/// the port wait and the start, which can take seconds, run without the
+/// watcher.
+pub struct RestartJob {
+    pub(crate) key: ServerKey,
+    pub(crate) target: RestartTarget,
+    pub(crate) plan: RestartPlan,
+    pub(crate) cfg: Config,
+    pub(crate) data_dir: PathBuf,
+    pub(crate) spawner: Arc<dyn Spawner>,
+    /// How long the port is waited for, and how often it is looked at.
+    pub(crate) wait: (Duration, Duration),
+    pub(crate) now_ms: u64,
+}
+
+impl RestartJob {
+    /// Stops the server (a manual kill, start times re-checked, an
+    /// exclusion saved meanwhile honoured), waits for its port, starts the
+    /// plan and records the pending restart. `p` is the platform it was
+    /// prepared on.
+    pub fn run(self, p: &dyn Platform) -> io::Result<Result<(), RestartBlocked>> {
+        let RestartJob {
+            key,
+            target,
+            plan,
+            cfg,
+            data_dir,
+            spawner,
+            wait: (limit, interval),
+            now_ms,
+        } = self;
+        // `dropped`: no longer tracked although not killed, which for a
+        // process still running means an exclusion saved meanwhile matched.
+        let (stopped, dropped, owner) = match target {
+            RestartTarget::Tracked(s) => {
+                let (killed, gone) = execute_kills(
+                    p,
+                    &data_dir,
+                    vec![(s.clone(), KillReason::Manual)],
+                    &cfg,
+                    now_ms,
+                )?;
+                let dropped = killed.is_empty() && gone.contains(&key);
+                (!killed.is_empty(), dropped, Some(s))
+            }
+            RestartTarget::Observed(o) => {
+                let stopped = stop_observed_tree(p, &data_dir, &o, &cfg, now_ms)?.is_some();
+                (stopped, false, None)
+            }
+        };
+        if !stopped && live(p, key).is_some() {
+            return Ok(Err(if dropped {
+                RestartBlocked::Excluded
+            } else {
+                // A refused signal leaves it running: no point waiting.
+                RestartBlocked::PortStillTaken
+            }));
+        }
+        // Only the recorded port is waited for, not every port of the tree.
+        if !wait_port_free(p, plan.port, limit, interval) {
+            return Ok(Err(RestartBlocked::PortStillTaken));
+        }
+        let spawned =
+            create_log(&data_dir, plan.port, now_ms).and_then(|log| spawner.spawn(&plan, &log, p));
+        let Ok((child_pid, child_start)) = spawned else {
+            return Ok(Err(RestartBlocked::SpawnFailed));
+        };
+        with_state(&data_dir, |state| {
+            state.pending_restarts.push(PendingRestart {
+                child_pid,
+                child_start,
+                from: key,
+                owner,
+                at_ms: now_ms,
+            })
+        })?;
+        Ok(Ok(()))
+    }
+}
+
 fn resolve_program(argv0: &str, cwd: &Path, env: &[(String, String)]) -> Option<PathBuf> {
     let path = Path::new(argv0);
     if argv0.contains('/') {
@@ -354,6 +471,29 @@ mod tests {
         assert!(!can_restart(&p, key(30, START)));
         p.set_env(30, &[("PATH", "/usr/bin")]);
         assert!(can_restart(&p, key(30, START)));
+    }
+
+    #[test]
+    fn restart_check_reads_the_env_once_and_the_folder_every_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("app");
+        fs::create_dir_all(&cwd).unwrap();
+        let p = FakePlatform::new();
+        p.spawn(30, 1, START, "/bin/node x.js", cwd.to_str().unwrap());
+        p.set_env(30, &[("PATH", "/usr/bin")]);
+        let k = key(30, START);
+        let mut c = RestartCheck::default();
+        assert!(c.can_restart(&p, k));
+        // The environment of a process never changes: not read again.
+        p.clear_env(30);
+        assert!(c.can_restart(&p, k));
+        // Its folder is checked on every call.
+        fs::remove_dir(&cwd).unwrap();
+        assert!(!c.can_restart(&p, k));
+        fs::create_dir_all(&cwd).unwrap();
+        // Forgotten once gone from the live servers: read again.
+        c.retain(&std::collections::HashSet::new());
+        assert!(!c.can_restart(&p, k));
     }
 
     #[test]

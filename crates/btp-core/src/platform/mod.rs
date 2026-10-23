@@ -233,6 +233,11 @@ mod fake {
             self.st().env.insert(pid, env);
         }
 
+        /// The environment of `pid` can no longer be read.
+        pub fn clear_env(&self, pid: i32) {
+            self.st().env.remove(&pid);
+        }
+
         pub fn set_open_paths(&self, pid: i32, paths: &[&str]) {
             let paths = paths.iter().map(PathBuf::from).collect();
             self.st().open_paths.insert(pid, paths);

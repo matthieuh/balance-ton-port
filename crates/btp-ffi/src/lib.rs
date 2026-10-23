@@ -16,9 +16,9 @@ use btp_core::model::{KillReason, KillTarget, ServerKey};
 use btp_core::observed::ObservedServer;
 use btp_core::platform::{MacOs, Platform};
 use btp_core::probe::{probe_port, ProbeOutcome};
-use btp_core::restart::{can_restart, RestartBlocked};
+use btp_core::restart::RestartBlocked;
 use btp_core::sessions::default_config_dirs;
-use btp_core::state::{with_state, KillRecord, SessionEndedGroup};
+use btp_core::state::{read_state_readonly, with_state, KillRecord, SessionEndedGroup};
 use btp_core::watcher::{acquire_watch_lock, now_ms, ServerView, TickReport, WatchLock, Watcher};
 use btp_core::worktree::worktree_root;
 use std::collections::HashMap;
@@ -572,7 +572,7 @@ fn live_of<P: Platform>(
         branch,
         page_title: page.and_then(|m| m.title.clone()),
         has_icon: page.is_some_and(|m| m.icon.is_some()),
-        can_restart: !procs.is_empty() && can_restart(w.platform(), key),
+        can_restart: !procs.is_empty() && w.can_restart(key),
         process_count: procs.len() as u32,
         card: card.map(Into::into),
     }
@@ -597,19 +597,12 @@ fn observed_use<P: Platform>(w: &Watcher<P>, o: &ObservedServer, now_ms: u64) ->
 /// `t` as the app shows it, with what the watcher knows of each server.
 fn report_ffi<P: Platform>(w: &mut Watcher<P>, t: &TickReport, now_ms: u64) -> TickReportFfi {
     let cards: HashMap<ServerKey, &NeedsYou> = t.needs_you.iter().map(|(k, n)| (*k, n)).collect();
-    let tracked = |w: &mut Watcher<P>, v: &ServerView| {
-        let l = live_of(
-            w,
-            v.key,
-            &v.command,
-            Some(&v.worktree),
-            cards.get(&v.key).copied(),
-            now_ms,
-        );
-        ServerViewFfi::tracked(v, &l, now_ms)
-    };
-    let mut servers: Vec<ServerViewFfi> = t.servers.iter().map(|v| tracked(w, v)).collect();
-    let alerts = t.alerts.iter().map(|v| tracked(w, v)).collect();
+    let mut servers: Vec<ServerViewFfi> = Vec::new();
+    for v in &t.servers {
+        let card = cards.get(&v.key).copied();
+        let l = live_of(w, v.key, &v.command, Some(&v.worktree), card, now_ms);
+        servers.push(ServerViewFfi::tracked(v, &l, now_ms));
+    }
     for o in &t.observed {
         let worktree = o.cwd.as_deref().map(worktree_root);
         let l = live_of(
@@ -626,16 +619,18 @@ fn report_ffi<P: Platform>(w: &mut Watcher<P>, t: &TickReport, now_ms: u64) -> T
     let dev = servers.iter().map(|s| s.rss_bytes).sum();
     let machine = w.platform().machine_memory();
     let (total, used) = machine.map_or((0, 0), |m| (m.total_bytes, m.used_bytes));
-    let leaks = t
-        .leaks
-        .iter()
-        .filter_map(|k| {
+    // Rows of this pass (a server stopped by the pass has none).
+    let rows = |keys: &mut dyn Iterator<Item = ServerKey>| -> Vec<ServerViewFfi> {
+        keys.filter_map(|k| {
             servers
                 .iter()
                 .find(|s| s.pid == k.pid && s.start_time == k.start_time)
                 .cloned()
         })
-        .collect();
+        .collect()
+    };
+    let alerts = rows(&mut t.alerts.iter().map(|v| v.key));
+    let leaks = rows(&mut t.leaks.iter().copied());
     TickReportFfi {
         servers,
         alerts,
@@ -894,11 +889,12 @@ impl Core {
     /// observed server or a session without an id.
     pub fn resume_command(&self, pid: i32, start_time: u64) -> Result<Option<String>, BtpError> {
         let key = ServerKey { pid, start_time };
-        Ok(with_state(&self.dir, |s| {
-            let s = s.servers.iter().find(|s| s.key == key)?;
-            let folder = s.session_cwd.as_deref().unwrap_or(&s.worktree);
-            resume_command(s.agent, folder, &s.session_id)
-        })?)
+        let state = read_state_readonly(&self.dir)?;
+        let Some(s) = state.servers.iter().find(|s| s.key == key) else {
+            return Ok(None);
+        };
+        let folder = s.session_cwd.as_deref().unwrap_or(&s.worktree);
+        Ok(resume_command(s.agent, folder, &s.session_id))
     }
 
     /// "Postpone 1 h": the server's stop waits one hour from now. `false`
@@ -928,7 +924,17 @@ impl Core {
     /// again`). Blocks for the kill grace plus up to 5 s while the port
     /// frees: never call it on the main thread.
     pub fn restart(&self, pid: i32, start_time: u64) -> Result<Option<String>, BtpError> {
-        let r = lock(&self.watcher).restart(ServerKey { pid, start_time })?;
+        // Checked and planned under the lock; the stop, the port wait and
+        // the start run without it, so passes go on meanwhile.
+        let (job, platform) = {
+            let mut w = lock(&self.watcher);
+            let job = w.prepare_restart(ServerKey { pid, start_time }, now_ms())?;
+            (job, *w.platform())
+        };
+        let r = match job {
+            Ok(job) => job.run(&platform)?,
+            Err(blocked) => Err(blocked),
+        };
         Ok(r.err().map(|b| restart_blocked_label(b).to_string()))
     }
 
@@ -940,8 +946,16 @@ impl Core {
         pid: i32,
         start_time: u64,
     ) -> Result<Option<KillRecordFfi>, BtpError> {
-        let r = lock(&self.watcher).stop_observed(ServerKey { pid, start_time })?;
-        Ok(r.as_ref().map(Into::into))
+        // Checked under the lock, killed without it (the kill grace).
+        let (job, platform) = {
+            let mut w = lock(&self.watcher);
+            let job = w.prepare_stop_observed(ServerKey { pid, start_time })?;
+            (job, *w.platform())
+        };
+        let Some(job) = job else {
+            return Ok(None);
+        };
+        Ok(job.run(&platform)?.as_ref().map(Into::into))
     }
 
     /// The Claude config dirs found automatically, read only. The config's
@@ -1082,6 +1096,12 @@ mod tests {
         assert_eq!(duration_label(12 * 60_000), "12 min");
         assert_eq!(duration_label(2 * 3_600_000), "2 h");
     }
+
+    /// Held by the tests that spawn a child and by those that check the
+    /// watch lock: a child forked while a lock is held keeps a copy of its
+    /// descriptor until it execs, so a lock dropped then could still look
+    /// taken.
+    static SPAWNS: Mutex<()> = Mutex::new(());
 
     fn assert_send_sync<T: Send + Sync>() {}
 
@@ -1465,6 +1485,7 @@ mod tests {
 
     #[test]
     fn processes_lists_a_running_server_first() {
+        let _spawns = lock(&SPAWNS);
         use btp_core::platform::Platform;
         let d = tempfile::tempdir().unwrap();
         let core = Core::at(d.path().to_path_buf(), Vec::new);
@@ -1503,37 +1524,146 @@ mod tests {
             .all(|s| !s.managed && s.agent_label == "no agent"));
     }
 
-    #[test]
-    fn a_pass_shows_the_title_its_probe_fetched() {
-        use btp_core::probe::PageMeta;
+    /// A child `nc` listening on a free loopback port (an observed server
+    /// of the test's own), once the platform sees it listen.
+    fn nc_listener() -> (std::process::Child, u16, ServerKey) {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        // An absolute argv[0]: `nc`'s environment reads back empty here (no
+        // `PATH` to look it up in), and a restart must still plan it.
+        let child = std::process::Command::new("/usr/bin/nc")
+            .args(["-l", "127.0.0.1", &port.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !MacOs
+            .listeners()
+            .iter()
+            .any(|l| l.pid == pid && l.port == port)
+        {
+            assert!(std::time::Instant::now() < deadline, "nc never listened");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let start_time = MacOs.proc_info(pid).unwrap().start_time;
+        (child, port, ServerKey { pid, start_time })
+    }
+
+    /// A temp core whose sessions dir is empty: nothing is ever tracked.
+    fn isolated_core() -> (Core, tempfile::TempDir, tempfile::TempDir) {
         let d = tempfile::tempdir().unwrap();
         let sessions = tempfile::tempdir().unwrap();
-        let mut core = Core::at(d.path().to_path_buf(), Vec::new);
-        core.probe = |_| {
-            ProbeOutcome::Meta(PageMeta {
-                title: Some("Fetched title".into()),
-                icon: None,
-            })
-        };
+        let core = Core::at(d.path().to_path_buf(), Vec::new);
         let mut c = core.config().unwrap();
         c.claude_config_dirs = vec![sessions.path().display().to_string()];
+        c.kill_grace_s = 2;
         core.set_config(c).unwrap();
-        // The test process itself listens: an observed server of its own.
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = l.local_addr().unwrap().port();
-        let me = std::process::id() as i32;
-        let mine = |r: &TickReportFfi| r.servers.iter().find(|s| s.pid == me).cloned();
-        let row = mine(&core.observe().unwrap()).expect("observed");
-        assert!(row.ports.contains(&port), "{:?}", row.ports);
-        assert!(!row.managed);
+        (core, d, sessions)
+    }
+
+    /// The ports `recording_probe` was asked, in order.
+    static PROBED: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+
+    fn recording_probe(port: u16) -> ProbeOutcome {
+        lock(&PROBED).push(port);
+        ProbeOutcome::Meta(btp_core::probe::PageMeta {
+            title: Some("Fetched title".into()),
+            icon: None,
+        })
+    }
+
+    #[test]
+    fn a_pass_shows_the_title_its_probe_fetched() {
+        let _spawns = lock(&SPAWNS);
+        let (mut core, _d, _s) = isolated_core();
+        core.probe = recording_probe;
+        let (mut child, port, key) = nc_listener();
+        let r = core.observe().unwrap();
+        let probed = std::mem::take(&mut *lock(&PROBED));
+        let _ = child.kill();
+        let _ = child.wait();
+        let row = r
+            .servers
+            .iter()
+            .find(|s| s.pid == key.pid)
+            .expect("observed");
+        assert!(row.ports.contains(&port) && !row.managed);
         assert!(row.process_count >= 1);
-        // Two probes a pass, after it, with the watcher unlocked: the
-        // machine's other servers may come first.
-        let titled = (0..100)
-            .find_map(|_| mine(&core.observe().unwrap()).filter(|r| r.title == "Fetched title"));
-        assert!(!titled.expect("probed within 100 passes").has_icon);
-        assert!(!core.history(me, row.start_time).is_empty());
-        drop(l);
+        // Whatever the machine listens on, a pass probes something (`nc`
+        // at least is due), after the pass with the watcher unlocked, and
+        // that very report shows each answer.
+        assert!(!probed.is_empty() && probed.len() <= 2, "{probed:?}");
+        for port in probed {
+            let shown = r.servers.iter().find(|s| s.port == port).expect("a row");
+            assert_eq!(shown.title, "Fetched title");
+            assert!(!shown.has_icon);
+        }
+    }
+
+    /// Starts nothing: tells the test it was reached, then waits for its
+    /// go before failing.
+    struct BlockingSpawner {
+        entered: Mutex<std::sync::mpsc::Sender<()>>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl btp_core::restart::Spawner for BlockingSpawner {
+        fn spawn(
+            &self,
+            _plan: &btp_core::restart::RestartPlan,
+            _log: &Path,
+            _p: &dyn Platform,
+        ) -> io::Result<(i32, u64)> {
+            let _ = lock(&self.entered).send(());
+            let _ = lock(&self.release).recv();
+            Err(io::Error::other("test spawner"))
+        }
+    }
+
+    #[test]
+    fn passes_run_while_a_restart_waits() {
+        let _spawns = lock(&SPAWNS);
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        let (core, d, _s) = isolated_core();
+        let (entered_tx, entered_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        {
+            let mut w = lock(&core.watcher);
+            let old = std::mem::replace(&mut *w, Watcher::new(MacOs, d.path().to_path_buf()));
+            *w = old
+                .with_spawner(Box::new(BlockingSpawner {
+                    entered: Mutex::new(entered_tx),
+                    release: Mutex::new(release_rx),
+                }))
+                .with_restart_wait(Duration::from_secs(5), Duration::from_millis(20));
+        }
+        let (mut child, _port, key) = nc_listener();
+        let (blocked, observed) = std::thread::scope(|s| {
+            let restart = s.spawn(|| core.restart(key.pid, key.start_time));
+            // The restart stopped `nc` and reached the start: it is waiting.
+            let reached = entered_rx.recv_timeout(Duration::from_secs(15)).is_ok();
+            let (done_tx, done_rx) = channel();
+            let core = &core;
+            s.spawn(move || {
+                let _ = done_tx.send(core.observe().is_ok());
+            });
+            let observed = reached && done_rx.recv_timeout(Duration::from_secs(10)) == Ok(true);
+            let _ = release_tx.send(());
+            (restart.join().unwrap(), observed)
+        });
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(
+            blocked.unwrap().as_deref(),
+            Some("Could not start it again")
+        );
+        assert!(observed, "observe() returned while the restart was waiting");
     }
 
     #[test]
@@ -1734,6 +1864,7 @@ mod tests {
 
     #[test]
     fn stop_session_ended_kills_only_the_exact_process() {
+        let _spawns = lock(&SPAWNS);
         use btp_core::model::TrackedServer;
         use btp_core::platform::Platform;
         use btp_core::state::GroupServer;
@@ -1831,6 +1962,7 @@ mod tests {
 
     #[test]
     fn observe_works_without_the_watch_lock() {
+        let _spawns = lock(&SPAWNS);
         let d = tempfile::tempdir().unwrap();
         let sessions = tempfile::tempdir().unwrap();
         let holder = Core::at(d.path().to_path_buf(), Vec::new);
@@ -1848,6 +1980,7 @@ mod tests {
 
     #[test]
     fn acquire_watch_is_exclusive_and_held_until_drop() {
+        let _spawns = lock(&SPAWNS);
         let d = tempfile::tempdir().unwrap();
         let a = Core::at(d.path().to_path_buf(), Vec::new);
         let b = Core::at(d.path().to_path_buf(), Vec::new);

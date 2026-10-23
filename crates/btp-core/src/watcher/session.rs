@@ -551,7 +551,7 @@ impl<P: Platform> Watcher<P> {
             for (s, t) in state.servers.iter_mut().zip(&trees) {
                 // `refresh` already forgot excluded servers; checked again
                 // so the list can never offer one.
-                if !keys.contains(&s.key) || self.excluded_now(s, t, &scan.cfg) {
+                if !keys.contains(&s.key) || super::excluded_now(&self.platform, s, t, &scan.cfg) {
                     continue;
                 }
                 s.asked_stale = true;
