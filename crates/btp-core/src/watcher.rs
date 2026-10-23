@@ -19,8 +19,8 @@ use crate::observed::{observed_servers_cached, ObservedServer, SystemCache};
 use crate::platform::{ancestry, format_proc_start, Listener, Platform, ProcInfo, ProcResources};
 use crate::probe::{PageMeta, ProbeCache, ProbeOutcome};
 use crate::restart::{
-    pending_for, pending_holds, plan_restart, relinked, CommandSpawner, PendingRestart,
-    RestartBlocked, RestartCheck, RestartJob, RestartTarget, Spawner,
+    pending_for, pending_holds, plan_restart, relinked, CommandSpawner, InFlight, InFlightGuard,
+    PendingRestart, RestartBlocked, RestartCheck, RestartJob, RestartTarget, Spawner,
 };
 use crate::session_end::session_ended_open;
 use crate::sessions::default_config_dirs;
@@ -609,6 +609,8 @@ pub struct Watcher<P: Platform> {
     restart_wait: (Duration, Duration),
     /// Whether each server could restart, its environment read once.
     restart_check: RestartCheck,
+    /// The servers a restart or a stop job is running for.
+    in_flight: InFlight,
 }
 
 impl<P: Platform> Watcher<P> {
@@ -634,6 +636,7 @@ impl<P: Platform> Watcher<P> {
             spawner: Arc::new(CommandSpawner),
             restart_wait: (Duration::from_secs(5), Duration::from_millis(100)),
             restart_check: RestartCheck::default(),
+            in_flight: InFlight::default(),
         }
     }
 
@@ -859,6 +862,10 @@ impl<P: Platform> Watcher<P> {
     /// own, so a caller can release the watcher during the kill grace.
     /// `None` unless `key` is still an observed, non-excluded server.
     pub fn prepare_stop_observed(&mut self, key: ServerKey) -> io::Result<Option<StopObservedJob>> {
+        // A restart or a stop of it already running: nothing more to do.
+        let Some(claim) = self.in_flight.claim(key) else {
+            return Ok(None);
+        };
         let now = now_ms();
         let scan = self.scan();
         let listeners = self.platform.listeners();
@@ -874,6 +881,7 @@ impl<P: Platform> Watcher<P> {
                 cfg: scan.cfg,
                 data_dir: self.data_dir.clone(),
                 now_ms: now,
+                _claim: claim,
             }))
     }
 
@@ -908,6 +916,10 @@ impl<P: Platform> Watcher<P> {
         key: ServerKey,
         now_ms: u64,
     ) -> io::Result<Result<RestartJob, RestartBlocked>> {
+        // Claimed first: a second click waits for the lock, then finds it.
+        let Some(claim) = self.in_flight.claim(key) else {
+            return Ok(Err(RestartBlocked::Busy));
+        };
         let scan = self.scan();
         let listeners = self.platform.listeners();
         let (owner, tracked) = with_state(&self.data_dir, |state| {
@@ -948,6 +960,7 @@ impl<P: Platform> Watcher<P> {
             spawner: Arc::clone(&self.spawner),
             wait: self.restart_wait,
             now_ms,
+            _claim: claim,
         }))
     }
 
@@ -1306,6 +1319,8 @@ impl<P: Platform> Watcher<P> {
                                 alerted.insert(key);
                             }
                         }
+                        // A restart or stop job is already stopping it.
+                        Action::Kill { key, .. } if self.in_flight.contains(key) => {}
                         Action::Kill { key, reason } => {
                             if let Some(s) = state.servers.iter().find(|s| s.key == key) {
                                 to_kill.push((s.clone(), reason));
@@ -1576,6 +1591,8 @@ pub struct StopObservedJob {
     cfg: Config,
     data_dir: PathBuf,
     now_ms: u64,
+    /// Holds the server in flight until the stop is done.
+    _claim: InFlightGuard,
 }
 
 impl StopObservedJob {
@@ -3865,6 +3882,31 @@ mod tests {
         assert_eq!(pending(&f).len(), 1);
         // An observed server's stop is prepared the same way.
         assert!(f.w.prepare_stop_observed(key30()).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_server_in_flight_is_neither_restarted_twice_nor_killed_by_a_pass() {
+        let (mut f, calls) = restart_fx();
+        f.w.tick(T0).unwrap();
+        f.p().remove_proc(20);
+        let job = f.w.prepare_restart(key30(), T0).unwrap().unwrap();
+        // A second click, and a stop, while the first restart runs.
+        assert_eq!(
+            f.w.prepare_restart(key30(), T0).unwrap().err(),
+            Some(RestartBlocked::Busy)
+        );
+        assert!(f.w.prepare_stop_observed(key30()).unwrap().is_none());
+        // The dead-session rule is due, but the job is stopping it.
+        assert!(tick_minutes(&mut f, T0, T0 + 25 * MIN).is_empty());
+        assert!(f.p().is_alive(30));
+        assert_eq!(job.run(f.w.platform()).unwrap(), Ok(()));
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(f.state_kills().len(), 1, "one kill record");
+        // Released once done: a new restart is judged on its own.
+        assert_eq!(
+            f.w.restart_at(key30(), T0 + 26 * MIN).unwrap(),
+            Err(RestartBlocked::Gone)
+        );
     }
 
     #[test]

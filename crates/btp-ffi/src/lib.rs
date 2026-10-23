@@ -311,6 +311,7 @@ pub fn restart_blocked_label(b: RestartBlocked) -> &'static str {
         }
         RestartBlocked::PortStillTaken => "The port is still taken",
         RestartBlocked::Excluded => "It matches an exclusion now",
+        RestartBlocked::Busy => "Already restarting",
     }
 }
 
@@ -920,9 +921,9 @@ impl Core {
     /// and environment; a tracked server keeps its session, note, Keep and
     /// Postpone. `nil` once started, else why not, as the row shows it (`The
     /// folder no longer exists`, `Cannot read its environment`, `The port is
-    /// still taken`, `It matches an exclusion now`, `Could not start it
-    /// again`). Blocks for the kill grace plus up to 5 s while the port
-    /// frees: never call it on the main thread.
+    /// still taken`, `It matches an exclusion now`, `Already restarting`,
+    /// `Could not start it again`). Blocks for the kill grace plus up to 5 s
+    /// while the port frees: never call it on the main thread.
     pub fn restart(&self, pid: i32, start_time: u64) -> Result<Option<String>, BtpError> {
         // Checked and planned under the lock; the stop, the port wait and
         // the start run without it, so passes go on meanwhile.
@@ -1098,9 +1099,10 @@ mod tests {
     }
 
     /// Held by the tests that spawn a child and by those that check the
-    /// watch lock: a child forked while a lock is held keeps a copy of its
-    /// descriptor until it execs, so a lock dropped then could still look
-    /// taken.
+    /// watch lock. Without it `acquire_watch_is_exclusive_and_held_until_drop`
+    /// fails now and then (a dropped lock still looks taken) while another
+    /// test spawns a child; serializing them removes it. The cause is not
+    /// established.
     static SPAWNS: Mutex<()> = Mutex::new(());
 
     fn assert_send_sync<T: Send + Sync>() {}
@@ -1368,6 +1370,7 @@ mod tests {
         assert_eq!(copy(ArgvUnreadable), "Cannot read its environment");
         assert_eq!(copy(PortStillTaken), "The port is still taken");
         assert_eq!(copy(Excluded), "It matches an exclusion now");
+        assert_eq!(copy(Busy), "Already restarting");
         assert_eq!(copy(Gone), "Could not start it again");
         assert_eq!(copy(SpawnFailed), "Could not start it again");
     }
@@ -1606,10 +1609,12 @@ mod tests {
     }
 
     /// Starts nothing: tells the test it was reached, then waits for its
-    /// go before failing.
+    /// go before failing, or before handing back `started` (a process the
+    /// test runs) when set.
     struct BlockingSpawner {
         entered: Mutex<std::sync::mpsc::Sender<()>>,
         release: Mutex<std::sync::mpsc::Receiver<()>>,
+        started: Option<(i32, u64)>,
     }
 
     impl btp_core::restart::Spawner for BlockingSpawner {
@@ -1621,7 +1626,7 @@ mod tests {
         ) -> io::Result<(i32, u64)> {
             let _ = lock(&self.entered).send(());
             let _ = lock(&self.release).recv();
-            Err(io::Error::other("test spawner"))
+            self.started.ok_or_else(|| io::Error::other("test spawner"))
         }
     }
 
@@ -1640,6 +1645,7 @@ mod tests {
                 .with_spawner(Box::new(BlockingSpawner {
                     entered: Mutex::new(entered_tx),
                     release: Mutex::new(release_rx),
+                    started: None,
                 }))
                 .with_restart_wait(Duration::from_secs(5), Duration::from_millis(20));
         }
@@ -1664,6 +1670,62 @@ mod tests {
             Some("Could not start it again")
         );
         assert!(observed, "observe() returned while the restart was waiting");
+    }
+
+    #[test]
+    fn two_restarts_of_one_server_spawn_once() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        let _spawns = lock(&SPAWNS);
+        let (core, d, _s) = isolated_core();
+        // What the fake start hands back: a process of the test's own.
+        let mut new = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let new_pid = new.id() as i32;
+        let new_start = MacOs.proc_info(new_pid).unwrap().start_time;
+        let (entered_tx, entered_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        {
+            let mut w = lock(&core.watcher);
+            let old = std::mem::replace(&mut *w, Watcher::new(MacOs, d.path().to_path_buf()));
+            *w = old
+                .with_spawner(Box::new(BlockingSpawner {
+                    entered: Mutex::new(entered_tx),
+                    release: Mutex::new(release_rx),
+                    started: Some((new_pid, new_start)),
+                }))
+                .with_restart_wait(Duration::from_secs(5), Duration::from_millis(20));
+        }
+        let (mut child, _port, key) = nc_listener();
+        let (first, second, spawns) = std::thread::scope(|s| {
+            let first = s.spawn(|| core.restart(key.pid, key.start_time));
+            let reached = entered_rx.recv_timeout(Duration::from_secs(15)).is_ok();
+            // A second click while the first restart waits at the start.
+            let second = s.spawn(|| core.restart(key.pid, key.start_time));
+            let second = second.join().unwrap();
+            let _ = release_tx.send(());
+            let first = first.join().unwrap();
+            // A start the second restart would have made is reached by now.
+            let more = entered_rx.recv_timeout(Duration::from_millis(200)).is_ok();
+            (first, second, usize::from(reached) + usize::from(more))
+        });
+        let pending = with_state(d.path(), |s| s.pending_restarts.clone()).unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = new.kill();
+        let _ = new.wait();
+        assert_eq!(first.unwrap(), None, "started");
+        assert_eq!(second.unwrap().as_deref(), Some("Already restarting"));
+        assert_eq!(spawns, 1);
+        assert_eq!(pending.len(), 1);
+        assert_eq!((pending[0].child_pid, pending[0].from), (new_pid, key));
+        // Released: a later restart is judged on its own (`nc` is gone).
+        assert_eq!(
+            core.restart(key.pid, key.start_time).unwrap().as_deref(),
+            Some("Could not start it again")
+        );
     }
 
     #[test]

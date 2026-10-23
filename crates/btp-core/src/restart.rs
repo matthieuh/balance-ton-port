@@ -11,14 +11,14 @@ use crate::platform::{Listener, Platform, ProcInfo};
 use crate::state::with_state;
 use crate::watcher::{execute_kills, stop_observed_tree};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 /// A pending restart is kept while its process lives, at most this long.
@@ -65,6 +65,47 @@ pub enum RestartBlocked {
     Excluded,
     /// The new process could not be started (the server is stopped).
     SpawnFailed,
+    /// A restart or stop of this server is already running.
+    Busy,
+}
+
+/// The servers a restart or a stop is running for, shared by the watcher
+/// and its jobs: while a key is in, no other restart or stop starts for it
+/// and no pass kills it.
+#[derive(Debug, Clone, Default)]
+pub struct InFlight(Arc<Mutex<HashSet<ServerKey>>>);
+
+impl InFlight {
+    fn set(&self) -> MutexGuard<'_, HashSet<ServerKey>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Claims `key`; `None` when it is already claimed. The key is released
+    /// when the guard drops, whatever the outcome (an error or a panic
+    /// included).
+    pub fn claim(&self, key: ServerKey) -> Option<InFlightGuard> {
+        self.set().insert(key).then(|| InFlightGuard {
+            set: self.clone(),
+            key,
+        })
+    }
+
+    pub fn contains(&self, key: ServerKey) -> bool {
+        self.set().contains(&key)
+    }
+}
+
+/// A claimed key of `InFlight`, released on drop.
+#[derive(Debug)]
+pub struct InFlightGuard {
+    set: InFlight,
+    key: ServerKey,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.set.set().remove(&self.key);
+    }
 }
 
 /// A restarted process waiting for its first listener, so that listener
@@ -270,6 +311,8 @@ pub struct RestartJob {
     /// How long the port is waited for, and how often it is looked at.
     pub(crate) wait: (Duration, Duration),
     pub(crate) now_ms: u64,
+    /// Holds the server in flight until the job is done.
+    pub(crate) _claim: InFlightGuard,
 }
 
 impl RestartJob {
@@ -287,6 +330,7 @@ impl RestartJob {
             spawner,
             wait: (limit, interval),
             now_ms,
+            _claim,
         } = self;
         // `dropped`: no longer tracked although not killed, which for a
         // process still running means an exclusion saved meanwhile matched.
@@ -494,6 +538,25 @@ mod tests {
         // Forgotten once gone from the live servers: read again.
         c.retain(&std::collections::HashSet::new());
         assert!(!c.can_restart(&p, k));
+    }
+
+    #[test]
+    fn in_flight_claims_once_and_releases_on_drop_and_panic() {
+        let f = InFlight::default();
+        let k = key(30, START);
+        let g = f.claim(k).expect("first claim");
+        assert!(f.contains(k));
+        assert!(f.claim(k).is_none(), "already in flight");
+        assert!(f.claim(key(31, START)).is_some(), "another key");
+        drop(g);
+        assert!(!f.contains(k));
+        let shared = f.clone();
+        let r = std::panic::catch_unwind(move || {
+            let _g = shared.claim(k).unwrap();
+            panic!("job failed");
+        });
+        assert!(r.is_err());
+        assert!(!f.contains(k), "released by the unwinding");
     }
 
     #[test]
