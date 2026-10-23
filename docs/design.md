@@ -115,7 +115,7 @@ A pass does not consume alerts: it reports every server due one, on every pass, 
 
 ## 9. Observed servers
 
-The app also lists the servers no agent started. An observed server is any TCP listener of the current user, except a process whose executable is under `/System`, `/usr/libexec` or `/usr/sbin`, or inside an `*.app/Contents/` bundle (an executable whose path cannot be read counts as a system one). Observed listeners are grouped by process tree like tracked servers; grouping stops at an agent CLI or at a process matching an excluded command, so a nested agent session or a database is never folded into a dev server.
+The app also lists the servers no agent started. An observed server is any TCP listener of the current user, except a process whose executable is under `/System`, `/usr/libexec` or `/usr/sbin`, or inside an `*.app/Contents/` application bundle (but not a runtime bundle inside a `*.framework`, such as Homebrew's or python.org's `Python.app`, so servers run by framework Python are shown; an executable whose path cannot be read counts as a system one). Observed listeners are grouped by process tree like tracked servers; grouping stops at an agent CLI or at a process matching an excluded command, so a nested agent session or a database is never folded into a dev server.
 
 Observed servers are never stopped automatically. The row shows `in use`, `idle N min` or `excluded`; an excluded one (command or port, section 6) has no Stop. Stop and Restart exist only in the app, one server at a time, and ask for a confirmation first: Return and Escape both cancel, so a stray key press stops nothing. `btp kill` and `btp sweep` refuse observed servers (an untracked port or pid exits 1), and so does the skill.
 

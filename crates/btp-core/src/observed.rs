@@ -25,12 +25,32 @@ pub struct ObservedServer {
     pub excluded: bool,
 }
 
-/// macOS system daemons and application bundles: never shown.
+/// macOS system daemons and application bundles: never shown. A bundle
+/// inside a language runtime framework (`Python.framework/.../Python.app`) is
+/// not an application, unless that framework itself sits in an app bundle.
 pub fn is_system_process(exe: &Path) -> bool {
     ["/System", "/usr/libexec", "/usr/sbin"]
         .iter()
         .any(|root| exe.starts_with(root))
-        || exe.to_string_lossy().contains(".app/Contents/")
+        || in_app_bundle(exe)
+}
+
+fn in_app_bundle(exe: &Path) -> bool {
+    let parts: Vec<_> = exe
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect();
+    let mut in_framework = false;
+    for (i, part) in parts.iter().enumerate() {
+        if part.ends_with(".app") && parts.get(i + 1).is_some_and(|n| n == "Contents") {
+            if !in_framework {
+                return true;
+            }
+        } else if part.ends_with(".framework") {
+            in_framework = true;
+        }
+    }
+    false
 }
 
 /// Whether each process is a system one, by (pid, start time), so a pass
@@ -182,6 +202,19 @@ mod tests {
             "/Applications/Docker.app/Contents/MacOS/com.docker.backend",
         ] {
             assert!(is_system_process(Path::new(exe)), "{exe}");
+        }
+        for exe in [
+            "/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper.app/Contents/MacOS/Code Helper",
+            "/Users/me/Applications/X.app/Contents/MacOS/x",
+            "/Applications/Foo.app/Contents/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python",
+        ] {
+            assert!(is_system_process(Path::new(exe)), "{exe}");
+        }
+        for exe in [
+            "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python",
+            "/Library/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python",
+        ] {
+            assert!(!is_system_process(Path::new(exe)), "{exe}");
         }
         assert!(!is_system_process(Path::new(NODE)));
         assert!(!is_system_process(Path::new("/usr/bin/perl")));
