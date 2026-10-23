@@ -410,19 +410,34 @@ impl<P: Platform> Watcher<P> {
         }
     }
 
-    /// The live session process the caller descends from: its nearest
-    /// ancestor that matches a live session file (pid and start time).
-    fn caller_session<'a>(&self, caller_pid: i32, scan: &'a Scan) -> Option<&'a ClaudeSession> {
-        ancestry(&self.platform, caller_pid)
-            .iter()
-            .skip(1)
+    /// The Claude Code process the caller descends from, as (pid, start
+    /// time in session-file format): its nearest ancestor that matches a
+    /// live session file. Failing that, `session_pid` when given and it is
+    /// a Claude Code ancestor of the caller: Claude Code rewrites its session
+    /// file after `/clear` and `/resume` only once the SessionStart hook has
+    /// run, so the proven process stands in for the file, as at session end.
+    fn caller_process(
+        &self,
+        caller_pid: i32,
+        session_pid: Option<i32>,
+        scan: &Scan,
+    ) -> Option<(i32, String)> {
+        let chain = ancestry(&self.platform, caller_pid);
+        let ancestors = || chain.iter().skip(1);
+        ancestors()
             .find_map(|p| {
                 let started = format_proc_start(p.start_time);
                 scan.live
                     .iter()
                     .find(|l| l.session.pid == p.pid && l.session.proc_start == started)
+                    .map(|l| (l.session.pid, l.session.proc_start.clone()))
             })
-            .map(|l| &l.session)
+            .or_else(|| {
+                let pid = session_pid?;
+                ancestors()
+                    .find(|p| p.pid == pid && is_claude_cli(&p.command))
+                    .map(|p| (p.pid, format_proc_start(p.start_time)))
+            })
     }
 
     /// Sets the agent's note on the server listening on `port`, when it
@@ -436,7 +451,7 @@ impl<P: Platform> Watcher<P> {
         now_ms: u64,
     ) -> io::Result<NoteOutcome> {
         let scan = self.scan();
-        let Some(caller) = self.caller_session(caller_pid, &scan).cloned() else {
+        let Some((caller_pid, caller_start)) = self.caller_process(caller_pid, None, &scan) else {
             return Ok(NoteOutcome::NoSession);
         };
         let listeners = self.platform.listeners();
@@ -458,7 +473,7 @@ impl<P: Platform> Watcher<P> {
                 return NoteOutcome::NotTracked;
             };
             let s = &mut state.servers[i];
-            if s.session_pid != caller.pid || s.session_proc_start != caller.proc_start {
+            if s.session_pid != caller_pid || s.session_proc_start != caller_start {
                 return NoteOutcome::OtherSession;
             }
             let (keep, done, reason) = match cmd {
@@ -481,15 +496,17 @@ impl<P: Platform> Watcher<P> {
     /// The leftovers of earlier conversations of the caller's live session
     /// process (tier 3), each returned once: they are marked as asked.
     /// Excluded servers are never returned. `None` when the caller does not
-    /// descend from a live session.
+    /// descend from a live session (see `caller_process` for `session_pid`).
     pub fn stale(
         &mut self,
         caller_pid: i32,
+        session_pid: Option<i32>,
         conversation: &str,
         now_ms: u64,
     ) -> io::Result<Option<Vec<StaleServer>>> {
         let scan = self.scan();
-        let Some(caller) = self.caller_session(caller_pid, &scan).cloned() else {
+        let Some((caller_pid, caller_start)) = self.caller_process(caller_pid, session_pid, &scan)
+        else {
             return Ok(None);
         };
         let listeners = self.platform.listeners();
@@ -509,8 +526,8 @@ impl<P: Platform> Watcher<P> {
             let keys = stale_conversation_servers(
                 &state.servers,
                 &obs,
-                caller.pid,
-                &caller.proc_start,
+                caller_pid,
+                &caller_start,
                 conversation,
                 now_ms,
             );
@@ -547,7 +564,7 @@ impl<P: Platform> Watcher<P> {
     pub fn kill_own(&mut self, caller_pid: i32, key: ServerKey) -> io::Result<OwnKillOutcome> {
         let now = now_ms();
         let scan = self.scan();
-        let Some(caller) = self.caller_session(caller_pid, &scan).cloned() else {
+        let Some((caller_pid, caller_start)) = self.caller_process(caller_pid, None, &scan) else {
             return Ok(OwnKillOutcome::NoSession);
         };
         let listeners = self.platform.listeners();
@@ -563,7 +580,7 @@ impl<P: Platform> Watcher<P> {
         let Some(server) = found else {
             return Ok(OwnKillOutcome::NotTracked);
         };
-        if server.session_pid != caller.pid || server.session_proc_start != caller.proc_start {
+        if server.session_pid != caller_pid || server.session_proc_start != caller_start {
             return Ok(OwnKillOutcome::OtherSession);
         }
         Ok(
@@ -1106,13 +1123,13 @@ mod tests {
         hook(&f);
         tracked(&mut f);
         cleared(&f);
-        let first = f.w.stale(HOOK, "sess-b", T0).unwrap().unwrap();
+        let first = f.w.stale(HOOK, None, "sess-b", T0).unwrap().unwrap();
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].port, 3000);
         assert_eq!(first[0].conversation_id, "sess-a");
         assert_eq!(first[0].tool_label, "Bun dev");
         assert!(f.state_servers()[0].asked_stale);
-        let again = f.w.stale(HOOK, "sess-b", T0 + MIN).unwrap().unwrap();
+        let again = f.w.stale(HOOK, None, "sess-b", T0 + MIN).unwrap().unwrap();
         assert!(again.is_empty());
         assert!(f.p().signals().is_empty());
     }
@@ -1123,10 +1140,18 @@ mod tests {
         hook(&f);
         tracked(&mut f);
         // Current conversation: never offered.
-        assert!(f.w.stale(HOOK, "sess-a", T0).unwrap().unwrap().is_empty());
+        assert!(f
+            .w
+            .stale(HOOK, None, "sess-a", T0)
+            .unwrap()
+            .unwrap()
+            .is_empty());
         cleared(&f);
         // Idle 5 min only: not yet, and not marked.
-        let r = f.w.stale(HOOK, "sess-b", T0 - 5 * MIN).unwrap().unwrap();
+        let r =
+            f.w.stale(HOOK, None, "sess-b", T0 - 5 * MIN)
+                .unwrap()
+                .unwrap();
         assert!(r.is_empty());
         assert!(!f.state_servers()[0].asked_stale);
     }
@@ -1140,7 +1165,12 @@ mod tests {
         let mut cfg = f.cfg();
         cfg.exclude_commands.push("bun run".into());
         save_config(f.data.path(), &cfg).unwrap();
-        assert!(f.w.stale(HOOK, "sess-b", T0).unwrap().unwrap().is_empty());
+        assert!(f
+            .w
+            .stale(HOOK, None, "sess-b", T0)
+            .unwrap()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1201,10 +1231,27 @@ mod tests {
     }
 
     #[test]
+    fn stale_without_a_session_file_uses_the_claude_ancestor() {
+        // After /clear, Claude Code rewrites its session file only after the
+        // SessionStart hook ran.
+        let mut f = fx();
+        hook(&f);
+        tracked(&mut f);
+        fs::remove_file(f.claude.path().join("sessions/20.json")).unwrap();
+        assert_eq!(f.w.stale(HOOK, None, "sess-b", T0).unwrap(), None);
+        // Not a Claude Code ancestor (the hook's bash): refused.
+        assert_eq!(f.w.stale(HOOK, Some(39), "sess-b", T0).unwrap(), None);
+        let list = f.w.stale(HOOK, Some(20), "sess-b", T0).unwrap().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].port, 3000);
+        assert!(f.p().signals().is_empty());
+    }
+
+    #[test]
     fn stale_needs_a_live_session_caller() {
         let mut f = fx();
         tracked(&mut f);
         f.p().spawn(51, 10, START + 51 * SEC, "btp stale", "/");
-        assert_eq!(f.w.stale(51, "sess-b", T0).unwrap(), None);
+        assert_eq!(f.w.stale(51, Some(10), "sess-b", T0).unwrap(), None);
     }
 }

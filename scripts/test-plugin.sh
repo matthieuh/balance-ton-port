@@ -335,7 +335,7 @@ unset rel
 
 run_hook session-start.sh "${start_payload/startup/clear}" with-btp
 check "session-start: no stale servers prints nothing" test "$code:$out" = "0:"
-check "session-start: asks btp stale for the current conversation" grep -q '^stale --conversation=conv-2$' "$FAKE_BTP_LOG"
+check "session-start: asks btp stale for the current conversation, with its Claude pid" grep -Eq '^stale --conversation=conv-2 --session-pid=[0-9]+$' "$FAKE_BTP_LOG"
 
 stale='[{"pid":42,"start_time":1,"port":5173,"ports":[5173],"tool_label":"Vite","command":"vite --secret-flag","worktree":"/w","location_label":"w","idle_ms":400000,"conversation_id":"conv-1","note":"testing \"the\" form"},{"pid":43,"start_time":1,"port":4322,"ports":[4322],"tool_label":"Astro","command":"astro","worktree":"/w","location_label":"w","idle_ms":400000,"conversation_id":"conv-1","note":null}]'
 FAKE_STALE="$stale" run_hook session-start.sh "${start_payload/startup/clear}" with-btp

@@ -69,6 +69,10 @@ enum Cmd {
         /// The current conversation id
         #[arg(long)]
         conversation: String,
+        /// The Claude Code process (the hook's parent), used when its
+        /// session file is not written yet
+        #[arg(long)]
+        session_pid: Option<i32>,
     },
     /// Claude Code SessionEnd hook: record the servers the quitting session
     /// leaves running (never stops any). Prints nothing and always exits 0.
@@ -342,9 +346,17 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
                 ))),
             }
         }
-        Cmd::Stale { conversation } => {
+        Cmd::Stale {
+            conversation,
+            session_pid,
+        } => {
             let mut w = Watcher::new(MacOs, dir);
-            let out = w.stale(std::process::id() as i32, &conversation, now_ms())?;
+            let out = w.stale(
+                std::process::id() as i32,
+                session_pid,
+                &conversation,
+                now_ms(),
+            )?;
             warn_config(w.config_error());
             let Some(list) = out else {
                 return Err(Failure::User("not run from a Claude Code session".into()));

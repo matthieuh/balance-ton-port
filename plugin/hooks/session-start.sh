@@ -49,13 +49,25 @@ source="$(btp_json_field source "$payload")"
 session_id="$(btp_json_field session_id "$payload")"
 data="$(btp_data_dir)"
 
+# BTP_HOOK_DEBUG=1 (off by default): one line per step, appended to
+# session-end.log in btp's data dir, like the SessionEnd hook.
+debug_log() {
+  [ "${BTP_HOOK_DEBUG:-}" = 1 ] || return 0
+  mkdir -p "$data" && printf '%s start[%s] %s\n' "$(date +%s)" "$$" "$*" >>"$data/session-end.log"
+}
+debug_log "source=$source session_id=$session_id ppid=$PPID"
+
 if bin="$(btp_find)"; then
   [ -n "$session_id" ] || exit 0
   tmp="$(mktemp "${TMPDIR:-/tmp}/btp-stale.XXXXXX")" || exit 0
   trap 'rm -f "$tmp"' EXIT
   # Exits 1 when not run from a session: nothing to offer then.
-  "$bin" stale "--conversation=$session_id" >"$tmp" || exit 0
+  if ! "$bin" stale "--conversation=$session_id" "--session-pid=$PPID" >"$tmp"; then
+    debug_log "btp stale failed: nothing offered"
+    exit 0
+  fi
   list="$(stale_lines "$tmp")"
+  debug_log "stale servers: $(printf '%s' "$list" | grep -c . || true)"
   [ -n "$list" ] || exit 0
   emit "Balance ton port (plugin): dev servers started by an earlier conversation of this Claude Code session are still running and have been idle more than 5 minutes. They are listed once, now; btp will not offer them again.
 
