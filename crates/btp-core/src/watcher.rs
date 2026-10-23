@@ -16,7 +16,7 @@ use crate::labels::{location_label, session_display_name, tool_label};
 use crate::model::{Action, KillReason, KillTarget, Note, Observation, ServerKey, TrackedServer};
 use crate::observed::{observed_servers_cached, ObservedServer, SystemCache};
 use crate::platform::{ancestry, format_proc_start, Listener, Platform, ProcInfo, ProcResources};
-use crate::probe::{PageMeta, ProbeCache};
+use crate::probe::{PageMeta, ProbeCache, ProbeOutcome};
 use crate::sessions::default_config_dirs;
 use crate::state::{append_kill_log, with_state, KillRecord, State};
 use crate::worktree::{worktree_root, MetaCache};
@@ -541,9 +541,9 @@ pub struct Watcher<P: Platform> {
     ignored_peers: Vec<i32>,
     /// Which listening processes are system ones, read once per process.
     system: SystemCache,
-    /// The observed servers of the last `tick` or `observe`, as (key, port):
-    /// a `sweep` keeps their history and probes.
-    observed_targets: Vec<(ServerKey, u16)>,
+    /// The observed servers of the last `tick` or `observe`: a `sweep`
+    /// keeps their history and probes.
+    last_observed: Vec<ObservedServer>,
 }
 
 impl<P: Platform> Watcher<P> {
@@ -562,7 +562,7 @@ impl<P: Platform> Watcher<P> {
             probe_targets: Vec::new(),
             ignored_peers: Vec::new(),
             system: SystemCache::default(),
-            observed_targets: Vec::new(),
+            last_observed: Vec::new(),
         }
     }
 
@@ -595,18 +595,14 @@ impl<P: Platform> Watcher<P> {
 
     /// The `(server, port)` pairs of the last pass that need a title and
     /// favicon probe (two at most). Take them under the lock, release it,
-    /// fetch with `probe::fetch_page_meta`, then hand the answers to
+    /// fetch with `probe::probe_port`, then hand the answers to
     /// `store_probes`: no network I/O happens while the watcher is borrowed.
     pub fn due_probes(&self, now_ms: u64) -> Vec<(ServerKey, u16)> {
         self.probes.due(&self.probe_targets, now_ms)
     }
 
     /// Records the answers of probes taken with `due_probes`.
-    pub fn store_probes(
-        &mut self,
-        results: Vec<((ServerKey, u16), Option<PageMeta>)>,
-        now_ms: u64,
-    ) {
+    pub fn store_probes(&mut self, results: Vec<((ServerKey, u16), ProbeOutcome)>, now_ms: u64) {
         self.probes.store(results, now_ms);
         self.probes.retain(&self.probe_targets);
     }
@@ -1076,16 +1072,21 @@ impl<P: Platform> Watcher<P> {
         let mut feeds = feeds;
         if mode != Mode::Sweep {
             report.observed = self.observed(&listeners, &tracked, &scan.cfg);
-            self.observed_targets = report.observed.iter().map(|o| (o.key, o.port)).collect();
+            self.last_observed = report.observed.clone();
             feeds.extend(report.observed.iter().map(|o| self.observed_feed(o)));
         }
         self.feed_history(&feeds, &report, now_ms);
-        let mut targets: Vec<(ServerKey, u16)> =
-            report.servers.iter().map(|v| (v.key, v.port)).collect();
-        targets.extend(self.observed_targets.iter().copied());
-        let live: HashSet<ServerKey> = targets.iter().map(|&(k, _)| k).collect();
+        let mut live: HashSet<ServerKey> = report.servers.iter().map(|v| v.key).collect();
+        live.extend(self.last_observed.iter().map(|o| o.key));
         self.history.retain(&live, now_ms);
-        self.probe_targets = targets;
+        // An excluded server (a database, say) is never probed.
+        self.probe_targets = report.servers.iter().map(|v| (v.key, v.port)).collect();
+        self.probe_targets.extend(
+            self.last_observed
+                .iter()
+                .filter(|o| !o.excluded)
+                .map(|o| (o.key, o.port)),
+        );
 
         if mode == Mode::Observe {
             report.killed = to_kill
@@ -2428,7 +2429,7 @@ mod tests {
             title: Some("t".into()),
             icon: None,
         };
-        f.w.store_probes(vec![(due[0], Some(meta.clone()))], T0);
+        f.w.store_probes(vec![(due[0], ProbeOutcome::Meta(meta.clone()))], T0);
         assert!(f.w.due_probes(T0 + 1000).is_empty());
         assert_eq!(f.w.page_meta(key30(), 3000), Some(&meta));
     }
@@ -2902,6 +2903,47 @@ mod tests {
         assert_eq!(f.w.stop_observed(key50()).unwrap(), None);
         assert!(f.p().signals().is_empty());
         assert!(f.p().is_alive(50));
+    }
+
+    #[test]
+    fn excluded_observed_servers_are_never_probed() {
+        let mut f = fx();
+        f.p()
+            .spawn(50, 10, START + 50 * SEC, "postgres -D /db", "/w");
+        f.p().set_exe(50, "/opt/homebrew/bin/postgres");
+        f.p().add_listener(50, 5432);
+        f.p().spawn(60, 10, START + 60 * SEC, "node api.js", "/w");
+        f.p().set_exe(60, NODE);
+        f.p().add_listener(60, 4000);
+        save_config(
+            f.data.path(),
+            &Config {
+                exclude_ports: vec![4000],
+                ..f.cfg()
+            },
+        )
+        .unwrap();
+        for i in 0..5 {
+            let now = T0 + i * 10 * MIN;
+            let r = f.w.tick(now).unwrap();
+            assert_eq!(r.observed.len(), 2);
+            assert!(r.observed.iter().all(|o| o.excluded));
+            let due = f.w.due_probes(now);
+            assert!(
+                due.iter().all(|(k, _)| k.pid != 50 && k.pid != 60),
+                "{due:?}"
+            );
+            f.w.store_probes(
+                due.into_iter()
+                    .map(|k| (k, ProbeOutcome::Nothing))
+                    .collect(),
+                now,
+            );
+            f.w.sweep(now + 1).unwrap();
+            assert!(f.w.due_probes(now + 1).iter().all(|(k, _)| k.pid != 50));
+        }
+        // Their history is kept all the same.
+        assert!(!f.w.history().events(key50()).is_empty());
     }
 
     #[test]
