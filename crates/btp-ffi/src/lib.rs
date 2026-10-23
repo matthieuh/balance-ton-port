@@ -10,7 +10,7 @@ use btp_core::display::{
     card_reason, format_idle, free_is_low, server_state, session_ended_body, started_label,
     status_text, status_text_observed, usage_line, NeedsYou, SuggestedAction, ACTIVE_WINDOW_MS,
 };
-use btp_core::history::{health, EventKind, Health, ServerEvent};
+use btp_core::history::{health, EventKind, Health, LeakCause, ServerEvent};
 use btp_core::labels::{framework as framework_of, location_label, tool_label};
 use btp_core::model::{KillReason, KillTarget, ServerKey};
 use btp_core::observed::ObservedServer;
@@ -137,6 +137,10 @@ pub struct ServerViewFfi {
     /// min`, `excluded`, else `idle N min`.
     pub status_text: String,
     pub card: Option<CardFfi>,
+    /// The leak its card shows: `size` (above the memory threshold) or
+    /// `growth` (grew past the growth threshold in 10 min); `None` without
+    /// a leak card.
+    pub leak_kind: Option<String>,
     /// Restart is possible: still running, folder exists, environment
     /// readable, not excluded.
     pub can_restart: bool,
@@ -163,6 +167,7 @@ pub struct Live {
     pub can_restart: bool,
     pub process_count: u32,
     pub card: Option<CardFfi>,
+    pub leak_kind: Option<String>,
 }
 
 impl Default for Live {
@@ -180,6 +185,7 @@ impl Default for Live {
             can_restart: false,
             process_count: 0,
             card: None,
+            leak_kind: None,
         }
     }
 }
@@ -466,6 +472,7 @@ impl ServerViewFfi {
             in_use: v.in_use,
             status_text: status_text(v),
             card: l.card.clone(),
+            leak_kind: l.leak_kind.clone(),
             can_restart: l.can_restart,
             postponed: v.postponed_until_ms.is_some_and(|u| u > now_ms),
             uptime_ms: now_ms.saturating_sub(v.started_ms),
@@ -521,6 +528,7 @@ impl ServerViewFfi {
             in_use,
             status_text: status_text_observed(o, in_use, idle_ms),
             card: l.card.clone(),
+            leak_kind: l.leak_kind.clone(),
             can_restart: l.can_restart && !o.excluded,
             postponed: false,
             uptime_ms: now_ms.saturating_sub(started_ms),
@@ -576,6 +584,21 @@ fn live_of<P: Platform>(
         can_restart: !procs.is_empty() && w.can_restart(key),
         process_count: procs.len() as u32,
         card: card.map(Into::into),
+        leak_kind: leak_kind(card),
+    }
+}
+
+/// `size` or `growth` for a leak card, `None` for any other card or none.
+fn leak_kind(card: Option<&NeedsYou>) -> Option<String> {
+    match card {
+        Some(NeedsYou::Leak { cause, .. }) => Some(
+            match cause {
+                LeakCause::Size => "size",
+                LeakCause::Growth => "growth",
+            }
+            .to_string(),
+        ),
+        _ => None,
     }
 }
 
@@ -1206,7 +1229,7 @@ mod tests {
 
     #[test]
     fn card_maps_kind_reason_action() {
-        use btp_core::history::{LeakCause, MB};
+        use btp_core::history::MB;
         let leak = NeedsYou::Leak {
             rss_bytes: 900 * MB,
             growth_bytes: 600 * MB as i64,
@@ -1255,6 +1278,26 @@ mod tests {
     }
 
     #[test]
+    fn leak_kind_follows_the_card_cause() {
+        use btp_core::history::MB;
+        let leak = |cause| NeedsYou::Leak {
+            rss_bytes: 3000 * MB,
+            growth_bytes: 600 * MB as i64,
+            cause,
+        };
+        assert_eq!(
+            leak_kind(Some(&leak(LeakCause::Size))).as_deref(),
+            Some("size")
+        );
+        assert_eq!(
+            leak_kind(Some(&leak(LeakCause::Growth))).as_deref(),
+            Some("growth")
+        );
+        assert_eq!(leak_kind(Some(&NeedsYou::SessionEndedOpen)), None);
+        assert_eq!(leak_kind(None), None);
+    }
+
+    #[test]
     fn tracked_view_carries_live_facts() {
         let l = Live {
             rss_bytes: 600 * 1_048_576,
@@ -1269,6 +1312,7 @@ mod tests {
             can_restart: true,
             process_count: 3,
             card: Some(CardFfi::from(&NeedsYou::AboutToStop { in_ms: 1 })),
+            leak_kind: None,
         };
         let f = ServerViewFfi::tracked(&view(), &l, 5_000);
         assert!(f.managed && !f.excluded);

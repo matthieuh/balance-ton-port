@@ -10,7 +10,7 @@ struct MoreMenu: View {
 
     var body: some View {
         Menu {
-            ForEach(moreMenuItems(server), id: \.kind) { item in
+            ForEach(moreMenuItems(server, restarting: model.isRestarting(server.id)), id: \.kind) { item in
                 if item.kind == .separator {
                     Divider()
                 } else {

@@ -2,6 +2,7 @@ import SwiftUI
 
 @main
 struct BalanceTonPortApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var model = CoreModel()
 
     var body: some Scene {
@@ -17,5 +18,13 @@ struct BalanceTonPortApp: App {
             SettingsView()
                 .environmentObject(model)
         }
+    }
+}
+
+/// Sets up notifications before launch finishes, so a notification button
+/// that launched the app reaches it.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        _ = Notifier.shared
     }
 }

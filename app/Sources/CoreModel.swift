@@ -4,7 +4,9 @@ import Foundation
 /// Owns the Rust `Core` for the app's lifetime and publishes what the menu
 /// shows. Every `Core` call can block (kills wait up to `kill_grace_s` while
 /// holding the core's lock, a tick may run several kills), so all of them run
-/// on one serial background queue, never on the main thread.
+/// on one serial background queue, never on the main thread. Restart and the
+/// stop of a server no agent started are the exception: the core releases its
+/// lock while they wait, so they run on a concurrent queue and passes go on.
 @MainActor
 final class CoreModel: ObservableObject {
     /// Agent servers, then observed ones (`managed == false`, no agent).
@@ -38,6 +40,10 @@ final class CoreModel: ObservableObject {
 
     private let core = Core()
     private let queue = DispatchQueue(label: "com.matthieuh.balancetonport.core", qos: .utility)
+    /// Restart and observed Stop, which wait outside the core's lock.
+    private let actionQueue = DispatchQueue(
+        label: "com.matthieuh.balancetonport.actions", qos: .userInitiated, attributes: .concurrent
+    )
     private var timer: Timer?
     /// Servers killed by hand, with when. A pass already queued when the
     /// kill was requested can still report them; they stay hidden until
@@ -51,8 +57,20 @@ final class CoreModel: ObservableObject {
     private var optimistic: [ServerID: (since: Int, apply: (ServerViewFfi) -> ServerViewFfi)] = [:]
     /// Passes enqueued so far.
     private var passCount = 0
+    /// Restarts running, with the row as it was: it stays in the menu, saying
+    /// "restarting…", even when a pass taken meanwhile no longer lists the
+    /// old process. `doneAt` is `passCount` when the core returned; the first
+    /// pass enqueued after that lets it go.
+    private var restarts: [ServerID: (row: ServerViewFfi, doneAt: Int?)] = [:]
+    /// A confirmation is on screen: another one is not stacked over it.
+    private var confirming = false
+    /// The first pass has landed, so a server can be looked up.
+    private var firstPassDone = false
+    /// Work waiting for the first pass (a notification button pressed at
+    /// launch).
+    private var afterFirstPass: [() -> Void] = []
     private let killedHoldTime: TimeInterval = 30
-    private let notifier = Notifier()
+    private let notifier = Notifier.shared
 
     init() {
         notifier.onAction = { [weak self] route in
@@ -145,7 +163,7 @@ final class CoreModel: ObservableObject {
     /// Stop from the menu: an agent server at once (`kill`), a server no
     /// agent started after the confirmation. Never an excluded one.
     func stop(_ server: ServerViewFfi) {
-        guard !server.excluded else { return }
+        guard canStopNow(server, restarting: isRestarting(server.id)) else { return }
         guard needsConfirmation(server) else {
             kill(server.id)
             return
@@ -156,11 +174,12 @@ final class CoreModel: ObservableObject {
     /// Stops a server no agent started (already confirmed). The row leaves
     /// at once, like a kill.
     private func stopObserved(_ id: ServerID) {
+        guard !isRestarting(id) else { return }
         killedByHand[id] = Date()
         publish()
         Task {
             do {
-                let (record, kills) = try await onCore { core in
+                let (record, kills) = try await onActionQueue { core in
                     let record = try core.stopObserved(pid: id.pid, startTime: id.startTime)
                     return (record, try core.recentKills())
                 }
@@ -184,21 +203,30 @@ final class CoreModel: ObservableObject {
     /// Restart: stops the server and starts it again the same way (a server
     /// no agent started after the confirmation). The row says
     /// "restarting…" at once; the core call blocks for the kill grace plus
-    /// up to 5 s, on the core queue. A refused Restart shows its reason in
-    /// the row for `blockedNoteDuration`; a done one leaves the note until
-    /// the next pass, which lists the new process instead.
+    /// up to 5 s, on the action queue, while passes go on. A refused Restart
+    /// (`Already restarting` included) shows its reason in the row for
+    /// `blockedNoteDuration`; a done one keeps the row until the next pass,
+    /// which lists the new process instead.
     func restart(_ server: ServerViewFfi) {
-        guard server.canRestart, rowNotes[server.id] != .restarting else { return }
+        guard canRestartNow(server, restarting: isRestarting(server.id)) else { return }
         guard needsConfirmation(server) else {
-            runRestart(server.id)
+            runRestart(server)
             return
         }
-        confirm(server, .restart) { [weak self] in self?.runRestart(server.id) }
+        confirm(server, .restart) { [weak self] in self?.runRestart(server) }
+    }
+
+    func isRestarting(_ id: ServerID) -> Bool {
+        restarts[id] != nil
     }
 
     /// A leak notification's Restart: the app is brought forward, so the
     /// confirmation of a server no agent started shows on top.
     private func restartFromNotification(_ id: ServerID) {
+        guard firstPassDone else {
+            afterFirstPass.append { [weak self] in self?.restartFromNotification(id) }
+            return
+        }
         guard let server = lastPassServers.first(where: { $0.id == id }) else {
             killNotice = missedRestartNotice
             killNoticeAt = Date()
@@ -208,14 +236,28 @@ final class CoreModel: ObservableObject {
         restart(server)
     }
 
-    private func runRestart(_ id: ServerID) {
+    private func runRestart(_ server: ServerViewFfi) {
+        let id = server.id
+        // Checked again here: a confirmation may have waited on screen.
+        guard !isRestarting(id) else { return }
+        restarts[id] = (server, nil)
         rowNotes[id] = .restarting
         Task {
             do {
-                let blocked = try await onCore { core in try core.restart(pid: id.pid, startTime: id.startTime) }
-                if let blocked { showBlocked(blocked, for: id) }
+                let blocked = try await onActionQueue { core in
+                    try core.restart(pid: id.pid, startTime: id.startTime)
+                }
+                if let blocked {
+                    restarts[id] = nil
+                    showBlocked(blocked, for: id)
+                    publish()
+                } else {
+                    restarts[id]?.doneAt = passCount
+                }
             } catch {
+                restarts[id] = nil
                 rowNotes[id] = nil
+                publish()
                 lastError = error.localizedDescription
             }
         }
@@ -280,10 +322,14 @@ final class CoreModel: ObservableObject {
     /// Shows the confirmation for a server no agent started, then runs
     /// `action` when the user agrees. Run from the main run loop, outside
     /// any main-queue job, so passes keep landing while the alert is up.
+    /// One at a time: a request while one is open is dropped. Return is
+    /// Cancel, so a stray key never stops a server.
     private func confirm(_ server: ServerViewFfi, _ action: ConfirmAction, then run: @escaping @MainActor () -> Void) {
+        guard !confirming else { return }
+        confirming = true
         let text = confirmationText(server, action: action)
         RunLoop.main.perform(inModes: [.common]) {
-            MainActor.assumeIsolated {
+            MainActor.assumeIsolated { [weak self] in
                 NSApp.activate(ignoringOtherApps: true)
                 let alert = NSAlert()
                 alert.alertStyle = .warning
@@ -291,8 +337,12 @@ final class CoreModel: ObservableObject {
                 alert.informativeText = text.message
                 let button = alert.addButton(withTitle: text.button)
                 button.hasDestructiveAction = action == .stop
-                alert.addButton(withTitle: "Cancel")
-                if alert.runModal() == .alertFirstButtonReturn { run() }
+                button.keyEquivalent = ""
+                let cancel = alert.addButton(withTitle: "Cancel")
+                cancel.keyEquivalent = "\r"
+                let agreed = alert.runModal() == .alertFirstButtonReturn
+                self?.confirming = false
+                if agreed { run() }
             }
         }
     }
@@ -311,7 +361,9 @@ final class CoreModel: ObservableObject {
     /// The rows the menu shows: the last pass, without the servers stopped
     /// by hand, with the changes the core has not confirmed yet.
     private func publish() {
-        servers = lastPassServers
+        let listed = Set(lastPassServers.map(\.id))
+        let held = restarts.filter { !listed.contains($0.key) }.map(\.value.row)
+        servers = (lastPassServers + held)
             .filter { killedByHand[$0.id] == nil }
             .map { optimistic[$0.id]?.apply($0) ?? $0 }
     }
@@ -408,9 +460,21 @@ final class CoreModel: ObservableObject {
             lastPassServers = result.servers
             // This pass was enqueued after those actions: it shows them.
             optimistic = optimistic.filter { $0.value.since >= generation }
+            for (id, restart) in restarts {
+                if let done = restart.doneAt, generation > done {
+                    restarts[id] = nil
+                    if rowNotes[id] == .restarting { rowNotes[id] = nil }
+                }
+            }
             let live = Set(result.servers.map(\.id))
-            rowNotes = rowNotes.filter { live.contains($0.key) }
+            rowNotes = rowNotes.filter { live.contains($0.key) || restarts[$0.key] != nil }
             publish()
+            if !firstPassDone {
+                firstPassDone = true
+                let waiting = afterFirstPass
+                afterFirstPass = []
+                waiting.forEach { $0() }
+            }
             memory = result.memory
             recentKills = result.kills
             loadIcons(for: result.servers)
@@ -526,6 +590,17 @@ final class CoreModel: ObservableObject {
         // tracking mode), not only in the default mode.
         RunLoop.main.add(next, forMode: .common)
         timer = next
+    }
+
+    /// Runs `work` on the concurrent action queue (Restart, observed Stop):
+    /// the core takes its lock only for the parts that need it.
+    private func onActionQueue<T: Sendable>(_ work: @escaping @Sendable (Core) throws -> T) async throws -> T {
+        let core = self.core
+        return try await withCheckedThrowingContinuation { continuation in
+            actionQueue.async {
+                continuation.resume(with: Result { try work(core) })
+            }
+        }
     }
 
     /// Runs `work` on the core's serial queue.
