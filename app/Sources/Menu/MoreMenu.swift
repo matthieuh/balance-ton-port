@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// The ⋯ button and its menu, the same for every server. Keep and Stop call
-/// through for agent servers; the other items wait for their actions.
+/// through for agent servers; items without an action yet are disabled.
 struct MoreMenu: View {
     let server: ServerViewFfi
     var onKeep: (() -> Void)?
@@ -11,14 +11,14 @@ struct MoreMenu: View {
 
     var body: some View {
         Menu {
-            Button("\u{2197} Open in browser") {}
-            Button("\u{27F3} Restart") {}.disabled(!server.canRestart)
-            Button("\u{23F8} Keep (no alerts)") { onKeep?() }
-            Button("\u{2298} Ignore this alert") {}.disabled(server.card == nil)
+            Button("\u{2197} Open in browser") {}.disabled(true)
+            Button("\u{27F3} Restart") {}.disabled(true)
+            Button("\u{23F8} Keep (no alerts)") { onKeep?() }.disabled(onKeep == nil)
+            Button("\u{2298} Ignore this alert") {}.disabled(true)
             Divider()
-            Button("\u{24D8} Details\u{2026}") {}
+            Button("\u{24D8} Details\u{2026}") {}.disabled(true)
             if !server.excluded {
-                Button("\u{25A0} Stop", role: .destructive) { onStop?() }
+                Button("\u{25A0} Stop", role: .destructive) { onStop?() }.disabled(onStop == nil)
             }
         } label: {
             Text(verbatim: "\u{22EF}")
@@ -34,10 +34,14 @@ struct MoreMenu: View {
     }
 }
 
-/// Every pill and capsule button: plain, pressed at `pressScale`.
+/// Every pill and capsule button: plain, pressed at `pressScale`, faded
+/// while disabled.
 struct PressableStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
+
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
+            .opacity(isEnabled ? 1 : 0.45)
             .scaleEffect(configuration.isPressed ? pressScale : 1)
             .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
     }

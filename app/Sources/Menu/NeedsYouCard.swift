@@ -2,7 +2,8 @@ import AppKit
 import SwiftUI
 
 /// A server that needs a decision: what it is, why, and the one suggested
-/// action (plus ⋯). The pill is drawn here; its action comes later.
+/// action (plus ⋯). Only Stop on an agent server acts yet; the other pills
+/// are disabled until their actions exist.
 struct NeedsYouCard: View {
     let server: ServerViewFfi
     let card: CardFfi
@@ -49,7 +50,8 @@ struct NeedsYouCard: View {
 
     private func actionPill(tint: Color) -> some View {
         let prominent = cardActionIsProminent(card)
-        return Button {} label: {
+        let action = card.action == "stop" ? onStop : nil
+        return Button { action?() } label: {
             Text(verbatim: cardActionLabel(card))
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(prominent ? Color.black.opacity(0.85) : Color.primary)
@@ -59,5 +61,6 @@ struct NeedsYouCard: View {
                 .contentShape(Capsule())
         }
         .buttonStyle(PressableStyle())
+        .disabled(action == nil)
     }
 }

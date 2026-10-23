@@ -10,8 +10,10 @@ struct RowCapsule: View {
     var body: some View {
         HStack(spacing: 2) {
             pill("\u{2197} Open", color: .primary.opacity(0.8)) {}
+                .disabled(true)
             if !server.excluded {
                 pill("\u{25A0} Stop", color: .red) { onStop?() }
+                    .disabled(onStop == nil)
             }
             MoreMenu(server: server, onKeep: onKeep, onStop: onStop, bare: true)
         }

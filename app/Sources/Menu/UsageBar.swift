@@ -15,7 +15,7 @@ struct UsageBar: View {
                     healthColor("green").frame(width: w * seg.green)
                     healthColor("amber").frame(width: w * seg.amber)
                     healthColor("red").frame(width: w * seg.red)
-                    Color.clear.frame(width: 1)
+                    Color(nsColor: .windowBackgroundColor).frame(width: 1)
                     Color.secondary.opacity(0.45).frame(width: max(0, w * seg.apps - 1))
                     Spacer(minLength: 0)
                 }

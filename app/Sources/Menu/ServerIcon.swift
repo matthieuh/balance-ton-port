@@ -21,17 +21,18 @@ struct ServerIcon: View {
             } else {
                 let tile = iconTile(server)
                 ZStack {
-                    tile.background ?? Color.primary.opacity(scheme == .dark ? 0.1 : 0.07)
+                    if let colors = tile.background {
+                        LinearGradient(colors: colors, startPoint: .topLeading, endPoint: .bottomTrailing)
+                    } else {
+                        Color.primary.opacity(scheme == .dark ? 0.1 : 0.07)
+                    }
                     if let symbol = tile.symbol {
                         Image(systemName: symbol).font(.system(size: 11, weight: .semibold))
                     } else {
                         Text(verbatim: tile.letter).font(.system(size: 11, weight: .bold))
                     }
                 }
-                .foregroundStyle(
-                    tile.foreground ?? (tile.background == nil
-                        ? portColor(server.port, dark: scheme == .dark) : .white)
-                )
+                .foregroundStyle(tile.background == nil ? portColor(server.port, dark: scheme == .dark) : .white)
             }
         }
         .frame(width: 22, height: 22)
