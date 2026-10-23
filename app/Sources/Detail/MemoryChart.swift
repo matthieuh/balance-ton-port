@@ -13,7 +13,7 @@ struct MemoryChart: View {
     let rssBytes: UInt64
     let cpuPct: Float
     let health: String
-    /// The chart's right edge; now, except in a rendering from a fixture.
+    /// The chart's right edge: now.
     var end = Date()
     @Environment(\.colorScheme) private var scheme
 

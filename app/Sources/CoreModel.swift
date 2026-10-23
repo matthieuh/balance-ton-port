@@ -82,10 +82,12 @@ final class CoreModel: ObservableObject {
         notifier.onAction = { [weak self] route in
             guard let self else { return }
             switch route {
-            case .server(.kill, let id): self.kill(id, fromNotification: true)
-            case .server(.keep, let id): self.keep(id)
-            case .server(.restart, let id): self.restartFromNotification(id)
-            case .server(.ignoreAlert, let id): self.ignoreAlert(id)
+            // A button pressed at launch looks the server up in the first
+            // pass.
+            case .server(.kill, let id): self.afterFirstPassDone { $0.kill(id, fromNotification: true) }
+            case .server(.keep, let id): self.afterFirstPassDone { $0.keep(id) }
+            case .server(.restart, let id): self.afterFirstPassDone { $0.restartFromNotification(id) }
+            case .server(.ignoreAlert, let id): self.afterFirstPassDone { $0.ignoreAlert(id) }
             case .sessionEnded(.stopNow, let id): self.stopSessionEnded(id)
             case .sessionEnded(.keep, let id): self.keepSessionEnded(id)
             }
@@ -226,13 +228,20 @@ final class CoreModel: ObservableObject {
         restartingIDs.contains(id)
     }
 
+    /// Runs `work` now, or once the first pass has landed.
+    private func afterFirstPassDone(_ work: @escaping (CoreModel) -> Void) {
+        guard firstPassDone else {
+            afterFirstPass.append { [weak self] in
+                if let self { work(self) }
+            }
+            return
+        }
+        work(self)
+    }
+
     /// A leak notification's Restart: the app is brought forward, so the
     /// confirmation of a server no agent started shows on top.
     private func restartFromNotification(_ id: ServerID) {
-        guard firstPassDone else {
-            afterFirstPass.append { [weak self] in self?.restartFromNotification(id) }
-            return
-        }
         guard let server = lastPassServers.first(where: { $0.id == id }) else {
             killNotice = missedRestartNotice
             killNoticeAt = Date()
