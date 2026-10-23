@@ -264,6 +264,8 @@ pub struct LeakState {
     /// "Ignore this alert": the memory at that moment. The alert stays
     /// dismissed until memory grows `LEAK_REARM_MB` more.
     pub ignored_at_rss: Option<u64>,
+    /// Since when the server has not been a leak, pass after pass.
+    pub clear_since_ms: Option<u64>,
 }
 
 /// What one pass decided about a server's leak alert.
@@ -273,36 +275,62 @@ pub struct LeakUpdate {
     pub shown: Option<Leak>,
     /// Report it for a notification (shown and not notified yet).
     pub notify: bool,
-    /// An ignored alert came back this pass.
+    /// The alert re-armed this pass: ignored then grew `LEAK_REARM_MB`
+    /// more, or no leak for `GROWTH_WINDOW_MS` in a row.
     pub rearmed: bool,
 }
 
+/// What one pass decided for every server.
+#[derive(Debug, Default, PartialEq)]
+pub struct LeakPass {
+    /// The leak each card shows.
+    pub shown: HashMap<ServerKey, Leak>,
+    /// Due a notification, in input order.
+    pub due: Vec<ServerKey>,
+    /// Re-armed: their history alert can be recorded again.
+    pub rearmed: Vec<ServerKey>,
+}
+
 /// The leak alerts of every server, in memory only. One notification per
-/// leak: a leak stays notified while its server lives, unless it was
-/// ignored and memory then grew `LEAK_REARM_MB` more.
+/// leak. A leak re-arms when it was ignored and memory then grew
+/// `LEAK_REARM_MB` more, or once the server has not leaked for a whole
+/// `GROWTH_WINDOW_MS` (so a leak that comes back is a new one, and a server
+/// hovering at a threshold is not notified on every crossing).
 #[derive(Debug, Default)]
 pub struct LeakAlerts {
     states: HashMap<ServerKey, LeakState>,
-    shown: HashSet<ServerKey>,
 }
 
 impl LeakAlerts {
     /// One pass for a server with memory `rss_bytes`, leaking or not.
-    pub fn update(&mut self, key: ServerKey, rss_bytes: u64, leak: Option<Leak>) -> LeakUpdate {
+    pub fn update(
+        &mut self,
+        key: ServerKey,
+        rss_bytes: u64,
+        leak: Option<Leak>,
+        now_ms: u64,
+    ) -> LeakUpdate {
         let st = self.states.entry(key).or_default();
         let mut rearmed = false;
         if let Some(at) = st.ignored_at_rss {
             if rss_bytes >= at.saturating_add(LEAK_REARM_MB * MB) {
-                *st = LeakState::default();
+                st.ignored_at_rss = None;
+                st.notified = false;
+                rearmed = true;
+            }
+        }
+        if leak.is_some() {
+            st.clear_since_ms = None;
+        } else {
+            let since = *st.clear_since_ms.get_or_insert(now_ms);
+            let settled = now_ms.saturating_sub(since) >= GROWTH_WINDOW_MS;
+            if settled && (st.notified || st.ignored_at_rss.is_some()) {
+                st.notified = false;
+                st.ignored_at_rss = None;
                 rearmed = true;
             }
         }
         let shown = leak.filter(|_| st.ignored_at_rss.is_none());
-        if shown.is_some() {
-            self.shown.insert(key);
-        } else {
-            self.shown.remove(&key);
-        }
         LeakUpdate {
             shown,
             notify: shown.is_some() && !st.notified,
@@ -310,13 +338,35 @@ impl LeakAlerts {
         }
     }
 
-    pub fn state(&self, key: ServerKey) -> LeakState {
-        self.states.get(&key).copied().unwrap_or_default()
+    /// `update` for each of `keys`, from the history's latest sample and
+    /// growth.
+    pub fn pass(
+        &mut self,
+        history: &History,
+        keys: &[ServerKey],
+        cfg: &Config,
+        now_ms: u64,
+    ) -> LeakPass {
+        let mut out = LeakPass::default();
+        for &key in keys {
+            let rss = history.samples(key).last().map_or(0, |s| s.rss_bytes);
+            let growth = history.growth_bytes(key, now_ms);
+            let u = self.update(key, rss, leak(rss, growth, cfg), now_ms);
+            if u.rearmed {
+                out.rearmed.push(key);
+            }
+            if u.notify {
+                out.due.push(key);
+            }
+            if let Some(l) = u.shown {
+                out.shown.insert(key, l);
+            }
+        }
+        out
     }
 
-    /// The last pass showed a leak card for this server.
-    pub fn is_shown(&self, key: ServerKey) -> bool {
-        self.shown.contains(&key)
+    pub fn state(&self, key: ServerKey) -> LeakState {
+        self.states.get(&key).copied().unwrap_or_default()
     }
 
     pub fn mark_notified(&mut self, key: ServerKey) {
@@ -326,12 +376,10 @@ impl LeakAlerts {
     /// Dismisses the current alert at memory `rss_bytes`.
     pub fn ignore(&mut self, key: ServerKey, rss_bytes: u64) {
         self.states.entry(key).or_default().ignored_at_rss = Some(rss_bytes);
-        self.shown.remove(&key);
     }
 
     pub fn retain(&mut self, live: &HashSet<ServerKey>) {
         self.states.retain(|k, _| live.contains(k));
-        self.shown.retain(|k| live.contains(k));
     }
 }
 
@@ -393,21 +441,68 @@ mod tests {
         let mut a = LeakAlerts::default();
         let k = key(1);
         let big = |r| leak(r, 0, &c);
-        let u = a.update(k, mb(3000), big(mb(3000)));
+        let u = a.update(k, mb(3000), big(mb(3000)), 0);
         assert!(u.notify && u.shown.is_some() && !u.rearmed);
-        assert!(a.update(k, mb(3000), big(mb(3000))).notify);
+        assert!(a.update(k, mb(3000), big(mb(3000)), 1).notify);
         a.mark_notified(k);
-        let u = a.update(k, mb(3000), big(mb(3000)));
+        let u = a.update(k, mb(3000), big(mb(3000)), 2);
         assert!(!u.notify && u.shown.is_some());
         a.ignore(k, mb(3000));
-        assert!(!a.is_shown(k));
-        let u = a.update(k, mb(3499), big(mb(3499)));
+        let u = a.update(k, mb(3499), big(mb(3499)), 3);
         assert_eq!(u, LeakUpdate::default());
-        let u = a.update(k, mb(3500), big(mb(3500)));
+        let u = a.update(k, mb(3500), big(mb(3500)), 4);
         assert!(u.rearmed && u.notify && u.shown.is_some());
         assert_eq!(a.state(k), LeakState::default());
         a.retain(&HashSet::new());
-        assert!(!a.is_shown(k));
+        assert_eq!(a.state(k), LeakState::default());
+    }
+
+    #[test]
+    fn leak_rearms_after_ten_minutes_without_one() {
+        let c = Config::default();
+        let mut a = LeakAlerts::default();
+        let k = key(1);
+        let min = 60_000;
+        a.update(k, mb(3000), leak(mb(3000), 0, &c), 0);
+        a.mark_notified(k);
+        // Back under the threshold, then over again within 10 min: the
+        // same leak, not notified again.
+        assert!(!a.update(k, mb(100), None, min).rearmed);
+        assert!(!a.update(k, mb(100), None, 9 * min).rearmed);
+        assert!(
+            !a.update(k, mb(3000), leak(mb(3000), 0, &c), 10 * min)
+                .notify
+        );
+        // Ten minutes in a row without a leak: the next one is new.
+        assert!(!a.update(k, mb(100), None, 11 * min).rearmed);
+        assert!(a.update(k, mb(100), None, 21 * min).rearmed);
+        assert!(!a.update(k, mb(100), None, 22 * min).rearmed);
+        assert!(
+            a.update(k, mb(3000), leak(mb(3000), 0, &c), 23 * min)
+                .notify
+        );
+        // An ignored leak that settles comes back the same way.
+        a.ignore(k, mb(3000));
+        a.update(k, mb(100), None, 24 * min);
+        assert!(a.update(k, mb(100), None, 34 * min).rearmed);
+        assert!(
+            a.update(k, mb(3000), leak(mb(3000), 0, &c), 35 * min)
+                .notify
+        );
+    }
+
+    #[test]
+    fn leak_pass_reads_the_history() {
+        let c = Config::default();
+        let mut h = History::default();
+        h.record(key(1), 0, &[((1, 1), res(mb(3000), 0))]);
+        h.record(key(2), 0, &[((2, 1), res(mb(10), 0))]);
+        let mut a = LeakAlerts::default();
+        let p = a.pass(&h, &[key(1), key(2)], &c, 0);
+        assert_eq!(p.due, vec![key(1)]);
+        assert_eq!(p.shown.len(), 1);
+        assert_eq!(p.shown[&key(1)].cause, LeakCause::Size);
+        assert!(p.rearmed.is_empty());
     }
 
     #[test]

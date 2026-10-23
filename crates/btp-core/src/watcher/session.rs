@@ -731,6 +731,23 @@ mod tests {
     }
 
     #[test]
+    fn a_postpone_delays_the_session_end_schedule_and_the_waiter() {
+        let mut f = fx();
+        hook(&f);
+        tracked(&mut f);
+        assert!(f.w.postpone_at(key30(), T0).unwrap());
+        let r = end(&mut f, T0);
+        assert_eq!(r.sweep_at, Some(T0 + crate::watcher::POSTPONE_MS));
+        quit(&f);
+        let out = sweep(&mut f, T0 + DEAD_IDLE);
+        assert!(out.killed.is_empty());
+        assert_eq!(out.next_at, Some(T0 + crate::watcher::POSTPONE_MS));
+        assert!(f.p().is_alive(30));
+        let out = sweep(&mut f, T0 + crate::watcher::POSTPONE_MS);
+        assert_eq!(out.killed.len(), 1);
+    }
+
+    #[test]
     fn a_done_note_is_due_at_once() {
         let mut f = fx();
         hook(&f);

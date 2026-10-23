@@ -3,9 +3,11 @@
 
 use crate::agents::AgentKind;
 use crate::history::{Leak, LeakCause, MB};
+use crate::model::ServerKey;
 use crate::observed::ObservedServer;
 use crate::state::SessionEndedGroup;
 use crate::watcher::ServerView;
+use std::collections::{HashMap, HashSet};
 
 /// A server with no port activity for less than this counts as `active`.
 pub const ACTIVE_WINDOW_MS: u64 = 60_000;
@@ -173,6 +175,33 @@ pub fn needs_you(
         }),
         _ => None,
     }
+}
+
+/// Every "Needs you" card of a pass: tracked servers in `servers` order
+/// (`needs_you`), then observed servers, which only ever show a leak.
+/// `leaks` holds the leak each card shows, `ended_open` the servers still
+/// open after their session ended, `idle_alerts` the servers whose idle
+/// alert card shows.
+pub fn needs_you_cards(
+    servers: &[ServerView],
+    observed: &[ObservedServer],
+    leaks: &HashMap<ServerKey, Leak>,
+    ended_open: &HashSet<ServerKey>,
+    idle_alerts: &HashSet<ServerKey>,
+) -> Vec<(ServerKey, NeedsYou)> {
+    let tracked = servers.iter().filter_map(|v| {
+        let n = needs_you(
+            v,
+            leaks.get(&v.key).copied(),
+            ended_open.contains(&v.key),
+            idle_alerts.contains(&v.key),
+        );
+        n.map(|n| (v.key, n))
+    });
+    let observed = observed
+        .iter()
+        .filter_map(|o| leaks.get(&o.key).map(|&l| (o.key, NeedsYou::from(l))));
+    tracked.chain(observed).collect()
 }
 
 /// The one-sentence reason on a card.
@@ -394,6 +423,38 @@ mod tests {
             None
         );
         assert!(needs_you(&dead(ABOUT_TO_STOP_MS), None, false, false).is_some());
+    }
+
+    #[test]
+    fn cards_list_tracked_then_observed_leaks() {
+        let key = |pid| ServerKey { pid, start_time: 1 };
+        let a = ServerView {
+            key: key(1),
+            ..dead(MIN)
+        };
+        let b = ServerView {
+            key: key(2),
+            ..view(true, 0)
+        };
+        let o = |pid| ObservedServer {
+            key: key(pid),
+            port: 4000,
+            ports: vec![4000],
+            command: "next dev".into(),
+            cwd: None,
+            excluded: false,
+        };
+        let leaks = HashMap::from([(key(2), size_leak(mb(3000))), (key(9), size_leak(mb(3000)))]);
+        let idle = HashSet::from([key(8)]);
+        let cards = needs_you_cards(&[a, b], &[o(8), o(9)], &leaks, &HashSet::new(), &idle);
+        assert_eq!(
+            cards,
+            vec![
+                (key(1), NeedsYou::AboutToStop { in_ms: MIN }),
+                (key(2), size_leak(mb(3000)).into()),
+                (key(9), size_leak(mb(3000)).into()),
+            ]
+        );
     }
 
     #[test]

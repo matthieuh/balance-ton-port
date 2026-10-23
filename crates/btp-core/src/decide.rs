@@ -47,13 +47,34 @@ pub fn decide(
             continue;
         }
         if !s.is_kept() && !s.alerted {
-            let idle = port_idle.max(o.session_idle_ms.unwrap_or(0));
+            let idle = alert_idle_ms(s, o, now_ms);
             if idle >= alert_ms {
                 actions.push(Action::Alert { key, idle_ms: idle });
             }
         }
     }
     actions
+}
+
+/// The idle time the live-session alert compares: port idle, or the
+/// session's idle time when larger.
+pub fn alert_idle_ms(s: &TrackedServer, o: &Observation, now_ms: u64) -> u64 {
+    now_ms
+        .saturating_sub(s.last_active_ms)
+        .max(o.session_idle_ms.unwrap_or(0))
+}
+
+/// The idle period the alert is about has ended (its idle time is back
+/// under the alert delay): the alert can fire again later. An open
+/// connection alone is not enough while the session itself stays idle.
+pub fn idle_period_over(s: &TrackedServer, o: &Observation, now_ms: u64, cfg: &Config) -> bool {
+    o.alive && alert_idle_ms(s, o, now_ms) < cfg.alert_after_s.saturating_mul(1000)
+}
+
+/// A delivered idle alert still applies: the session lives, the server is
+/// not kept and is still idle by the alert rule (its card stays).
+pub fn idle_alert_holds(s: &TrackedServer, o: &Observation, now_ms: u64, cfg: &Config) -> bool {
+    s.alerted && !s.is_kept() && o.alive && o.session_alive && !idle_period_over(s, o, now_ms, cfg)
 }
 
 /// Records port activity: any established connection resets the idle clock.
@@ -356,6 +377,33 @@ mod tests {
                 reason: KillReason::WorktreeDeleted
             }]
         );
+    }
+
+    #[test]
+    fn idle_period_ends_only_under_the_alert_delay() {
+        let cfg = Config::default();
+        let mut s = server(1);
+        s.alerted = true;
+        let mut o = obs(1);
+        // Port used now, but the session has been idle 40 min: still idle.
+        s.last_active_ms = 100 * MIN;
+        o.session_idle_ms = Some(40 * MIN);
+        assert!(!idle_period_over(&s, &o, 100 * MIN, &cfg));
+        assert!(idle_alert_holds(&s, &o, 100 * MIN, &cfg));
+        // The session is busy again: the period is over.
+        o.session_idle_ms = None;
+        assert!(idle_period_over(&s, &o, 100 * MIN, &cfg));
+        assert!(!idle_alert_holds(&s, &o, 100 * MIN, &cfg));
+        // Kept, dead session or not delivered: no card.
+        o.session_idle_ms = Some(40 * MIN);
+        s.kept = true;
+        assert!(!idle_alert_holds(&s, &o, 100 * MIN, &cfg));
+        s.kept = false;
+        o.session_alive = false;
+        assert!(!idle_alert_holds(&s, &o, 100 * MIN, &cfg));
+        o.session_alive = true;
+        s.alerted = false;
+        assert!(!idle_alert_holds(&s, &o, 100 * MIN, &cfg));
     }
 
     #[test]
