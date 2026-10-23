@@ -61,7 +61,11 @@ final class CoreModel: ObservableObject {
     /// "restarting…", even when a pass taken meanwhile no longer lists the
     /// old process. `doneAt` is `passCount` when the core returned; the first
     /// pass enqueued after that lets it go.
-    private var restarts: [ServerID: (row: ServerViewFfi, doneAt: Int?)] = [:]
+    private var restarts: [ServerID: (row: ServerViewFfi, doneAt: Int?)] = [:] {
+        didSet { restartingIDs = Set(restarts.keys) }
+    }
+    /// The servers being restarted: their Stop and Restart are disabled.
+    @Published private(set) var restartingIDs: Set<ServerID> = []
     /// A confirmation is on screen: another one is not stacked over it.
     private var confirming = false
     /// The first pass has landed, so a server can be looked up.
@@ -217,7 +221,7 @@ final class CoreModel: ObservableObject {
     }
 
     func isRestarting(_ id: ServerID) -> Bool {
-        restarts[id] != nil
+        restartingIDs.contains(id)
     }
 
     /// A leak notification's Restart: the app is brought forward, so the
@@ -322,8 +326,8 @@ final class CoreModel: ObservableObject {
     /// Shows the confirmation for a server no agent started, then runs
     /// `action` when the user agrees. Run from the main run loop, outside
     /// any main-queue job, so passes keep landing while the alert is up.
-    /// One at a time: a request while one is open is dropped. Return is
-    /// Cancel, so a stray key never stops a server.
+    /// One at a time: a request while one is open is dropped. Return and
+    /// Escape are Cancel; no key ever confirms.
     private func confirm(_ server: ServerViewFfi, _ action: ConfirmAction, then run: @escaping @MainActor () -> Void) {
         guard !confirming else { return }
         confirming = true
@@ -340,7 +344,15 @@ final class CoreModel: ObservableObject {
                 button.keyEquivalent = ""
                 let cancel = alert.addButton(withTitle: "Cancel")
                 cancel.keyEquivalent = "\r"
+                // Escape cancels too (Return on Cancel replaced NSAlert's
+                // own Escape).
+                let escape = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                    guard event.keyCode == 53 else { return event }
+                    cancel.performClick(nil)
+                    return nil
+                }
                 let agreed = alert.runModal() == .alertFirstButtonReturn
+                if let escape { NSEvent.removeMonitor(escape) }
                 self?.confirming = false
                 if agreed { run() }
             }
