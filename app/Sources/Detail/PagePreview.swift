@@ -11,37 +11,73 @@ import WebKit
 final class PreviewStore: ObservableObject {
     static let shared = PreviewStore()
 
-    @Published private(set) var images: [ServerID: NSImage] = [:]
-    private var takenAt: [ServerID: Date] = [:]
-    private var running: [ServerID: PagePreview] = [:]
+    @Published private(set) var images: [ServerID: (image: NSImage, at: Date)] = [:]
+    /// When the last attempt started, per server: the next waits a full TTL.
+    private var triedAt: [ServerID: Date] = [:]
+    /// The one snapshot in flight, if any (the panel shows one detail).
+    private var running: (id: ServerID, preview: PagePreview)?
+    /// The port the stored rule list was compiled for.
+    private var rulesPort: UInt16?
+    private var cleaned = false
 
     private init() {}
 
-    /// The last snapshot, kept while the detail is open even once stale.
+    /// The snapshot, while it is younger than `previewCacheTTL`.
     func image(for id: ServerID) -> NSImage? {
-        images[id]
+        guard let entry = images[id], previewCacheFresh(takenAt: entry.at) else { return nil }
+        return entry.image
     }
 
-    /// Starts a snapshot when the server is in use and none is fresh or
-    /// running. An attempt (failed or not) waits a full TTL before the next.
+    /// Starts a snapshot when the server is in use, none is running and the
+    /// last attempt is older than the TTL; drops a stale image.
     func refresh(_ s: ServerViewFfi) {
         let id = s.id
-        guard shouldSnapshot(s), running[id] == nil else { return }
-        if let at = takenAt[id], previewCacheFresh(takenAt: at) { return }
-        takenAt[id] = Date()
-        let preview = PagePreview(port: s.port) { [weak self] image in
+        if let entry = images[id], !previewCacheFresh(takenAt: entry.at) { images[id] = nil }
+        guard shouldSnapshot(s), running == nil else { return }
+        if let at = triedAt[id], previewCacheFresh(takenAt: at) { return }
+        triedAt[id] = Date()
+        let preview = PagePreview(port: s.port, rules: { [weak self] port in await self?.rules(for: port) }) {
+            [weak self] image in
             guard let self else { return }
-            self.running[id] = nil
-            if let image { self.images[id] = image }
+            if self.running?.id == id { self.running = nil }
+            if let image { self.images[id] = (image, Date()) }
         }
-        running[id] = preview
+        running = (id, preview)
         preview.start()
+    }
+
+    /// The detail closed: its image goes.
+    func drop(_ id: ServerID) {
+        images[id] = nil
     }
 
     /// Forgets the previews of servers that are gone.
     func retain(_ live: Set<ServerID>) {
         images = images.filter { live.contains($0.key) }
-        takenAt = takenAt.filter { live.contains($0.key) }
+        triedAt = triedAt.filter { live.contains($0.key) }
+        if let r = running, !live.contains(r.id) { running = nil }
+    }
+
+    /// The rule list for `port`, stored under the one `previewRuleListID`:
+    /// looked up when it was compiled for this port, compiled (replacing
+    /// it) otherwise.
+    private func rules(for port: UInt16) async -> WKContentRuleList? {
+        let store = WKContentRuleListStore.default()
+        if !cleaned {
+            cleaned = true
+            // Lists stored one per port by an earlier build.
+            for old in await store?.availableIdentifiers() ?? [] where old.hasPrefix(previewRuleListID + "-") {
+                try? await store?.removeContentRuleList(forIdentifier: old)
+            }
+        }
+        if rulesPort == port, let list = try? await store?.contentRuleList(forIdentifier: previewRuleListID) {
+            return list
+        }
+        let list = try? await store?.compileContentRuleList(
+            forIdentifier: previewRuleListID, encodedContentRuleList: previewContentRules(port: port)
+        )
+        rulesPort = list == nil ? nil : port
+        return list
     }
 }
 
@@ -49,11 +85,14 @@ final class PreviewStore: ObservableObject {
 /// view is released. Non-persistent data store. Every load, the page's
 /// subresources included, is blocked by a content rule list unless it goes
 /// to the server's own port on loopback; navigations elsewhere (links,
-/// redirects, frames) are cancelled as well. Without the rule list there is
-/// no preview.
+/// redirects, frames) are cancelled as well; a document-start script turns
+/// DNS prefetch off, drops resource hints to other origins and takes
+/// service workers away (`previewUserScript`). Without the rule list there
+/// is no preview.
 @MainActor
 final class PagePreview: NSObject, WKNavigationDelegate {
     private let port: UInt16
+    private let rules: (UInt16) async -> WKContentRuleList?
     private let done: (NSImage?) -> Void
     private var webView: WKWebView?
     private var finished = false
@@ -61,23 +100,24 @@ final class PagePreview: NSObject, WKNavigationDelegate {
     private let loadTimeout: Duration = .seconds(10)
     private let settle: Duration = .milliseconds(1200)
 
-    init(port: UInt16, done: @escaping (NSImage?) -> Void) {
+    init(port: UInt16, rules: @escaping (UInt16) async -> WKContentRuleList?, done: @escaping (NSImage?) -> Void) {
         self.port = port
+        self.rules = rules
         self.done = done
     }
 
     func start() {
         Task {
-            let rules = try? await WKContentRuleListStore.default().compileContentRuleList(
-                forIdentifier: "btp-preview-\(port)", encodedContentRuleList: previewContentRules(port: port)
-            )
-            guard let rules else {
+            guard let rules = await self.rules(port) else {
                 finish(nil)
                 return
             }
             let config = WKWebViewConfiguration()
             config.websiteDataStore = .nonPersistent()
             config.userContentController.add(rules)
+            config.userContentController.addUserScript(WKUserScript(
+                source: previewUserScript(port: port), injectionTime: .atDocumentStart, forMainFrameOnly: true
+            ))
             config.defaultWebpagePreferences.allowsContentJavaScript = true
             config.mediaTypesRequiringUserActionForPlayback = .all
             let web = WKWebView(frame: CGRect(x: 0, y: 0, width: 1280, height: 800), configuration: config)

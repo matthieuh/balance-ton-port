@@ -7,9 +7,11 @@ import SwiftUI
 struct HeroView: View {
     let server: ServerViewFfi
     let favicon: NSImage?
-    let iconData: Data?
+    /// The favicon's dominant colors, worked out once per opened server.
+    let iconRGB: [UInt32]
     let preview: NSImage?
-    @EnvironmentObject private var nav: MenuNavigation
+    let onBack: () -> Void
+    let more: AnyView
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
@@ -23,30 +25,25 @@ struct HeroView: View {
         .frame(maxWidth: .infinity)
         .clipped()
         .overlay(alignment: .topLeading) {
-            Button { nav.back() } label: {
+            Button(action: onBack) {
                 Text(verbatim: "\u{2039}")
-                    .font(.system(size: 18, weight: .medium))
-                    .foregroundStyle(onImage ? Color.white.opacity(0.9) : Color.primary.opacity(0.75))
+                    .font(.system(size: 20, weight: .regular))
+                    .foregroundStyle(onImage ? Color.white.opacity(0.9) : Color.primary.opacity(0.7))
                     .frame(width: actionButtonHeight, height: actionButtonHeight)
-                    .background(chrome, in: Circle())
-                    .contentShape(Circle())
+                    .contentShape(Rectangle())
             }
             .buttonStyle(PressableStyle())
             .help("Back")
-            .padding(10)
+            .padding(.leading, 6)
+            .padding(.top, 6)
         }
         .overlay(alignment: .topTrailing) {
-            MoreMenu(server: server, inDetail: true, onImage: onImage)
-                .padding(10)
+            more.padding(10)
         }
     }
 
     /// Text and buttons sit on the preview (darkened): always light there.
     private var onImage: Bool { preview != nil }
-
-    private var chrome: Color {
-        onImage ? Color.black.opacity(0.35) : Color.primary.opacity(scheme == .dark ? 0.12 : 0.08)
-    }
 
     @ViewBuilder private var background: some View {
         if let preview {
@@ -56,13 +53,24 @@ struct HeroView: View {
                 .scaledToFill()
                 .frame(maxWidth: .infinity, maxHeight: heroHeight, alignment: .top)
                 .clipped()
+                // A scrim at the top for ‹ and ⋯, a deeper one at the bottom
+                // for the name.
                 .overlay(LinearGradient(
-                    colors: [.black.opacity(0.15), .black.opacity(0.7)], startPoint: .top, endPoint: .bottom
+                    stops: [
+                        .init(color: .black.opacity(0.55), location: 0),
+                        .init(color: .black.opacity(0.1), location: 0.35),
+                        .init(color: .black.opacity(0.25), location: 0.55),
+                        .init(color: .black.opacity(0.75), location: 1),
+                    ],
+                    startPoint: .top, endPoint: .bottom
                 ))
         } else {
-            let colors = dominantColors(iconData ?? Data(), fallback: portColor(server.port, dark: scheme == .dark))
+            // The favicon's colors, else the framework tile's, else the port's.
+            let colors = iconRGB.isEmpty
+                ? (iconTile(server).background ?? [portColor(server.port, dark: scheme == .dark)])
+                : iconRGB.map { Color(hex: $0) }
             let first = colors[0], second = colors.count > 1 ? colors[1] : colors[0]
-            let strength = scheme == .dark ? 0.32 : 0.22
+            let strength = scheme == .dark ? 0.32 : 0.28
             ZStack {
                 LinearGradient(
                     stops: [
@@ -82,7 +90,7 @@ struct HeroView: View {
         let title = titleParts(server).title
         return HStack(spacing: 10) {
             ServerIcon(server: server, favicon: favicon, size: 40)
-                .shadow(color: .black.opacity(0.4), radius: 7, y: 4)
+                .shadow(color: .black.opacity(scheme == .dark || onImage ? 0.4 : 0.15), radius: 7, y: 4)
             VStack(alignment: .leading, spacing: 2) {
                 Text(verbatim: title)
                     .font(.system(size: 16, weight: .semibold))
@@ -101,7 +109,7 @@ struct HeroView: View {
                     }
                 }
                 .font(.system(size: 12))
-                .foregroundStyle(onImage ? Color.white.opacity(0.75) : Color.secondary)
+                .foregroundStyle(onImage ? Color.white.opacity(0.8) : Color.primary.opacity(0.7))
                 .lineLimit(1)
             }
         }

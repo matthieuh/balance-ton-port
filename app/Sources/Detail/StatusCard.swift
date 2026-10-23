@@ -9,12 +9,13 @@ struct StatusCard: View {
     let note: RowNote?
     /// The countdown's full length (`countdownTotalMs`).
     let totalMs: UInt64
+    let restarting: Bool
     let perform: (DetailButton) -> Void
-    @EnvironmentObject private var model: CoreModel
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
         let tint = server.card.map(cardTint) ?? Color.secondary
+        let text = server.card.map { cardTextColor($0, dark: scheme == .dark) }
         let fraction = countdownFraction(killInMs: server.killInMs, totalMs: totalMs)
         HStack(spacing: 10) {
             if let fraction {
@@ -32,11 +33,11 @@ struct StatusCard: View {
                 if let title = statusTitle(server) {
                     Text(verbatim: title)
                         .font(.system(size: 13, weight: .bold))
-                        .foregroundStyle(server.card == nil ? Color.primary : tint)
+                        .foregroundStyle(text ?? Color.primary)
                 }
                 Text(verbatim: note.map(rowNoteText) ?? statusSentence(server))
                     .font(.system(size: 12))
-                    .foregroundStyle(server.card == nil ? Color.secondary : tint.opacity(scheme == .dark ? 0.85 : 1))
+                    .foregroundStyle(text.map { $0.opacity(0.9) } ?? Color.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -50,7 +51,7 @@ struct StatusCard: View {
                         .contentShape(Capsule())
                 }
                 .buttonStyle(PressableStyle())
-                .disabled(!detailButtonEnabled(action, server, restarting: model.isRestarting(server.id)))
+                .disabled(!detailButtonEnabled(action, server, restarting: restarting))
             }
         }
         .padding(.vertical, 10)

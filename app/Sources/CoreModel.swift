@@ -567,24 +567,34 @@ final class CoreModel: ObservableObject {
         }
     }
 
-    /// What the detail view shows beyond the row: history, events,
-    /// processes, the resume command, the favicon bytes and the config
-    /// figures for the chart and the countdown. Cheap reads, on the core
-    /// queue; empty when they fail.
-    func detail(_ id: ServerID) async -> DetailData {
-        let data = try? await onCore { core in
+    /// What the detail needs once per opened server: the resume command,
+    /// the favicon's dominant colors and the config figures for the chart
+    /// and the countdown. On the core queue; defaults when it fails.
+    func detailOnce(_ id: ServerID) async -> DetailOnce {
+        let once = try? await onCore { core in
             let config = try? core.config()
-            return DetailData(
-                history: core.history(pid: id.pid, startTime: id.startTime),
-                events: core.events(pid: id.pid, startTime: id.startTime),
-                processes: core.processes(pid: id.pid, startTime: id.startTime),
+            return DetailOnce(
                 resumeCommand: (try? core.resumeCommand(pid: id.pid, startTime: id.startTime)) ?? nil,
-                icon: core.icon(pid: id.pid, startTime: id.startTime),
+                iconRGB: core.icon(pid: id.pid, startTime: id.startTime).map(dominantRGB) ?? [],
                 leakLineBytes: (config?.leakMemoryMb ?? 2048) * 1_048_576,
                 deadSessionIdleS: config?.deadSessionIdleS ?? 0
             )
         }
-        return data ?? DetailData()
+        return once ?? DetailOnce()
+    }
+
+    /// What the detail refreshes on every pass: memory history and events,
+    /// and the processes only while their list is open. Cheap reads, on the
+    /// core queue.
+    func detailLive(_ id: ServerID, processes: Bool) async -> DetailLive {
+        let live = try? await onCore { core in
+            DetailLive(
+                history: core.history(pid: id.pid, startTime: id.startTime),
+                events: core.events(pid: id.pid, startTime: id.startTime),
+                processes: processes ? core.processes(pid: id.pid, startTime: id.startTime) : []
+            )
+        }
+        return live ?? DetailLive()
     }
 
     /// Fetches the favicon of each server that has one and is not cached
@@ -660,13 +670,18 @@ private struct PassResult: Sendable {
     let leaks: [ServerViewFfi]
 }
 
-/// The detail view's data for one server (`CoreModel.detail`).
-struct DetailData: Sendable, Equatable {
+/// The detail's data fetched once per opened server (`CoreModel.detailOnce`).
+struct DetailOnce: Sendable, Equatable {
+    var resumeCommand: String?
+    /// The favicon's two most common colors (`dominantRGB`), empty without one.
+    var iconRGB: [UInt32] = []
+    var leakLineBytes: UInt64 = 2048 * 1_048_576
+    var deadSessionIdleS: UInt64 = 0
+}
+
+/// The detail's data refreshed on every pass (`CoreModel.detailLive`).
+struct DetailLive: Sendable, Equatable {
     var history: [SampleFfi] = []
     var events: [EventFfi] = []
     var processes: [ProcRowFfi] = []
-    var resumeCommand: String?
-    var icon: Data?
-    var leakLineBytes: UInt64 = 2048 * 1_048_576
-    var deadSessionIdleS: UInt64 = 0
 }

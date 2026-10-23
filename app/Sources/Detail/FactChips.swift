@@ -7,6 +7,7 @@ struct FactChips: View {
     let server: ServerViewFfi
     let resumeCommand: String?
     @State private var copied = false
+    @Environment(\.colorScheme) private var scheme
 
     var body: some View {
         FlowLayout(spacing: 6) {
@@ -34,7 +35,7 @@ struct FactChips: View {
     }
 
     private func sessionChip(_ command: String) -> some View {
-        let color = agentBadge(server).color ?? .secondary
+        let color = agentChipColor(server.agent, dark: scheme == .dark)
         return Button {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(command, forType: .string)
@@ -51,7 +52,8 @@ struct FactChips: View {
                 .padding(.vertical, 4)
                 .padding(.horizontal, 9)
                 .background(color.opacity(0.16), in: Capsule())
-                .contentShape(Capsule())
+                .frame(minHeight: minHitHeight)
+                .contentShape(Rectangle())
         }
         .buttonStyle(PressableStyle())
         .help("Copy: \(command)")
