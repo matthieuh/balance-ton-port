@@ -17,12 +17,16 @@ private func server(
     agentLabel: String = "Claude"
 ) -> ServerViewFfi {
     ServerViewFfi(
-        pid: 4242, startTime: 1_700_000_000_123, port: port, command: command,
+        pid: 4242, startTime: 1_700_000_000_123, port: port, ports: [port], command: command,
         toolLabel: toolLabel, worktree: "/Users/me/trees/\(worktree)", worktreeName: worktree,
         locationLabel: "revva \u{203A} \(worktree)", sessionName: sessionName,
         agent: agent, agentLabel: agentLabel,
         startedMs: 1_700_000_000, startedLabel: "started 4 min ago",
-        sessionAlive: sessionAlive, idleMs: idleMs, killInMs: killInMs, state: state
+        sessionAlive: sessionAlive, idleMs: idleMs, killInMs: killInMs, state: state,
+        managed: true, excluded: false, framework: nil, title: toolLabel, hasIcon: false,
+        branch: nil, rssBytes: 0, cpuPct: 0, growthBytes: 0, health: "green", inUse: false,
+        statusText: "idle 0 min", card: nil, canRestart: false, postponed: false,
+        uptimeMs: 0, processCount: 1
     )
 }
 
@@ -63,7 +67,8 @@ final class NotificationTextTests: XCTestCase {
 final class SettingsDraftTests: XCTestCase {
     private let config = ConfigFfi(
         deadSessionIdleS: 1200, alertAfterS: 1800, killGraceS: 5, scanIntervalS: 5,
-        claudeConfigDirs: ["/Users/me/.claude"], excludeCommands: ["mcp"], excludePorts: [5432]
+        claudeConfigDirs: ["/Users/me/.claude"], excludeCommands: ["mcp"], excludePorts: [5432],
+        leakMemoryMb: 4096, leakGrowthMb: 300
     )
 
     func testConversions() {

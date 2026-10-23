@@ -289,6 +289,7 @@ mod tests {
             agent: crate::agents::AgentKind::ClaudeCode,
             postponed_until_ms: None,
             restarted_from: None,
+            session_cwd: None,
         }
     }
 
