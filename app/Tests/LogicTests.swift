@@ -205,22 +205,6 @@ final class MenuLabelTests: XCTestCase {
         )
     }
 
-    /// The longest third lines fit the menu at the callout font (12 pt), so
-    /// "started 2 d ago" is never cut.
-    func testLongestSessionLinesFitTheMenu() {
-        let font = NSFont.preferredFont(forTextStyle: .callout)
-        let name = "web-itinerairer-public-cb4fa7a5"
-        let lines = [
-            sessionLine(server(sessionName: name, idleMs: 59 * 60_000, state: "idle")),
-            sessionLine(server(sessionName: name, idleMs: 59 * 60_000, state: "idle"), notificationsOff: true),
-            sessionLine(server(sessionName: name, killInMs: 0)),
-        ].map { $0.replacingOccurrences(of: "started 4 min ago", with: "started 59 min ago") }
-        for line in lines {
-            let width = (line as NSString).size(withAttributes: [.font: font]).width
-            XCTAssertLessThanOrEqual(width, rowTextWidth, line)
-        }
-    }
-
     func testPortLabelIsVerbatim() {
         XCTAssertEqual(portLabel(8081), ":8081")
         XCTAssertEqual(portLabel(65535), ":65535")

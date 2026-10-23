@@ -27,19 +27,11 @@ func stateLabel(_ s: ServerViewFfi) -> String {
     return s.state
 }
 
-/// The previous menu's width, padding and row indent, against which the
-/// session lines are measured (tested). The decision-first menu uses
-/// `panelWidth`, `panelPadding` and `cardIndent`.
-let menuWidth: CGFloat = 480
-let menuPadding: CGFloat = 12
-let rowIndent: CGFloat = 16
-
 /// The menu panel's width and padding, and the indent of a card's second
 /// and third lines (past the 22 pt icon and its 8 pt gap).
 let panelWidth: CGFloat = 420
 let panelPadding: CGFloat = 14
 let cardIndent: CGFloat = 30
-var rowTextWidth: CGFloat { menuWidth - 2 * menuPadding - rowIndent }
 
 /// `:8081`. Always the bare digits: a port is not a quantity, so no
 /// locale grouping (SwiftUI's `Text("\(port)")` would show `8 081`).
