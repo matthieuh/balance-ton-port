@@ -923,6 +923,7 @@ mod tests {
                 })
                 .collect(),
             delivered: true,
+            agent: btp_core::agents::AgentKind::ClaudeCode,
         }
     }
 

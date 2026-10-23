@@ -6,6 +6,7 @@
 //! is ever tracked, and only tracked servers are ever signalled, each signal
 //! guarded by a fresh start-time check (a pid can be reused at any moment).
 
+use crate::agents::{is_agent_cli, AgentKind};
 use crate::config::{effective_claude_dirs_with, read_config, Config};
 use crate::decide::{decide, touch};
 use crate::labels::{location_label, session_display_name, tool_label};
@@ -94,20 +95,6 @@ pub(crate) fn is_excluded(command: &str, cfg: &Config) -> bool {
         .any(|e| !e.is_empty() && command.contains(&e))
 }
 
-/// The Claude Code CLI itself: argv[0] named `claude`, a runtime running a
-/// script named `claude` (`node /opt/homebrew/bin/claude`), or the npm
-/// package (`node …/@anthropic-ai/claude-code/cli.js`).
-fn is_claude_cli(command: &str) -> bool {
-    let base = |w: &str| w.rsplit('/').next().unwrap_or("").to_string();
-    let mut words = command.split_whitespace();
-    let argv0 = base(words.next().unwrap_or(""));
-    if argv0 == "claude" || command.contains("@anthropic-ai/claude-code") {
-        return true;
-    }
-    let runtime = matches!(argv0.as_str(), "node" | "nodejs" | "bun" | "deno");
-    runtime && words.find(|w| !w.starts_with('-')).map(base).as_deref() == Some("claude")
-}
-
 /// Links a new listener to the live Claude Code session it descends from.
 ///
 /// `chain` is the listener's ancestry (`chain[0]` is the listener's own
@@ -139,7 +126,7 @@ pub fn link(
     })?;
     if chain[..depth]
         .iter()
-        .any(|p| is_claude_cli(&p.command) || is_excluded(&p.command, cfg))
+        .any(|p| is_agent_cli(&p.command).is_some() || is_excluded(&p.command, cfg))
     {
         return None;
     }
@@ -162,6 +149,7 @@ pub fn link(
         alerted: false,
         note: None,
         asked_stale: false,
+        agent: AgentKind::ClaudeCode,
     })
 }
 
@@ -197,7 +185,7 @@ fn own_descendants(p: &dyn Platform, pid: i32, spare: &dyn Fn(&str) -> bool) -> 
         let Some(info) = p.proc_info(pid) else {
             continue;
         };
-        if is_claude_cli(&info.command) || spare(&info.command) {
+        if is_agent_cli(&info.command).is_some() || spare(&info.command) {
             spared.insert(pid);
             spared.extend(p.descendants(pid));
             continue;
@@ -1115,6 +1103,7 @@ mod tests {
                 alerted: false,
                 note: None,
                 asked_stale: false,
+                agent: crate::agents::AgentKind::ClaudeCode,
             }
         );
 
@@ -1622,6 +1611,7 @@ mod tests {
                 alerted: false,
                 note: None,
                 asked_stale: false,
+                agent: crate::agents::AgentKind::ClaudeCode,
             })
         })
         .unwrap();

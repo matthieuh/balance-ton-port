@@ -86,6 +86,7 @@ mod tests {
             alerted: false,
             note: None,
             asked_stale: false,
+            agent: crate::agents::AgentKind::ClaudeCode,
         }
     }
 

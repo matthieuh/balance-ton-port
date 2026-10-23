@@ -144,7 +144,7 @@ impl<P: Platform> Watcher<P> {
                 format!("pid {session_pid} is not an ancestor of this process"),
             ));
         };
-        if !is_claude_cli(&session_proc.command) {
+        if is_agent_cli(&session_proc.command) != Some(AgentKind::ClaudeCode) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("pid {session_pid} is not a Claude Code process"),
@@ -296,6 +296,7 @@ impl<P: Platform> Watcher<P> {
                 })
                 .collect(),
             delivered: !app_running,
+            agent: AgentKind::ClaudeCode,
         };
         with_state(&self.data_dir, |state| {
             state.record_session_ended(group.clone())
@@ -435,7 +436,9 @@ impl<P: Platform> Watcher<P> {
             .or_else(|| {
                 let pid = session_pid?;
                 ancestors()
-                    .find(|p| p.pid == pid && is_claude_cli(&p.command))
+                    .find(|p| {
+                        p.pid == pid && is_agent_cli(&p.command) == Some(AgentKind::ClaudeCode)
+                    })
                     .map(|p| (p.pid, format_proc_start(p.start_time)))
             })
     }

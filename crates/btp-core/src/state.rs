@@ -1,3 +1,4 @@
+use crate::agents::AgentKind;
 use crate::model::{KillReason, ServerKey, TrackedServer};
 use fs4::FileExt;
 use serde::{Deserialize, Serialize};
@@ -63,6 +64,8 @@ pub struct SessionEndedGroup {
     /// held the watch lock, else set by the app once delivered).
     #[serde(default)]
     pub delivered: bool,
+    #[serde(default)]
+    pub agent: AgentKind,
 }
 
 impl SessionEndedGroup {
@@ -259,6 +262,7 @@ mod tests {
             alerted: false,
             note: None,
             asked_stale: false,
+            agent: crate::agents::AgentKind::ClaudeCode,
         }
     }
 
@@ -393,6 +397,7 @@ mod tests {
         assert!(!d.path().join("state.json.corrupt").exists());
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].note, None);
+        assert_eq!(servers[0].agent, AgentKind::ClaudeCode);
         assert!(!servers[0].asked_stale);
         assert!(servers[0].kept);
         assert_eq!(kills[0].reason, KillReason::Manual);
@@ -433,6 +438,7 @@ mod tests {
                 })
                 .collect(),
             delivered: false,
+            agent: crate::agents::AgentKind::ClaudeCode,
         }
     }
 

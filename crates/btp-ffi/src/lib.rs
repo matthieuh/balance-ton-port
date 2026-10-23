@@ -648,6 +648,7 @@ mod tests {
                 alerted: false,
                 note: None,
                 asked_stale: false,
+                agent: btp_core::agents::AgentKind::ClaudeCode,
             });
             let open = |pid, port| GroupServer {
                 key: ServerKey { pid, start_time: 1 },
@@ -664,6 +665,7 @@ mod tests {
                 stopped: Vec::new(),
                 still_open: vec![open(dead_pid, 5173), open(dead_pid + 1, 3000)],
                 delivered: false,
+                agent: btp_core::agents::AgentKind::ClaudeCode,
             });
         })
         .unwrap();
@@ -766,6 +768,7 @@ mod tests {
                 alerted: false,
                 note: None,
                 asked_stale: false,
+                agent: btp_core::agents::AgentKind::ClaudeCode,
             });
             for (at_ms, start) in [(7, start_time + 1), (8, start_time)] {
                 s.record_session_ended(SessionEndedGroup {
@@ -785,6 +788,7 @@ mod tests {
                         in_use: false,
                     }],
                     delivered: false,
+                    agent: btp_core::agents::AgentKind::ClaudeCode,
                 });
             }
         })

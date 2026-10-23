@@ -154,6 +154,7 @@ mod tests {
             stopped: Vec::new(),
             still_open: vec![open("Vite", 5173), open("Bun dev", 3000)],
             delivered: false,
+            agent: crate::agents::AgentKind::ClaudeCode,
         };
         assert_eq!(
             session_ended_body(&g, 1200),
