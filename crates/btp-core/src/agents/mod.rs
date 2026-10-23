@@ -55,6 +55,11 @@ pub trait Agent {
     fn is_cli(&self, command: &str) -> bool;
     /// Sessions whose process is verified (pid and start time).
     fn live_sessions(&self, p: &dyn Platform) -> Vec<AgentSession>;
+    /// Like `live_sessions`, knowing the sessions the earlier agents found
+    /// (a Codex `exec` below a live Claude session is part of that session).
+    fn live_sessions_after(&self, p: &dyn Platform, _outer: &[AgentSession]) -> Vec<AgentSession> {
+        self.live_sessions(p)
+    }
     /// The conversation id carried by a process environment, if any.
     fn env_conversation(&self, _env: &[(String, String)]) -> Option<String> {
         None

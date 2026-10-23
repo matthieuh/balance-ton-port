@@ -7,6 +7,7 @@
 //! guarded by a fresh start-time check (a pid can be reused at any moment).
 
 use crate::agents::claude::ClaudeAgent;
+use crate::agents::codex::CodexAgent;
 use crate::agents::{is_agent_cli, session_idle_ms, Agent, AgentKind, AgentSession};
 use crate::config::{effective_claude_dirs_with, read_config, Config};
 use crate::decide::{decide, touch};
@@ -598,11 +599,17 @@ impl<P: Platform> Watcher<P> {
 
     fn scan(&mut self) -> Scan {
         let cfg = self.load_config();
-        let live = self
-            .agents(&cfg)
-            .iter()
-            .flat_map(|a| a.live_sessions(&self.platform))
-            .filter(|s| self.process_matches(s.pid, &s.proc_start))
+        let mut found: Vec<AgentSession> = Vec::new();
+        for agent in self.agents(&cfg) {
+            let mine: Vec<AgentSession> = agent
+                .live_sessions_after(&self.platform, &found)
+                .into_iter()
+                .filter(|s| self.process_matches(s.pid, &s.proc_start))
+                .collect();
+            found.extend(mine);
+        }
+        let live = found
+            .into_iter()
             .map(|s| LiveSession {
                 root: canonical(&worktree_root(&s.cwd)),
                 session: s,
@@ -613,9 +620,14 @@ impl<P: Platform> Watcher<P> {
 
     /// The agents whose sessions are followed, built from the current config.
     fn agents(&self, cfg: &Config) -> Vec<Box<dyn Agent>> {
-        vec![Box::new(ClaudeAgent {
-            dirs: effective_claude_dirs_with((self.discover)(), cfg),
-        })]
+        vec![
+            Box::new(ClaudeAgent {
+                dirs: effective_claude_dirs_with((self.discover)(), cfg),
+            }),
+            Box::new(CodexAgent {
+                default_home: dirs::home_dir().map(|h| h.join(".codex")),
+            }),
+        ]
     }
 
     /// `pid` is running and started at `proc_start` (Claude's format).
