@@ -113,7 +113,28 @@ Config minimums: 60 s for `dead_session_idle_s` and `alert_after_s`, 1 s for `ki
 
 **One watcher.** Only the holder of `watch.lock` runs killing passes. The app tries to take it on every pass; while `btp watch` holds it, the app only observes (links, activity and forgets are still recorded, no kill, no alert) and shows the list read-only, but its manual Kill button still works. `btp watch` refuses to start while the app holds the lock. `btp list`, `btp kill` and `btp sweep` work without any watcher: they run the same pass (link, observe, forget) on demand.
 
-## 10. Known limitations
+## 10. Claude Code plugin and session end
+
+The plugin (`plugin/`) has two hooks, an install command and the agent skill.
+
+**Session end never stops anything.** The SessionEnd hook runs `btp session-end` in a detached child (Claude Code gives the hook about 1.5 s and shows nothing it prints, so the hook prints nothing and always exits 0). The session process is the hook's parent. With "Exit and stop tasks", Claude Code stops its own background tasks before the hook runs, so the hook finds no server. With "Move to background and exit", the servers are still alive: a server alive at that moment is one the user chose to keep. `btp session-end` records them as one ended-session group, with the process identity of the session so the link survives, and posts one notification ("Session ended: N servers kept running, stopped after 20 min unused"). Nothing is posted when no server was kept. The app posts it on its next pass when it holds the watch lock; otherwise `btp session-end` posts it with `osascript` and marks the group delivered under the state lock, so it is never shown twice. `clear` and `resume` reasons do nothing: the process lives on.
+
+**Who stops the kept servers.** They follow the normal dead-session rule: idle for `dead_session_idle_s`, with every protection (exclusions, Keep, shared worktree). The app or `btp watch` applies it. When neither runs, `btp session-end` starts a detached waiter (`btp _sweep-later`, a double fork) that sleeps until the first server is due, runs the same pass restricted to that session's servers with a fresh config, and repeats until none is left. If a watcher holds the lock when it wakes, it does nothing: the watcher applies the rule. It gives up after 24 hours.
+
+**Notes.** The agent tells `btp` its intent through the skill. `btp note <port> --keep "<why>"` has the effect of Keep (spared, no alerts) and stores the reason, shown in the app. `btp note <port> --done` makes the server eligible as soon as it is idle once its session has ended, without waiting `dead_session_idle_s`. A note only makes things more cautious or speeds up a kill the rules already allow: it never stops a server that is in use, excluded, shared with another live session, or of another session (the CLI checks that the caller descends from the session's process). Notes are cleared when the server restarts.
+
+**`/clear` and `/resume`.** The SessionStart hook runs `btp stale --conversation <id>`: the servers recorded under an earlier conversation id of the same live process, idle more than 5 minutes, each listed once. Claude asks the user a single question in the new conversation, using the notes to describe them, and a yes runs `btp kill` for each. Kept and excluded servers are not offered.
+
+**Install.** Another SessionStart check finds `btp` (and a minimum version). If it is missing or too old, Claude asks before installing. The script downloads the latest release, checks the sha256, verifies the Developer ID signature with `codesign`, and installs to `~/.local/bin/btp`, never with sudo and never over a `btp` the plugin did not install. A refusal is remembered under the plugin's data dir; `/balance-ton-port:install` clears it.
+
+**Debugging.** With `BTP_HOOK_DEBUG=1`, the hook and `btp session-end` append one line per step to `session-end.log` in the data dir (what was found, why nothing was done). It is off by default.
+
+**Known gaps.**
+- No hook runs when Claude Code crashes or is killed hard, so nothing is recorded; the normal rules take over.
+- A server reparented to launchd before the hook runs is left to the normal rules.
+- A server started with `&` or `nohup` is reparented at once, so it is never linked to the session and never tracked.
+
+## 11. Known limitations
 
 - A Claude Code process with no session file in a watched dir (a `CLAUDE_CONFIG_DIR` whose `sessions/` folder is shared with another dir, an older Claude Code) is ignored: its servers are never tracked, so never killed, and never cleaned up either.
 - A server started in the background (`cmd &`) inside one shell command is reparented to launchd before the first scan and is not tracked. More generally, anything started and orphaned between two scans is missed.
@@ -123,7 +144,7 @@ Config minimums: 60 s for `dead_session_idle_s` and `alert_after_s`, 1 s for `ki
 - The kill log grows without bound, and the same kill can occasionally be recorded twice.
 - macOS only. The platform layer is behind a trait so that a Linux implementation (`/proc`) can follow.
 
-## 11. Architecture
+## 12. Architecture
 
 ```
 crates/btp-core   Rust library: platform layer, sessions, linking, decide, kill, state, config
@@ -137,6 +158,6 @@ plugin/           the Claude Code plugin: hooks, install script, the agent skill
 - `btp-ffi`: a `Core` object exposing `tick`, `observe`, `kill_port`, `kill_server(pid, start_time)`, `mark_alerted`, `keep`, `config`/`set_config`, `recent_kills` and `acquire_watch`. `scripts/build-xcframework.sh` builds a universal static library, packs it as `BtpCore.xcframework` and generates the Swift bindings.
 - The app: `MenuBarExtra` in window style, `LSUIElement` (no Dock icon), launch at login through `SMAppService`, notifications with actions through `UNUserNotificationCenter`. It runs one pass at a time on a background queue and schedules the next one `scan_interval_s` after the previous one finished. One process, no daemon to install. macOS 14 or later.
 
-## 12. Release pipeline
+## 13. Release pipeline
 
 CI runs fmt, clippy, the Rust tests and the Swift tests on every push and pull request. A `v*` tag runs the release workflow: it checks that the tag matches the CLI and app versions, builds a universal `btp` and app, signs them with a Developer ID, notarizes and staples the app, packs it into `BalanceTonPort-<v>.dmg` (signed, notarized and stapled too), and publishes a GitHub release with the CLI tarball, the dmg, their `.sha256` files and the Homebrew formula and cask filled with the version and checksums; a tag with a hyphen is a prerelease, and nothing is published unless every step passed. See [RELEASING.md](../RELEASING.md) for the secrets and the steps.

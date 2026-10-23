@@ -51,4 +51,4 @@ btp note 5173 --done     # stop it when the session quits, once idle
 btp recent               # the last kills and why
 ```
 
-`recent_kills` entries carry a `reason` of `{"kind": "manual"}`, `{"kind": "worktree_deleted"}`, `{"kind": "dead_session_idle", "idle_ms": ...}` or `{"kind": "session_ended"}` (stopped when its session quit).
+`recent_kills` entries carry a `reason` of `{"kind": "manual"}`, `{"kind": "worktree_deleted"}`, `{"kind": "dead_session_idle", "idle_ms": ...}` or `{"kind": "session_ended"}` (only in records written by older versions; a quit no longer stops anything).

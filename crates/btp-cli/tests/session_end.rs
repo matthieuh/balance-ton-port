@@ -1,4 +1,4 @@
-//! `btp session-end`, `note`, `stale`, `recent` and `_finish-kill` against
+//! `btp session-end`, `note`, `stale`, `recent` and `_sweep-later` against
 //! real processes. Every process signalled here is one this test spawned: a
 //! `bash` run under the name `claude` stands in for the Claude Code process,
 //! and a `perl` one-liner is its dev server. `BTP_DATA_DIR` and `HOME` point to a
