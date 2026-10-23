@@ -60,7 +60,7 @@ func truncatedSessionName(_ name: String) -> String {
 func sessionLine(_ s: ServerViewFfi, notificationsOff: Bool = false) -> String {
     var parts: [String]
     if s.sessionAlive {
-        let name = "Claude session \"\(truncatedSessionName(s.sessionName))\""
+        let name = "\(s.agentLabel) session \"\(truncatedSessionName(s.sessionName))\""
         let idle = "idle \(durationLabel(ms: s.idleMs))"
         if notificationsOff {
             parts = [name, "\(idle), notifications off"]

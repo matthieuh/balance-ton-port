@@ -174,14 +174,16 @@ impl<P: Platform> Watcher<P> {
         } else {
             trace.push("session file: missing, linking with the process identity".into());
             scan.live.push(LiveSession {
-                session: ClaudeSession {
+                session: AgentSession {
+                    agent: AgentKind::ClaudeCode,
                     pid: session_pid,
-                    session_id: conversation.unwrap_or_default().to_string(),
+                    proc_start: proc_start.clone(),
+                    conversation_id: conversation.unwrap_or_default().to_string(),
+                    other_conversations: Vec::new(),
                     cwd,
+                    name: String::new(),
                     status: crate::sessions::SessionStatus::Unknown,
                     status_updated_at_ms: 0,
-                    proc_start: proc_start.clone(),
-                    name: String::new(),
                 },
                 root: session_root.clone(),
             });

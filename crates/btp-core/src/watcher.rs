@@ -6,13 +6,14 @@
 //! is ever tracked, and only tracked servers are ever signalled, each signal
 //! guarded by a fresh start-time check (a pid can be reused at any moment).
 
-use crate::agents::{is_agent_cli, AgentKind};
+use crate::agents::claude::ClaudeAgent;
+use crate::agents::{is_agent_cli, session_idle_ms, Agent, AgentKind, AgentSession};
 use crate::config::{effective_claude_dirs_with, read_config, Config};
 use crate::decide::{decide, touch};
 use crate::labels::{location_label, session_display_name, tool_label};
 use crate::model::{Action, KillReason, KillTarget, Note, Observation, ServerKey, TrackedServer};
 use crate::platform::{ancestry, format_proc_start, Listener, Platform, ProcInfo};
-use crate::sessions::{default_config_dirs, read_sessions, session_idle_ms, ClaudeSession};
+use crate::sessions::default_config_dirs;
 use crate::state::{append_kill_log, with_state, KillRecord, State};
 use crate::worktree::worktree_root;
 use fs4::{FileExt, TryLockError};
@@ -42,8 +43,10 @@ pub struct ServerView {
     pub worktree_name: String,
     /// `<repo> › <worktree>`, the repo dir name, or a `~`-shortened path.
     pub location_label: String,
-    /// The Claude Code session's display name.
+    /// The session's display name.
     pub session_name: String,
+    /// The agent whose session started the server.
+    pub agent: AgentKind,
     /// When the server process started, Unix milliseconds.
     pub started_ms: u64,
     pub session_alive: bool,
@@ -108,7 +111,7 @@ pub(crate) fn is_excluded(command: &str, cfg: &Config) -> bool {
 pub fn link(
     listener: &Listener,
     chain: &[ProcInfo],
-    sessions: &[ClaudeSession],
+    sessions: &[AgentSession],
     cfg: &Config,
     now_ms: u64,
 ) -> Option<TrackedServer> {
@@ -139,7 +142,7 @@ pub fn link(
         port: listener.port,
         command: server.command.clone(),
         worktree: worktree_root(cwd),
-        session_id: session.session_id.clone(),
+        session_id: session.conversation_id.clone(),
         session_pid: session.pid,
         session_proc_start: session.proc_start.clone(),
         session_name: session_display_name(Some(&session.name), &session.cwd),
@@ -149,7 +152,7 @@ pub fn link(
         alerted: false,
         note: None,
         asked_stale: false,
-        agent: AgentKind::ClaudeCode,
+        agent: session.agent,
     })
 }
 
@@ -435,10 +438,10 @@ enum Mode {
     Observe,
 }
 
-/// A live Claude Code session (its process verified) and its worktree.
+/// A live agent session (its process verified) and its worktree.
 #[derive(Clone)]
 struct LiveSession {
-    session: ClaudeSession,
+    session: AgentSession,
     root: PathBuf,
 }
 
@@ -449,7 +452,7 @@ struct Scan {
 }
 
 impl Scan {
-    fn sessions(&self) -> Vec<ClaudeSession> {
+    fn sessions(&self) -> Vec<AgentSession> {
         self.live.iter().map(|l| l.session.clone()).collect()
     }
 }
@@ -595,8 +598,10 @@ impl<P: Platform> Watcher<P> {
 
     fn scan(&mut self) -> Scan {
         let cfg = self.load_config();
-        let live = read_sessions(&effective_claude_dirs_with((self.discover)(), &cfg))
-            .into_iter()
+        let live = self
+            .agents(&cfg)
+            .iter()
+            .flat_map(|a| a.live_sessions(&self.platform))
             .filter(|s| self.process_matches(s.pid, &s.proc_start))
             .map(|s| LiveSession {
                 root: canonical(&worktree_root(&s.cwd)),
@@ -604,6 +609,13 @@ impl<P: Platform> Watcher<P> {
             })
             .collect();
         Scan { cfg, live }
+    }
+
+    /// The agents whose sessions are followed, built from the current config.
+    fn agents(&self, cfg: &Config) -> Vec<Box<dyn Agent>> {
+        vec![Box::new(ClaudeAgent {
+            dirs: effective_claude_dirs_with((self.discover)(), cfg),
+        })]
     }
 
     /// `pid` is running and started at `proc_start` (Claude's format).
@@ -932,8 +944,9 @@ fn view(
         } else if let Some(name) = live_session.filter(|_| o.session_alive) {
             name.to_string()
         } else {
-            "Claude session".to_string()
+            format!("{} session", s.agent.label())
         },
+        agent: s.agent,
         worktree_name,
         // Process start times are Unix microseconds.
         started_ms: s.key.start_time / 1000,
@@ -1073,13 +1086,24 @@ mod tests {
         }
     }
 
-    fn sessions(f: &Fx) -> Vec<ClaudeSession> {
+    fn sessions(f: &Fx) -> Vec<AgentSession> {
         read_sessions(&[f.claude.path().to_path_buf()])
+            .into_iter()
+            .map(AgentSession::from)
+            .collect()
     }
 
     fn link_pid(f: &Fx, pid: i32, port: u16) -> Option<TrackedServer> {
         let chain = ancestry(f.p(), pid);
         link(&Listener { pid, port }, &chain, &sessions(f), &f.cfg(), T0)
+    }
+
+    #[test]
+    fn links_carry_the_session_agent() {
+        let f = fx();
+        let s = link_pid(&f, 30, 3000).expect("linked");
+        assert_eq!(s.agent, AgentKind::ClaudeCode);
+        assert_eq!(s.session_id, "sess-a");
     }
 
     #[test]
@@ -1120,6 +1144,7 @@ mod tests {
                 worktree_name: "wt".into(),
                 location_label: "main \u{203A} wt".into(),
                 session_name: "wt".into(),
+                agent: AgentKind::ClaudeCode,
                 started_ms: (START + 30 * SEC) / 1000,
                 session_alive: true,
                 idle_ms: 0,

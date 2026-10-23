@@ -12,12 +12,15 @@ private func server(
     sessionAlive: Bool = true,
     idleMs: UInt64 = 0,
     killInMs: UInt64? = nil,
-    state: String = "active"
+    state: String = "active",
+    agent: String = "claude_code",
+    agentLabel: String = "Claude"
 ) -> ServerViewFfi {
     ServerViewFfi(
         pid: 4242, startTime: 1_700_000_000_123, port: port, command: command,
         toolLabel: toolLabel, worktree: "/Users/me/trees/\(worktree)", worktreeName: worktree,
         locationLabel: "revva \u{203A} \(worktree)", sessionName: sessionName,
+        agent: agent, agentLabel: agentLabel,
         startedMs: 1_700_000_000, startedLabel: "started 4 min ago",
         sessionAlive: sessionAlive, idleMs: idleMs, killInMs: killInMs, state: state
     )
@@ -165,6 +168,14 @@ final class MenuLabelTests: XCTestCase {
         XCTAssertEqual(
             sessionLine(server()),
             "Claude session \"revva-b8\" \u{00B7} active \u{00B7} started 4 min ago"
+        )
+    }
+
+    func testSessionLineNamesTheAgent() {
+        let s = server(sessionName: "web", agent: "codex", agentLabel: "Codex")
+        XCTAssertEqual(
+            sessionLine(s),
+            "Codex session \"web\" \u{00B7} active \u{00B7} started 4 min ago"
         )
     }
 

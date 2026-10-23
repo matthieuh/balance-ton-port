@@ -110,6 +110,7 @@ mod tests {
         };
         assert_eq!(session_idle_ms(&mk(SessionStatus::Idle), 5000), Some(4000));
         assert_eq!(session_idle_ms(&mk(SessionStatus::Busy), 5000), None);
+        assert_eq!(session_idle_ms(&mk(SessionStatus::Unknown), 5000), None);
         assert_eq!(session_idle_ms(&mk(SessionStatus::Idle), 500), Some(0));
     }
 }

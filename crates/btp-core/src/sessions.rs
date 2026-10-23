@@ -66,10 +66,6 @@ pub fn read_sessions(dirs: &[PathBuf]) -> Vec<ClaudeSession> {
     out
 }
 
-pub fn session_idle_ms(s: &ClaudeSession, now_ms: u64) -> Option<u64> {
-    (s.status == SessionStatus::Idle).then(|| now_ms.saturating_sub(s.status_updated_at_ms))
-}
-
 fn expand_tilde(raw: &str, home: &Path) -> PathBuf {
     if raw == "~" {
         home.to_path_buf()
@@ -231,23 +227,6 @@ mod tests {
         v.sort_by_key(|s| s.pid);
         assert_eq!(v[0].status, SessionStatus::Busy);
         assert_eq!(v[1].status, SessionStatus::Unknown);
-    }
-
-    #[test]
-    fn idle_ms_only_when_idle() {
-        let mk = |status| ClaudeSession {
-            pid: 1,
-            session_id: "x".into(),
-            cwd: PathBuf::from("/"),
-            status,
-            status_updated_at_ms: 1000,
-            proc_start: String::new(),
-            name: String::new(),
-        };
-        assert_eq!(session_idle_ms(&mk(SessionStatus::Idle), 5000), Some(4000));
-        assert_eq!(session_idle_ms(&mk(SessionStatus::Busy), 5000), None);
-        assert_eq!(session_idle_ms(&mk(SessionStatus::Unknown), 5000), None);
-        assert_eq!(session_idle_ms(&mk(SessionStatus::Idle), 500), Some(0));
     }
 
     #[test]

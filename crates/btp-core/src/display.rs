@@ -106,6 +106,7 @@ mod tests {
             worktree_name: "app".into(),
             location_label: "app".into(),
             session_name: "app-1d".into(),
+            agent: crate::agents::AgentKind::ClaudeCode,
             started_ms: 0,
             session_alive: alive,
             idle_ms,

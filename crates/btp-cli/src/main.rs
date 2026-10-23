@@ -821,6 +821,7 @@ fn render_list(servers: &[ServerView]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use btp_core::agents::AgentKind;
     use btp_core::model::ServerKey;
 
     fn view(port: u16, alive: bool, idle_ms: u64) -> ServerView {
@@ -837,6 +838,7 @@ mod tests {
             worktree_name: "app".into(),
             location_label: "app".into(),
             session_name: "app-1d".into(),
+            agent: AgentKind::ClaudeCode,
             started_ms: 0,
             session_alive: alive,
             idle_ms,
@@ -1068,5 +1070,16 @@ mod tests {
         assert_eq!(lines[0].split_whitespace().count(), 5);
         assert!(lines[1].starts_with("3000"));
         assert!(lines[1].ends_with("12 min"));
+    }
+
+    #[test]
+    fn list_json_has_agent_field() {
+        let v = view(3000, true, 0);
+        let json = serde_json::to_string(&ServerOut {
+            view: &v,
+            state: "idle",
+        })
+        .unwrap();
+        assert!(json.contains("\"agent\":\"claude_code\""), "{json}");
     }
 }
