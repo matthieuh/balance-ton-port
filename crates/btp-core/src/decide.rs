@@ -31,6 +31,10 @@ pub fn decide(
         }
         let port_idle = now_ms.saturating_sub(s.last_active_ms);
         if !o.session_alive {
+            // "Postpone 1 h" holds the dead-session kill until it runs out.
+            if s.postponed_until_ms.is_some_and(|until| now_ms < until) {
+                continue;
+            }
             // `btp note --done` (and no Keep): eligible as soon as idle,
             // never while a connection is open.
             let done_and_idle = s.is_done() && !s.is_kept() && o.established == 0;
@@ -87,6 +91,7 @@ mod tests {
             note: None,
             asked_stale: false,
             agent: crate::agents::AgentKind::ClaudeCode,
+            postponed_until_ms: None,
         }
     }
 
@@ -306,6 +311,51 @@ mod tests {
         let mut o = obs(1);
         o.session_alive = false;
         assert_eq!(decide(&[server(1)], &[o], MIN, &cfg).len(), 1);
+    }
+
+    #[test]
+    fn postpone_delays_dead_session_kill() {
+        let mut o = obs(1);
+        o.session_alive = false;
+        let mut s = server(1);
+        // Idle 25 min, postponed an hour ago minus one second.
+        let now = 25 * MIN;
+        s.postponed_until_ms = Some(now + 1_000);
+        assert!(run(&s, &o, now).is_empty());
+        assert_eq!(
+            run(&s, &o, now + 1_000),
+            vec![Action::Kill {
+                key: key(1),
+                reason: KillReason::DeadSessionIdle {
+                    idle_ms: now + 1_000
+                }
+            }]
+        );
+        // A done note waits too.
+        s.note = Some(crate::model::Note {
+            keep: false,
+            done: true,
+            reason: None,
+            set_at_ms: 0,
+        });
+        s.last_active_ms = now;
+        assert!(run(&s, &o, now).is_empty());
+    }
+
+    #[test]
+    fn postpone_never_blocks_worktree_deleted() {
+        let mut o = obs(1);
+        o.worktree_exists = false;
+        o.session_alive = false;
+        let mut s = server(1);
+        s.postponed_until_ms = Some(99 * MIN);
+        assert_eq!(
+            run(&s, &o, MIN),
+            vec![Action::Kill {
+                key: key(1),
+                reason: KillReason::WorktreeDeleted
+            }]
+        );
     }
 
     #[test]

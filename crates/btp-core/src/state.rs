@@ -282,6 +282,7 @@ mod tests {
             note: None,
             asked_stale: false,
             agent: crate::agents::AgentKind::ClaudeCode,
+            postponed_until_ms: None,
         }
     }
 

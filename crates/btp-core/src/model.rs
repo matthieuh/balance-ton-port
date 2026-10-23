@@ -44,6 +44,10 @@ pub struct TrackedServer {
     /// The agent whose session started this server.
     #[serde(default)]
     pub agent: AgentKind,
+    /// "Postpone 1 h": the dead-session kill waits until then (Unix ms).
+    /// Never delays a deleted worktree's kill.
+    #[serde(default)]
+    pub postponed_until_ms: Option<u64>,
 }
 
 impl TrackedServer {

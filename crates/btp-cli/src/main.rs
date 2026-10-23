@@ -858,6 +858,14 @@ fn saved_view(s: &TrackedServer, now_ms: u64) -> ServerView {
         session_alive: true,
         idle_ms: now_ms.saturating_sub(s.last_active_ms),
         kill_in_ms: None,
+        in_use: false,
+        postponed_until_ms: s.postponed_until_ms,
+        note_reason: s
+            .note
+            .as_ref()
+            .filter(|n| n.keep)
+            .map(|n| n.reason.clone().unwrap_or_default()),
+        kept_by_user: s.kept,
     }
 }
 
@@ -927,6 +935,10 @@ mod tests {
             session_alive: alive,
             idle_ms,
             kill_in_ms: None,
+            in_use: false,
+            postponed_until_ms: None,
+            note_reason: None,
+            kept_by_user: false,
         }
     }
 

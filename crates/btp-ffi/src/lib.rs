@@ -100,6 +100,10 @@ pub struct ConfigFfi {
     pub exclude_commands: Vec<String>,
     /// Ports never tracked or killed.
     pub exclude_ports: Vec<u16>,
+    /// A server above this much memory (MB) leaks.
+    pub leak_memory_mb: u64,
+    /// A server growing by more than this (MB) in 10 minutes leaks.
+    pub leak_growth_mb: u64,
 }
 
 /// One server a session end left running.
@@ -248,6 +252,8 @@ impl From<Config> for ConfigFfi {
                 .collect(),
             exclude_commands: c.exclude_commands,
             exclude_ports: c.exclude_ports,
+            leak_memory_mb: c.leak_memory_mb,
+            leak_growth_mb: c.leak_growth_mb,
         }
     }
 }
@@ -266,8 +272,8 @@ impl From<ConfigFfi> for Config {
                 .collect(),
             exclude_commands: c.exclude_commands,
             exclude_ports: c.exclude_ports,
-            // Not exposed to the app yet.
-            ..Config::default()
+            leak_memory_mb: c.leak_memory_mb,
+            leak_growth_mb: c.leak_growth_mb,
         }
     }
 }
@@ -409,7 +415,8 @@ impl Core {
     }
 
     /// Saves the config. Refuses a value below its minimum (delays in
-    /// minutes >= 60 s, grace and scan >= 1 s).
+    /// minutes >= 60 s, grace and scan >= 1 s, leak memory >= 100 MB, leak
+    /// growth >= 50 MB).
     pub fn set_config(&self, c: ConfigFfi) -> Result<(), BtpError> {
         let c: Config = c.into();
         c.validate().map_err(|message| BtpError::Io { message })?;
@@ -557,6 +564,10 @@ mod tests {
             session_alive: true,
             idle_ms: 0,
             kill_in_ms: None,
+            in_use: false,
+            postponed_until_ms: None,
+            note_reason: None,
+            kept_by_user: false,
         };
         let f = ServerViewFfi::at(&v, 0);
         assert_eq!(f.agent, "claude_code");
@@ -583,6 +594,10 @@ mod tests {
             session_alive: false,
             idle_ms: 0,
             kill_in_ms: Some(1_000),
+            in_use: false,
+            postponed_until_ms: None,
+            note_reason: None,
+            kept_by_user: false,
         };
         let f = ServerViewFfi::at(&v, 4 * 60_000);
         assert_eq!((f.pid, f.start_time, f.port), (42, 7, 5173));
@@ -618,11 +633,17 @@ mod tests {
         let core = Core::at(d.path().to_path_buf(), Vec::new);
         let mut c = core.config().unwrap();
         assert_eq!(c.dead_session_idle_s, 1200);
+        assert_eq!((c.leak_memory_mb, c.leak_growth_mb), (2048, 500));
         c.alert_after_s = 60;
         c.claude_config_dirs = vec!["/tmp/claude-x".into()];
+        c.leak_memory_mb = 4096;
+        c.leak_growth_mb = 300;
         core.set_config(c.clone()).unwrap();
         assert_eq!(core.config().unwrap(), c);
-        assert_eq!(read_config(d.path()).unwrap().alert_after_s, 60);
+        let saved = read_config(d.path()).unwrap();
+        assert_eq!(saved.alert_after_s, 60);
+        // The app's save keeps the leak thresholds it was given.
+        assert_eq!((saved.leak_memory_mb, saved.leak_growth_mb), (4096, 300));
     }
 
     #[test]
@@ -699,6 +720,7 @@ mod tests {
                 note: None,
                 asked_stale: false,
                 agent: btp_core::agents::AgentKind::ClaudeCode,
+                postponed_until_ms: None,
             });
             let open = |pid, port| GroupServer {
                 key: ServerKey { pid, start_time: 1 },
@@ -819,6 +841,7 @@ mod tests {
                 note: None,
                 asked_stale: false,
                 agent: btp_core::agents::AgentKind::ClaudeCode,
+                postponed_until_ms: None,
             });
             for (at_ms, start) in [(7, start_time + 1), (8, start_time)] {
                 s.record_session_ended(SessionEndedGroup {
