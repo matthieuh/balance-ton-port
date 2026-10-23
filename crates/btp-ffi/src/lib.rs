@@ -266,6 +266,8 @@ impl From<ConfigFfi> for Config {
                 .collect(),
             exclude_commands: c.exclude_commands,
             exclude_ports: c.exclude_ports,
+            // Not exposed to the app yet.
+            ..Config::default()
         }
     }
 }

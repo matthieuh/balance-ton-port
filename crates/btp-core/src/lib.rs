@@ -2,6 +2,7 @@ pub mod agents;
 pub mod config;
 pub mod decide;
 pub mod display;
+pub mod history;
 pub mod labels;
 pub mod model;
 pub mod platform;

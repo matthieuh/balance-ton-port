@@ -11,9 +11,10 @@ use crate::agents::codex::{classify_codex, env_thread, CodexAgent, CodexRole};
 use crate::agents::{is_agent_cli, session_idle_ms, Agent, AgentKind, AgentSession};
 use crate::config::{effective_claude_dirs_with, read_config, Config};
 use crate::decide::{decide, touch};
+use crate::history::{AlertKind, EventKind, History, ProcId, ServerEvent};
 use crate::labels::{location_label, session_display_name, tool_label};
 use crate::model::{Action, KillReason, KillTarget, Note, Observation, ServerKey, TrackedServer};
-use crate::platform::{ancestry, format_proc_start, Listener, Platform, ProcInfo};
+use crate::platform::{ancestry, format_proc_start, Listener, Platform, ProcInfo, ProcResources};
 use crate::sessions::default_config_dirs;
 use crate::state::{append_kill_log, with_state, KillRecord, State};
 use crate::worktree::worktree_root;
@@ -199,12 +200,23 @@ fn same_process(p: &dyn Platform, pid: i32, start_time: u64) -> bool {
     p.proc_info(pid).is_some_and(|i| i.start_time == start_time)
 }
 
+/// What one pass learned about a server, for the history.
+struct Feed {
+    key: ServerKey,
+    agent: AgentKind,
+    procs: Vec<ProcId>,
+    established: u32,
+    session_alive: bool,
+}
+
 /// A tracked server's process tree as seen in one pass: the server and its
 /// descendants, and every port any of them listens on. Empty when the
 /// server's process is gone.
 #[derive(Debug, Clone, Default)]
 struct Tree {
     pids: Vec<i32>,
+    /// `pids` with their start times (the server's own process first).
+    procs: Vec<ProcId>,
     ports: Vec<u16>,
     /// Every (pid, port) whose established connections count as the
     /// server's use: every process of the tree and every port they listen
@@ -243,12 +255,9 @@ fn tree_of(p: &dyn Platform, s: &TrackedServer, listeners: &[Listener]) -> Tree 
     if !same_process(p, s.key.pid, s.key.start_time) {
         return Tree::default();
     }
-    let mut pids = vec![s.key.pid];
-    pids.extend(
-        own_descendants(p, s.key.pid, &|_| false)
-            .into_iter()
-            .map(|(pid, _)| pid),
-    );
+    let mut procs = vec![(s.key.pid, s.key.start_time)];
+    procs.extend(own_descendants(p, s.key.pid, &|_| false));
+    let pids: Vec<i32> = procs.iter().map(|&(pid, _)| pid).collect();
     let mut ports: Vec<u16> = listeners
         .iter()
         .filter(|l| pids.contains(&l.pid))
@@ -271,6 +280,7 @@ fn tree_of(p: &dyn Platform, s: &TrackedServer, listeners: &[Listener]) -> Tree 
         .collect();
     Tree {
         pids,
+        procs,
         ports,
         activity,
     }
@@ -509,6 +519,7 @@ pub struct Watcher<P: Platform> {
     last_good: Option<Config>,
     /// Why the last read of `config.toml` failed, cleared once it parses.
     config_error: Option<String>,
+    history: History,
 }
 
 impl<P: Platform> Watcher<P> {
@@ -521,7 +532,13 @@ impl<P: Platform> Watcher<P> {
             codex: true,
             last_good: None,
             config_error: None,
+            history: History::default(),
         }
+    }
+
+    /// Memory, CPU and events of every server seen by the passes so far.
+    pub fn history(&self) -> &History {
+        &self.history
     }
 
     /// Replaces the automatic discovery of Claude config dirs (tests pass
@@ -837,7 +854,7 @@ impl<P: Platform> Watcher<P> {
     fn run(&mut self, now_ms: u64, mode: Mode) -> io::Result<TickReport> {
         let scan = self.scan();
         let listeners = self.platform.listeners();
-        let (mut report, to_kill) = with_state(&self.data_dir, |state| {
+        let (mut report, to_kill, feeds) = with_state(&self.data_dir, |state| {
             let trees = self.refresh(state, &scan, &listeners, now_ms);
             let obs: Vec<Observation> = state
                 .servers
@@ -893,8 +910,22 @@ impl<P: Platform> Watcher<P> {
                 report.servers.push(view);
             }
             state.servers.retain(|s| !forget.contains(&s.key));
-            (report, to_kill)
+            let feeds: Vec<Feed> = state
+                .servers
+                .iter()
+                .zip(&obs)
+                .zip(&trees)
+                .map(|((s, o), t)| Feed {
+                    key: s.key,
+                    agent: s.agent,
+                    procs: t.procs.clone(),
+                    established: o.established,
+                    session_alive: o.session_alive,
+                })
+                .collect();
+            (report, to_kill, feeds)
         })?;
+        self.feed_history(&feeds, &report, now_ms);
 
         if mode == Mode::Observe {
             report.killed = to_kill
@@ -907,6 +938,58 @@ impl<P: Platform> Watcher<P> {
         report.killed = killed;
         report.servers.retain(|v| !gone.contains(&v.key));
         Ok(report)
+    }
+
+    /// Feeds the history from one pass: a sample and the connection count of
+    /// every live server, plus its lifecycle events.
+    fn feed_history(&mut self, feeds: &[Feed], report: &TickReport, now_ms: u64) {
+        for f in feeds {
+            if self.history.track(f.key) {
+                self.history.push_event(
+                    f.key,
+                    ServerEvent {
+                        at_ms: now_ms,
+                        kind: EventKind::Started {
+                            agent: Some(f.agent),
+                        },
+                    },
+                );
+            }
+            if f.procs.is_empty() {
+                continue;
+            }
+            let tree: Vec<(ProcId, ProcResources)> = f
+                .procs
+                .iter()
+                .filter_map(|&id| Some((id, self.platform.proc_resources(id.0)?)))
+                .collect();
+            self.history.record(f.key, now_ms, &tree);
+            self.history.note_connections(f.key, now_ms, f.established);
+            if !f.session_alive {
+                self.history.note_session_ended(f.key, now_ms);
+            }
+        }
+        for a in &report.alerts {
+            let seen = self.history.events(a.key).iter().any(|e| {
+                e.kind
+                    == EventKind::Alert {
+                        alert: AlertKind::Idle,
+                    }
+            });
+            if !seen {
+                self.history.push_event(
+                    a.key,
+                    ServerEvent {
+                        at_ms: now_ms,
+                        kind: EventKind::Alert {
+                            alert: AlertKind::Idle,
+                        },
+                    },
+                );
+            }
+        }
+        let live: HashSet<ServerKey> = report.servers.iter().map(|v| v.key).collect();
+        self.history.retain(&live, now_ms);
     }
 
     /// Kills each server's tree outside the state lock (the grace period can
@@ -1802,6 +1885,54 @@ mod tests {
         })
         .unwrap();
         assert_eq!(f.state_servers().len(), 1);
+    }
+
+    #[test]
+    fn history_fed_each_pass() {
+        let mut f = fx();
+        f.p().set_resources(30, 100 * 1_048_576, 1_000_000_000);
+        f.p().set_resources(31, 50 * 1_048_576, 0);
+        f.w.tick(T0).unwrap();
+        f.p().set_resources(30, 120 * 1_048_576, 1_500_000_000);
+        f.w.tick(T0 + 1000).unwrap();
+        let h = f.w.history();
+        let s = h.samples(key30());
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].rss_bytes, 150 * 1_048_576);
+        assert_eq!(s[1].rss_bytes, 170 * 1_048_576);
+        assert!(s[1].cpu_pct > 0.0);
+        let started = h
+            .events(key30())
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::Started { .. }))
+            .count();
+        assert_eq!(started, 1);
+    }
+
+    #[test]
+    fn history_records_alert_and_session_end_once() {
+        let mut f = fx();
+        f.w.tick(T0).unwrap();
+        f.w.tick(T0 + 30 * MIN).unwrap();
+        f.w.tick(T0 + 31 * MIN).unwrap();
+        let alerts = |f: &Fx| {
+            f.w.history()
+                .events(key30())
+                .iter()
+                .filter(|e| matches!(e.kind, EventKind::Alert { .. }))
+                .count()
+        };
+        assert_eq!(alerts(&f), 1);
+        f.p().remove_proc(20);
+        f.w.observe(T0 + 32 * MIN).unwrap();
+        f.w.observe(T0 + 33 * MIN).unwrap();
+        let ended =
+            f.w.history()
+                .events(key30())
+                .iter()
+                .filter(|e| e.kind == EventKind::SessionEnded)
+                .count();
+        assert_eq!(ended, 1);
     }
 
     #[test]
