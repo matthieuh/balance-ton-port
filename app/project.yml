@@ -43,7 +43,7 @@ targets:
         CODE_SIGN_IDENTITY: "-"
         CODE_SIGN_STYLE: Manual
         SWIFT_TREAT_WARNINGS_AS_ERRORS: true
-  # Pure helpers (Sources/Logic.swift) plus the Rust core, no app host: the
+  # Pure helpers (Sources/Logic.swift, Sources/Menu/MenuStyle.swift) plus the Rust core, no app host: the
   # tests never start the app, its watch passes or its notifications.
   BalanceTonPortTests:
     type: bundle.unit-test
@@ -51,6 +51,7 @@ targets:
     sources:
       - path: Tests
       - path: Sources/Logic.swift
+      - path: Sources/Menu/MenuStyle.swift
       - path: Sources/Generated
     dependencies:
       - framework: Frameworks/BtpCore.xcframework

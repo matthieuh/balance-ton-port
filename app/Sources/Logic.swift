@@ -1,5 +1,4 @@
 import Foundation
-import SwiftUI
 import UserNotifications
 
 // Pure helpers: no UI, no notification center, no core queue. Compiled into
@@ -123,6 +122,13 @@ let cardRadius = concentricRadius(outer: panelRadius, padding: 4)
 let rowRadius = concentricRadius(outer: panelRadius, padding: 6)
 let iconRadius = concentricRadius(outer: rowRadius, padding: 4)
 
+/// The tallest the scrolling middle of the menu (cards and rows) may be on
+/// a screen whose visible height is `screenHeight`: the rest is left to the
+/// header, the footer and a margin. Never under 200 pt.
+func sectionsMaxHeight(screenHeight: CGFloat) -> CGFloat {
+    max(200, screenHeight - 220)
+}
+
 /// The menu's two lists: servers that need a decision (one card each) and
 /// the others, of which the first `visibleAllGood` show before the fold.
 struct MenuSections {
@@ -133,13 +139,18 @@ struct MenuSections {
 
 /// Cards: leak, session ended but open, about to stop, idle alert, then the
 /// biggest first. All good: agent servers by port, then the others by port.
+/// The port (then the pid) breaks every tie, so rows never swap between
+/// passes.
 func menuSections(_ servers: [ServerViewFfi], visibleAllGood: Int = allGoodVisibleRows) -> MenuSections {
     let cards = servers.filter { $0.card != nil }.sorted {
         let (a, b) = (cardRank($0.card?.kind), cardRank($1.card?.kind))
-        return a != b ? a < b : $0.rssBytes > $1.rssBytes
+        if a != b { return a < b }
+        if $0.rssBytes != $1.rssBytes { return $0.rssBytes > $1.rssBytes }
+        return ($0.port, $0.pid) < ($1.port, $1.pid)
     }
     let rest = servers.filter { $0.card == nil }.sorted {
-        $0.managed != $1.managed ? $0.managed : $0.port < $1.port
+        if $0.managed != $1.managed { return $0.managed }
+        return ($0.port, $0.pid) < ($1.port, $1.pid)
     }
     let shown = Array(rest.prefix(max(0, visibleAllGood)))
     return MenuSections(needsYou: cards, allGood: shown, hiddenCount: rest.count - shown.count)
@@ -169,53 +180,27 @@ func cardActionIsProminent(_ card: CardFfi) -> Bool {
     card.action == "restart"
 }
 
-/// Leak and idle cards are amber; the session ended ones rose.
-func cardTint(_ card: CardFfi) -> Color {
-    switch card.kind {
-    case "leak", "idle_alert": return .orange
-    default: return .pink
-    }
-}
-
-/// `green`, `amber` or `red` memory health, as system colors.
-func healthColor(_ health: String) -> Color {
-    switch health {
-    case "red": return .red
-    case "amber": return .orange
-    default: return .green
-    }
-}
-
-/// A size label's color: plain (`nil`) while healthy.
-func sizeColor(_ health: String) -> Color? {
-    health == "green" ? nil : healthColor(health)
-}
-
 /// A port's hue in 0..<1: the golden-ratio step from the port number, so
 /// neighbours differ and a port keeps its color across launches.
 func portHue(_ port: UInt16) -> Double {
     (Double(port) * 0.618_033_988_75).truncatingRemainder(dividingBy: 1)
 }
 
-/// A port's color: pastel on the dark panel, deeper on the light one.
-func portColor(_ port: UInt16, dark: Bool = true) -> Color {
-    Color(hue: portHue(port), saturation: dark ? 0.45 : 0.75, brightness: dark ? 0.95 : 0.62)
-}
-
-/// `✳ Claude` orange, `◎ Codex` blue, `no agent` secondary (`nil`).
-func agentBadge(_ s: ServerViewFfi) -> (text: String, color: Color?) {
+/// `✳ Claude`, `◎ Codex`, or `no agent`.
+func agentBadgeText(_ s: ServerViewFfi) -> String {
     switch s.agent {
-    case "claude_code": return ("\u{2733} Claude", .orange)
-    case "codex": return ("\u{25CE} Codex", .blue)
-    default: return ("no agent", nil)
+    case "claude_code": return "\u{2733} Claude"
+    case "codex": return "\u{25CE} Codex"
+    default: return "no agent"
     }
 }
 
-/// The parts of a row's second line, so each can take its own color.
+/// The parts of a row's second line, so each can take its own color and
+/// its own truncation.
 struct SubtitleParts: Equatable {
     /// `:3010`
     let port: String
-    /// `+9229 +9230`, or `nil` with a single port.
+    /// `+9229`, or `+9229 +4` past one extra port; `nil` with a single port.
     let otherPorts: String?
     /// The branch, else the project folder; `nil` when neither is known.
     let place: String?
@@ -223,14 +208,13 @@ struct SubtitleParts: Equatable {
 }
 
 func subtitleParts(_ s: ServerViewFfi) -> SubtitleParts {
-    let others = s.ports.filter { $0 != s.port }.map { "+" + String($0) }
+    let others = s.ports.filter { $0 != s.port }
+    var extra: String?
+    if let first = others.first {
+        extra = "+" + String(first) + (others.count > 1 ? " +\(others.count - 1)" : "")
+    }
     let place = [s.branch ?? "", s.worktreeName].first { !$0.isEmpty }
-    return SubtitleParts(
-        port: portLabel(s.port),
-        otherPorts: others.isEmpty ? nil : others.joined(separator: " "),
-        place: place,
-        badge: agentBadge(s).text
-    )
+    return SubtitleParts(port: portLabel(s.port), otherPorts: extra, place: place, badge: agentBadgeText(s))
 }
 
 /// `:3010 +9229 · roadbook-explore · ✳ Claude`.
@@ -339,54 +323,6 @@ func usageCaption(_ line: String) -> UsageCaption? {
 func usageHelp(_ m: MemoryBarFfi) -> String {
     let mb = { (b: UInt64) in "\(b / 1_048_576) MB" }
     return "Dev servers \(mb(m.devBytes))\nOther apps \(mb(m.appsBytes))\nFree \(mb(m.freeBytes)) of \(mb(m.totalBytes))"
-}
-
-/// What stands for a server without a favicon: its framework's tile, else
-/// the first letter of its title in its port's color.
-struct IconTile: Equatable {
-    let letter: String
-    /// An SF Symbol drawn instead of the letter.
-    let symbol: String?
-    /// `nil`: the neutral tile.
-    let background: Color?
-    /// `nil`: white on a colored tile, the port's color on the neutral one.
-    let foreground: Color?
-}
-
-func iconTile(_ s: ServerViewFfi) -> IconTile {
-    func tile(_ letter: String, _ hex: UInt32, symbol: String? = nil) -> IconTile {
-        IconTile(letter: letter, symbol: symbol, background: Color(hex: hex), foreground: nil)
-    }
-    switch s.framework {
-    case "Vite": return tile("V", 0x8A5CF6)
-    case "Next.js": return tile("N", 0x000000)
-    case "Astro": return tile("A", 0xFF5D01)
-    case "Remix": return tile("R", 0x3992FF)
-    case "Nuxt": return tile("N", 0x00C16A)
-    case "SvelteKit": return tile("S", 0xFF3E00)
-    case "Storybook": return tile("S", 0xFF4785)
-    case "Expo": return tile("E", 0x4630EB)
-    case "Django": return tile("D", 0x0C4B33)
-    case "Rails": return tile("R", 0xCC0000)
-    case "Flask": return tile("F", 0x3B3B3B)
-    case "wrangler": return tile("W", 0xF38020, symbol: "cloud.fill")
-    case "static": return tile("S", 0x5A6270, symbol: "doc.fill")
-    default:
-        let title = titleParts(s).title
-        let letter = title.first(where: { $0.isLetter || $0.isNumber }).map { String($0).uppercased() } ?? "?"
-        return IconTile(letter: letter, symbol: nil, background: nil, foreground: nil)
-    }
-}
-
-extension Color {
-    /// `0xRRGGBB`.
-    init(hex: UInt32) {
-        self.init(
-            red: Double((hex >> 16) & 0xFF) / 255,
-            green: Double((hex >> 8) & 0xFF) / 255,
-            blue: Double(hex & 0xFF) / 255
-        )
-    }
 }
 
 // MARK: - Notifications

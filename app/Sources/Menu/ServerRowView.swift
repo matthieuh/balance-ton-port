@@ -2,7 +2,8 @@ import AppKit
 import SwiftUI
 
 /// The second line of a card or row: port in its color, other ports, branch
-/// or project, agent badge, and (rows only) the status.
+/// or project, agent badge, and (rows only) the status. The place gives way
+/// first (cut in the middle); the status stays whole.
 struct ServerSubtitle: View {
     let server: ServerViewFfi
     var status: String?
@@ -11,19 +12,30 @@ struct ServerSubtitle: View {
     var body: some View {
         let p = subtitleParts(server)
         let badge = agentBadge(server)
-        let sep = Text(verbatim: " \u{00B7} ")
-        var line = Text(verbatim: p.port)
+        let sep = " \u{00B7} "
+        let port = Text(verbatim: p.port)
             .font(.system(size: 12, design: .monospaced))
             .foregroundColor(portColor(server.port, dark: scheme == .dark))
-        if let others = p.otherPorts { line = line + Text(verbatim: " " + others) }
-        if let place = p.place { line = line + sep + Text(verbatim: truncatedSessionName(place)) }
-        line = line + sep + Text(verbatim: badge.text).foregroundColor(badge.color ?? Color(nsColor: .tertiaryLabelColor))
-        if let status { line = line + sep + Text(verbatim: status) }
-        return line
-            .font(.system(size: 12))
-            .foregroundStyle(.secondary)
-            .lineLimit(1)
-            .truncationMode(.tail)
+        HStack(spacing: 0) {
+            (p.otherPorts.map { port + Text(verbatim: " " + $0) } ?? port)
+                .fixedSize()
+            if let place = p.place {
+                Text(verbatim: sep + place)
+                    .truncationMode(.middle)
+                    .layoutPriority(0)
+            }
+            (Text(verbatim: sep) + Text(verbatim: badge.text)
+                .foregroundColor(badge.color ?? Color(nsColor: .tertiaryLabelColor)))
+                .fixedSize()
+            if let status {
+                Text(verbatim: sep + status)
+                    .truncationMode(.tail)
+                    .layoutPriority(2)
+            }
+        }
+        .font(.system(size: 12))
+        .foregroundStyle(.secondary)
+        .lineLimit(1)
     }
 }
 

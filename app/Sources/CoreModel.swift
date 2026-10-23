@@ -14,6 +14,8 @@ final class CoreModel: ObservableObject {
     /// Favicons by server, loaded off the main thread once per server.
     @Published private(set) var icons: [ServerID: NSImage] = [:]
     private var iconsLoading: Set<ServerID> = []
+    /// Servers whose favicon bytes NSImage could not read: not fetched again.
+    private var iconsUndecodable: Set<ServerID> = []
     @Published private(set) var recentKills: [KillRecordFfi] = []
     /// True while another process (for example `btp watch`) holds the watch
     /// lock: the app then only observes and never runs a killing tick.
@@ -292,19 +294,24 @@ final class CoreModel: ObservableObject {
 
     /// Fetches the favicon of each server that has one and is not cached
     /// yet, on the core queue; forgets the icons of servers gone. A fetch
-    /// that finds nothing is tried again on a later pass.
+    /// that finds nothing is tried again on a later pass; bytes that do not
+    /// decode are not.
     private func loadIcons(for servers: [ServerViewFfi]) {
         let live = Set(servers.map(\.id))
         icons = icons.filter { live.contains($0.key) }
+        iconsUndecodable.formIntersection(live)
         for server in servers where server.hasIcon {
             let id = server.id
-            guard icons[id] == nil, !iconsLoading.contains(id) else { continue }
+            guard icons[id] == nil, !iconsLoading.contains(id), !iconsUndecodable.contains(id) else { continue }
             iconsLoading.insert(id)
             Task {
                 let data = try? await onCore { core in core.icon(pid: id.pid, startTime: id.startTime) }
                 iconsLoading.remove(id)
-                if let data, let image = NSImage(data: data), lastPassServers.contains(where: { $0.id == id }) {
+                guard let data, lastPassServers.contains(where: { $0.id == id }) else { return }
+                if let image = NSImage(data: data) {
                     icons[id] = image
+                } else {
+                    iconsUndecodable.insert(id)
                 }
             }
         }

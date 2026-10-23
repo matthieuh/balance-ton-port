@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import SwiftUI
 import UserNotifications
 import XCTest
 
@@ -614,6 +615,29 @@ final class MenuLayoutTests: XCTestCase {
         XCTAssertEqual(rowSubtitle(menuServer(port: 8081, worktree: "")), ":8081 \u{00B7} \u{2733} Claude")
     }
 
+    func testExtraPortsShowOneThenACount() {
+        let many = menuServer(port: 3022, ports: [3022, 3030, 5433, 6379, 35432, 41000], worktree: "")
+        XCTAssertEqual(subtitleParts(many).otherPorts, "+3030 +4")
+        XCTAssertEqual(rowSubtitle(many), ":3022 +3030 +4 \u{00B7} \u{2733} Claude")
+        XCTAssertEqual(subtitleParts(menuServer(port: 1, ports: [1, 2])).otherPorts, "+2")
+        XCTAssertNil(subtitleParts(menuServer(port: 1)).otherPorts)
+    }
+
+    func testEqualCardsAndRowsKeepAStableOrder() {
+        let servers = [
+            menuServer(port: 3003, card: "idle_alert", rssMb: 50),
+            menuServer(port: 3000, card: "idle_alert", rssMb: 50),
+            menuServer(port: 3001, card: "idle_alert", rssMb: 50),
+        ]
+        XCTAssertEqual(menuSections(servers).needsYou.map(\.port), [3000, 3001, 3003])
+        XCTAssertEqual(menuSections(servers.reversed()).needsYou.map(\.port), [3000, 3001, 3003])
+    }
+
+    func testSectionsMaxHeightLeavesRoomForHeaderAndFooter() {
+        XCTAssertEqual(sectionsMaxHeight(screenHeight: 1000), 780)
+        XCTAssertEqual(sectionsMaxHeight(screenHeight: 300), 200)
+    }
+
     func testTitlePartsDropARepeatedFramework() {
         XCTAssertEqual(titleParts(menuServer(title: "Revva", framework: "Expo")).framework, "Expo")
         XCTAssertNil(titleParts(menuServer(title: "Vite", framework: "Vite")).framework)
@@ -654,6 +678,8 @@ final class MenuLayoutTests: XCTestCase {
     }
 
     func testHealthAndSizeColors() {
+        XCTAssertEqual(needsYouColor(dark: true), Color(hex: 0xE9B764))
+        XCTAssertNotEqual(needsYouColor(dark: false), needsYouColor(dark: true))
         XCTAssertEqual(healthColor("green"), .green)
         XCTAssertEqual(healthColor("amber"), .orange)
         XCTAssertEqual(healthColor("red"), .red)
@@ -695,6 +721,11 @@ final class MenuLayoutTests: XCTestCase {
     func testIconTiles() {
         XCTAssertEqual(iconTile(menuServer(framework: "Vite")).letter, "V")
         XCTAssertEqual(iconTile(menuServer(framework: "wrangler")).symbol, "cloud.fill")
+        XCTAssertEqual(iconTile(menuServer(framework: "Vite")).background?.count, 2, "the Vite gradient")
+        let serve = iconTile(menuServer(title: "serve", framework: "static"))
+        XCTAssertEqual(serve.letter, "S")
+        XCTAssertNil(serve.background, "a letter on the neutral tile")
+        XCTAssertNil(serve.symbol)
         let plain = iconTile(menuServer(title: "serve"))
         XCTAssertEqual(plain.letter, "S")
         XCTAssertNil(plain.background)

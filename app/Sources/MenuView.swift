@@ -7,22 +7,56 @@ import SwiftUI
 struct MenuView: View {
     @EnvironmentObject private var model: CoreModel
     @Environment(\.openSettings) private var openSettings
+    @Environment(\.colorScheme) private var scheme
     @State private var showAll = false
+    /// The cards and rows' natural height, measured, so the scroll view is
+    /// only as tall as its content up to `sectionsMaxHeight`.
+    @State private var sectionsHeight: CGFloat = 0
 
     var body: some View {
         let sections = menuSections(model.servers, visibleAllGood: showAll ? .max : allGoodVisibleRows)
         VStack(alignment: .leading, spacing: 0) {
-            HeaderView(count: model.servers.count, memory: model.memory, servers: model.servers)
-                .padding(.bottom, 12)
-            notices
+            VStack(alignment: .leading, spacing: 0) {
+                HeaderView(count: model.servers.count, memory: model.memory, servers: model.servers)
+                    .padding(.bottom, 12)
+                notices
+            }
+            .padding(.horizontal, panelPadding)
+            // Inside the scroll view, so the cards' shadows are not clipped.
+            ScrollView(.vertical) {
+                sectionsView(sections)
+                    .padding(.horizontal, panelPadding)
+                    .background(GeometryReader { geo in
+                        Color.clear.preference(key: SectionsHeightKey.self, value: geo.size.height)
+                    })
+            }
+            .scrollIndicators(.automatic)
+            .frame(height: min(sectionsHeight, maxSectionsHeight))
+            .onPreferenceChange(SectionsHeightKey.self) { sectionsHeight = $0 }
+            FooterView(recentKills: model.recentKills)
+                .padding(.top, 6)
+                .padding(.horizontal, panelPadding)
+        }
+        .padding(.top, panelPadding)
+        .padding(.bottom, 10)
+        .frame(width: panelWidth, alignment: .leading)
+    }
 
+    private var maxSectionsHeight: CGFloat {
+        sectionsMaxHeight(screenHeight: NSScreen.main?.visibleFrame.height ?? 800)
+    }
+
+    @ViewBuilder private func sectionsView(_ sections: MenuSections) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
             if sections.needsYou.isEmpty {
                 Label(nothingToDecide, systemImage: "checkmark.circle.fill")
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(.green)
                     .padding(.bottom, 12)
             } else {
-                sectionHeader(sectionTitle("Needs you", count: sections.needsYou.count), color: .orange)
+                sectionHeader(
+                    sectionTitle("Needs you", count: sections.needsYou.count), color: needsYouColor(dark: scheme == .dark)
+                )
                     .padding(.bottom, 6)
                 VStack(spacing: 8) {
                     ForEach(sections.needsYou, id: \.id) { server in
@@ -62,14 +96,8 @@ struct MenuView: View {
                     .buttonStyle(PressableStyle())
                 }
             }
-
-            FooterView(recentKills: model.recentKills)
-                .padding(.top, 6)
         }
-        .padding(.horizontal, panelPadding)
-        .padding(.top, panelPadding)
-        .padding(.bottom, 10)
-        .frame(width: panelWidth, alignment: .leading)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func sectionHeader(_ title: String, color: Color) -> some View {
@@ -129,5 +157,12 @@ struct MenuView: View {
     private var hasNotices: Bool {
         menuNotificationFix(model.notificationPermission) != nil || model.watchedElsewhere
             || model.lastError != nil || model.killNotice != nil
+    }
+}
+
+private struct SectionsHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }
