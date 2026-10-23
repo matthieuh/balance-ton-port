@@ -1266,11 +1266,15 @@ mod tests {
         codex_server_chain(&f);
         f.w.tick(T0 - 30 * MIN).unwrap();
         assert!(f.state_servers().iter().any(|s| s.key.pid == 304));
-        // The Codex session is gone and its server long idle: due.
+        // Both sessions are gone (they share the worktree) and both servers
+        // are long idle: both are due, but only the swept session's is killed.
         f.p().remove_proc(300);
+        f.p().remove_proc(20);
         let proc_start = format_proc_start(START + 20 * SEC);
         let out = f.w.sweep_session(20, &proc_start, T0 + 30 * MIN).unwrap();
-        assert!(out.killed.iter().all(|k| k.port != 5173));
+        let ports: Vec<u16> = out.killed.iter().map(|k| k.port).collect();
+        assert_eq!(ports, vec![3000]);
+        assert!(!f.p().is_alive(30));
         assert!(f.p().is_alive(304));
         assert!(f.p().signals().iter().all(|&(pid, _)| pid != 304));
     }

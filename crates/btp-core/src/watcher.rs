@@ -1,8 +1,8 @@
 //! The watcher ties everything together: it links new listeners to the
-//! Claude Code session that started them, observes tracked servers, asks
+//! agent session (Claude Code or Codex) that started them, observes tracked servers, asks
 //! `decide` what to do, and executes it (kill, alert, forget).
 //!
-//! Safety: only a server linked at first sight to a live Claude Code session
+//! Safety: only a server linked at first sight to a live agent session
 //! is ever tracked, and only tracked servers are ever signalled, each signal
 //! guarded by a fresh start-time check (a pid can be reused at any moment).
 
@@ -164,7 +164,8 @@ pub fn link(
             (session, conversation)
         }
         None => {
-            if chain.iter().any(blocks) {
+            // Only a Codex session can be found through the env: no read otherwise.
+            if !sessions.iter().any(|s| s.agent == AgentKind::Codex) || chain.iter().any(blocks) {
                 return None;
             }
             let thread = thread(chain.len())?;
@@ -1238,6 +1239,31 @@ mod tests {
         f.w.tick(T0).unwrap();
         let s = server_of(&f, 310).expect("linked");
         assert_eq!((s.agent, s.session_id.as_str()), (AgentKind::Codex, "T1"));
+    }
+
+    #[test]
+    fn no_env_read_for_a_reparented_listener_without_codex_sessions() {
+        let f = fx();
+        let web = f.wt.join("apps/web");
+        f.p().spawn(
+            310,
+            1,
+            START + 310 * SEC,
+            "node vite",
+            web.to_str().unwrap(),
+        );
+        let chain = ancestry(f.p(), 310);
+        let calls = std::cell::Cell::new(0);
+        let envs = |_: i32| {
+            calls.set(calls.get() + 1);
+            None
+        };
+        let l = Listener {
+            pid: 310,
+            port: 5174,
+        };
+        assert_eq!(link(&l, &chain, &envs, &sessions(&f), &f.cfg(), T0), None);
+        assert_eq!(calls.get(), 0);
     }
 
     #[test]
