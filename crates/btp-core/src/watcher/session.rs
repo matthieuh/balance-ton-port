@@ -448,15 +448,20 @@ impl<P: Platform> Watcher<P> {
     /// Sets the agent's note on the server listening on `port`, when it
     /// belongs to the caller's own live session process. The latest note
     /// replaces the previous one; the user's Keep is never touched.
+    /// `env_thread` is the caller's own `CODEX_THREAD_ID`, when set.
     pub fn note(
         &mut self,
         caller_pid: i32,
+        env_thread: Option<&str>,
         port: u16,
         cmd: NoteCmd,
         now_ms: u64,
     ) -> io::Result<NoteOutcome> {
         let scan = self.scan();
-        let Some((caller_pid, caller_start)) = self.caller_process(caller_pid, None, &scan) else {
+        let ancestry_pick = self.caller_process(caller_pid, None, &scan);
+        let Some((caller_pid, caller_start)) =
+            caller_session(env_thread, &scan.sessions(), ancestry_pick)
+        else {
             return Ok(NoteOutcome::NoSession);
         };
         let listeners = self.platform.listeners();
@@ -601,6 +606,25 @@ impl<P: Platform> Watcher<P> {
     }
 }
 
+/// The session a `btp note` caller speaks for. A `CODEX_THREAD_ID` in the
+/// caller's own environment names the live session holding that thread
+/// (`conversation_id` or `other_conversations`); an unknown thread is
+/// refused and never falls back to the process ancestry. Without it, the
+/// ancestry pick stands.
+fn caller_session(
+    env_thread: Option<&str>,
+    sessions: &[AgentSession],
+    ancestry_pick: Option<(i32, String)>,
+) -> Option<(i32, String)> {
+    let Some(thread) = env_thread.filter(|t| !t.is_empty()) else {
+        return ancestry_pick;
+    };
+    sessions
+        .iter()
+        .find(|s| holds_thread(s, thread))
+        .map(|s| (s.pid, s.proc_start.clone()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests::*;
@@ -701,7 +725,7 @@ mod tests {
         let mut f = fx();
         hook(&f);
         tracked(&mut f);
-        f.w.note(HOOK, 3000, NoteCmd::Done, T0).unwrap();
+        f.w.note(HOOK, None, 3000, NoteCmd::Done, T0).unwrap();
         let r = end(&mut f, T0);
         assert!(f.p().signals().is_empty());
         assert_eq!(r.sweep_at, Some(T0));
@@ -934,7 +958,7 @@ mod tests {
         let mut f = fx();
         hook(&f);
         tracked(&mut f);
-        f.w.note(HOOK, 3000, NoteCmd::Done, T0).unwrap();
+        f.w.note(HOOK, None, 3000, NoteCmd::Done, T0).unwrap();
         f.p().set_established(30, 3000, 1);
         end(&mut f, T0);
         quit(&f);
@@ -1037,8 +1061,14 @@ mod tests {
         hook(&f);
         tracked(&mut f);
         let out =
-            f.w.note(HOOK, 3000, NoteCmd::Keep(Some("form demo".into())), T0)
-                .unwrap();
+            f.w.note(
+                HOOK,
+                None,
+                3000,
+                NoteCmd::Keep(Some("form demo".into())),
+                T0,
+            )
+            .unwrap();
         assert_eq!(
             out,
             NoteOutcome::Set {
@@ -1051,7 +1081,7 @@ mod tests {
         assert_eq!(n.reason.as_deref(), Some("form demo"));
         assert_eq!(n.set_at_ms, T0);
         // The latest intent replaces the previous one.
-        f.w.note(HOOK, 3000, NoteCmd::Done, T0 + 1).unwrap();
+        f.w.note(HOOK, None, 3000, NoteCmd::Done, T0 + 1).unwrap();
         let n = f.state_servers()[0].note.clone().unwrap();
         assert!(!n.keep && n.done);
     }
@@ -1063,7 +1093,7 @@ mod tests {
         f.p().spawn(50, 10, START + 50 * SEC, "claude", "/");
         f.session(50, "sess-b", Path::new("/elsewhere"), START + 50 * SEC);
         f.p().spawn(51, 50, START + 51 * SEC, "btp note", "/");
-        let out = f.w.note(51, 3000, NoteCmd::Done, T0).unwrap();
+        let out = f.w.note(51, None, 3000, NoteCmd::Done, T0).unwrap();
         assert_eq!(out, NoteOutcome::OtherSession);
         assert_eq!(f.state_servers()[0].note, None);
     }
@@ -1074,12 +1104,12 @@ mod tests {
         tracked(&mut f);
         f.p().spawn(51, 10, START + 51 * SEC, "btp note", "/");
         assert_eq!(
-            f.w.note(51, 3000, NoteCmd::Done, T0).unwrap(),
+            f.w.note(51, None, 3000, NoteCmd::Done, T0).unwrap(),
             NoteOutcome::NoSession
         );
         hook(&f);
         assert_eq!(
-            f.w.note(HOOK, 4444, NoteCmd::Done, T0).unwrap(),
+            f.w.note(HOOK, None, 4444, NoteCmd::Done, T0).unwrap(),
             NoteOutcome::NotTracked
         );
         assert_eq!(f.state_servers()[0].note, None);
@@ -1090,7 +1120,7 @@ mod tests {
         let mut f = fx();
         hook(&f);
         tracked(&mut f);
-        f.w.note(HOOK, 3000, NoteCmd::Keep(None), T0).unwrap();
+        f.w.note(HOOK, None, 3000, NoteCmd::Keep(None), T0).unwrap();
         // Same pid, new process (pid reuse), then a fresh pid.
         f.p().remove_proc(30);
         f.p().remove_proc(31);
@@ -1304,5 +1334,39 @@ mod tests {
         let group = r.group.expect("group");
         assert_eq!(group.still_open.len(), 1);
         assert_eq!(group.still_open[0].port, 3000);
+    }
+
+    fn codex(pid: i32, thread: &str, others: &[&str]) -> AgentSession {
+        AgentSession {
+            agent: AgentKind::Codex,
+            pid,
+            proc_start: format!("start-{pid}"),
+            conversation_id: thread.into(),
+            other_conversations: others.iter().map(|o| o.to_string()).collect(),
+            cwd: "/w".into(),
+            name: "w".into(),
+            status: crate::sessions::SessionStatus::Unknown,
+            status_updated_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn note_from_codex_thread_env_is_checked() {
+        let sessions = [codex(300, "T1", &["T1b"]), codex(400, "T2", &[])];
+        let pick = Some((20, "claude-start".to_string()));
+        // The thread names its session, whatever the ancestry says.
+        assert_eq!(
+            caller_session(Some("T1"), &sessions, pick.clone()),
+            Some((300, "start-300".into()))
+        );
+        assert_eq!(
+            caller_session(Some("T1b"), &sessions, None),
+            Some((300, "start-300".into()))
+        );
+        // An unknown thread is refused, never the ancestry.
+        assert_eq!(caller_session(Some("nope"), &sessions, pick.clone()), None);
+        // No thread: the ancestry pick.
+        assert_eq!(caller_session(None, &sessions, pick.clone()), pick);
+        assert_eq!(caller_session(None, &sessions, None), None);
     }
 }

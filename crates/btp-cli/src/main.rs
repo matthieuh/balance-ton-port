@@ -5,10 +5,10 @@
 use btp_core::config::{data_dir, effective_claude_dirs, read_config, save_config};
 use btp_core::display::format_idle as ago;
 use btp_core::display::{format_idle, name_list, server_state as state_label, session_ended_body};
-use btp_core::labels::tool_label;
-use btp_core::model::{KillReason, KillTarget, ServerKey};
+use btp_core::labels::{location_label, tool_label};
+use btp_core::model::{KillReason, KillTarget, ServerKey, TrackedServer};
 use btp_core::platform::MacOs;
-use btp_core::state::{KillRecord, SessionEndedGroup};
+use btp_core::state::{is_read_only_error, read_state_readonly, KillRecord, SessionEndedGroup};
 use btp_core::watcher::{
     acquire_watch_lock, now_ms, NoteCmd, NoteOutcome, OwnKillOutcome, ServerView, TickReport,
     Watcher,
@@ -175,6 +175,8 @@ impl From<io::Error> for Failure {
     fn from(e: io::Error) -> Self {
         if e.kind() == io::ErrorKind::WouldBlock {
             Failure::User(e.to_string())
+        } else if is_read_only_error(&e) {
+            Failure::User("data dir is read-only here; run btp outside the sandbox".into())
         } else {
             Failure::Internal(e.to_string())
         }
@@ -212,13 +214,29 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
     let dir = data_dir();
     match cmd {
         Cmd::List { json } => {
-            let report = Watcher::new(MacOs, dir.clone()).observe(now_ms())?;
-            warn_config(report.config_error.as_deref());
-            let kills = btp_core::state::with_state(&dir, |s| s.recent_kills.clone())?;
+            let pass = Watcher::new(MacOs, dir.clone())
+                .observe(now_ms())
+                .and_then(|report| {
+                    let kills = btp_core::state::with_state(&dir, |s| s.recent_kills.clone())?;
+                    Ok((report.servers, report.config_error, kills))
+                });
+            let (servers, config_error, kills) = match pass {
+                Ok(all) => all,
+                Err(e) if is_read_only_error(&e) => {
+                    let saved = read_state_readonly(&dir)?;
+                    eprintln!(
+                        "btp: data dir is read-only here (sandbox?), showing the last saved state"
+                    );
+                    let now = now_ms();
+                    let servers = saved.servers.iter().map(|s| saved_view(s, now)).collect();
+                    (servers, None, saved.recent_kills)
+                }
+                Err(e) => return Err(e.into()),
+            };
+            warn_config(config_error.as_deref());
             if json {
                 let out = ListOutput {
-                    servers: report
-                        .servers
+                    servers: servers
                         .iter()
                         .map(|view| ServerOut {
                             view,
@@ -233,11 +251,12 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
                         .map_err(|e| Failure::Internal(e.to_string()))?
                 );
             } else {
-                print!("{}", render_list(&report.servers));
+                print!("{}", render_list(&servers));
             }
             Ok(0)
         }
         Cmd::Kill(KillArgs { key: Some(key), .. }) => {
+            require_writable(&dir)?;
             let mut w = Watcher::new(MacOs, dir);
             let out = w.kill_own(std::process::id() as i32, key)?;
             warn_config(w.config_error());
@@ -322,8 +341,16 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
                 (None, true) => NoteCmd::Done,
                 _ => return Err(Failure::User("give --keep [reason] or --done".into())),
             };
+            require_writable(&dir)?;
             let mut w = Watcher::new(MacOs, dir);
-            let out = w.note(std::process::id() as i32, a.port, cmd.clone(), now_ms())?;
+            let thread = std::env::var("CODEX_THREAD_ID").ok();
+            let out = w.note(
+                std::process::id() as i32,
+                thread.as_deref(),
+                a.port,
+                cmd.clone(),
+                now_ms(),
+            )?;
             warn_config(w.config_error());
             match out {
                 NoteOutcome::Set { port, tool_label } => {
@@ -341,7 +368,7 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
                     a.port
                 ))),
                 NoteOutcome::OtherSession => Err(Failure::User(format!(
-                    "port {} belongs to another Claude Code session: notes only apply to your own session's servers",
+                    "{} belongs to another session",
                     a.port
                 ))),
             }
@@ -782,6 +809,38 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 /// Aligned table, header `PORT  COMMAND  WORKTREE  STATE  IDLE`.
+/// Fails with the sandbox message before a command that needs to write the
+/// data dir resolves its caller (which would otherwise answer first).
+fn require_writable(dir: &std::path::Path) -> Result<(), Failure> {
+    btp_core::state::with_state(dir, |_| ())?;
+    Ok(())
+}
+
+/// A tracked server as last saved, for the read-only list: nothing is probed,
+/// so the session counts as alive and the idle time is the saved one.
+fn saved_view(s: &TrackedServer, now_ms: u64) -> ServerView {
+    ServerView {
+        key: s.key,
+        port: s.port,
+        ports: vec![s.port],
+        command: s.command.clone(),
+        tool_label: tool_label(&s.command),
+        worktree: s.worktree.clone(),
+        worktree_name: s
+            .worktree
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| s.worktree.display().to_string()),
+        location_label: location_label(&s.worktree),
+        session_name: s.session_name.clone(),
+        agent: s.agent,
+        started_ms: s.key.start_time / 1000,
+        session_alive: true,
+        idle_ms: now_ms.saturating_sub(s.last_active_ms),
+        kill_in_ms: None,
+    }
+}
+
 fn render_list(servers: &[ServerView]) -> String {
     let mut rows: Vec<[String; 5]> = vec![[
         "PORT".into(),

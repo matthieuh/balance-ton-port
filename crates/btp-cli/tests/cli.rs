@@ -162,3 +162,75 @@ fn list_json_recent_kill_reason_shape() {
         serde_json::json!({"kind": "dead_session_idle", "idle_ms": 7})
     );
 }
+
+fn running_as_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// `btp` isolated from any real agent: no Claude or Codex env, temp HOME.
+fn btp_isolated(data: &tempfile::TempDir) -> Command {
+    let mut c = btp(data);
+    c.env_remove("CODEX_HOME");
+    c.env_remove("CODEX_THREAD_ID");
+    c
+}
+
+fn saved_server_state() -> &'static str {
+    r#"{"servers":[{"key":{"pid":999999,"start_time":1},"port":4321,"command":"node vite","worktree":"/tmp/some-wt","session_id":"s","session_pid":1,"session_proc_start":"x","session_name":"demo","first_seen_ms":0,"last_active_ms":0,"kept":false,"alerted":false}]}"#
+}
+
+fn read_only(data: &tempfile::TempDir) -> impl Drop + '_ {
+    use std::os::unix::fs::PermissionsExt;
+    struct Restore<'a>(&'a std::path::Path);
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    std::fs::write(data.path().join("state.json"), saved_server_state()).unwrap();
+    std::fs::set_permissions(data.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+    Restore(data.path())
+}
+
+#[test]
+fn list_degrades_to_read_only_when_data_dir_not_writable() {
+    if running_as_root() {
+        return;
+    }
+    let (data, _e) = sandbox();
+    let _g = read_only(&data);
+    let out = btp_isolated(&data).arg("list").assert().success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(stdout.contains("4321"), "{stdout}");
+    assert!(
+        stderr.contains("btp: data dir is read-only here (sandbox?), showing the last saved state"),
+        "{stderr}"
+    );
+    btp_isolated(&data)
+        .args(["list", "--json"])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read(data.path().join("state.json")).unwrap(),
+        saved_server_state().as_bytes()
+    );
+}
+
+#[test]
+fn note_refuses_when_data_dir_not_writable() {
+    if running_as_root() {
+        return;
+    }
+    let (data, _e) = sandbox();
+    let _g = read_only(&data);
+    let out = btp_isolated(&data)
+        .args(["note", "4321", "--done"])
+        .assert()
+        .code(1);
+    let err = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        err.contains("btp: data dir is read-only here; run btp outside the sandbox"),
+        "{err}"
+    );
+}
