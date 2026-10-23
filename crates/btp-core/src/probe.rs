@@ -148,7 +148,6 @@ fn attributes(tag: &str) -> Vec<(String, String)> {
 /// `shortcut icon`) before an `apple-touch-icon`.
 pub fn icon_href(html: &str) -> Option<String> {
     let lower = html.to_ascii_lowercase();
-    let mut plain: Option<String> = None;
     let mut other: Option<String> = None;
     let mut from = 0;
     while let Some(i) = lower[from..].find("<link") {
@@ -187,13 +186,11 @@ pub fn icon_href(html: &str) -> Option<String> {
         if tokens.contains(&"icon") {
             return Some(href);
         }
-        if plain.is_none() && other.is_none() {
+        if other.is_none() {
             other = Some(href);
-        } else if other.is_none() {
-            plain = Some(href);
         }
     }
-    plain.or(other)
+    other
 }
 
 /// The request path of an icon `href` when it points at this very server:
@@ -201,6 +198,12 @@ pub fn icon_href(html: &str) -> Option<String> {
 /// `port`. Any other host or port, and `data:` URIs (see `data_icon`),
 /// give `None`.
 pub fn local_icon_path(href: &str, port: u16) -> Option<String> {
+    let path = local_icon_path_unchecked(href, port)?;
+    // Nothing that could break out of the request line.
+    (!path.chars().any(|c| c.is_whitespace() || c.is_control())).then_some(path)
+}
+
+fn local_icon_path_unchecked(href: &str, port: u16) -> Option<String> {
     let href = href.trim();
     let lower = href.to_ascii_lowercase();
     if lower.starts_with("data:") || href.starts_with("//") {
@@ -316,6 +319,8 @@ struct Response {
     location: Option<String>,
     content_type: Option<String>,
     body: Vec<u8>,
+    /// The body was longer than the cap and was cut.
+    truncated: bool,
 }
 
 fn dechunk(raw: &[u8]) -> Vec<u8> {
@@ -334,9 +339,12 @@ fn dechunk(raw: &[u8]) -> Vec<u8> {
         if size == 0 {
             break;
         }
-        let end = (i + size).min(raw.len());
+        let Some(end) = i.checked_add(size) else {
+            break;
+        };
+        let end = end.min(raw.len());
         out.extend_from_slice(&raw[i..end]);
-        i = end + 2;
+        i = end.saturating_add(2);
     }
     out
 }
@@ -368,24 +376,49 @@ fn parse_response(raw: &[u8], max_body: usize) -> Option<Response> {
     } else {
         rest.to_vec()
     };
+    let truncated = body.len() > max_body;
     body.truncate(max_body);
     Some(Response {
         status,
         location,
         content_type,
         body,
+        truncated,
     })
 }
 
+/// Whether `raw` already holds a whole response: the head and a body of
+/// `Content-Length` bytes, or the last chunk. Servers that ignore
+/// `Connection: close` are not waited on.
+fn response_complete(raw: &[u8]) -> bool {
+    let Some(split) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return false;
+    };
+    let head = String::from_utf8_lossy(&raw[..split]).to_ascii_lowercase();
+    let body = &raw[split + 4..];
+    if head.contains("transfer-encoding: chunked") {
+        return body.ends_with(b"0\r\n\r\n");
+    }
+    head.lines()
+        .find_map(|l| l.strip_prefix("content-length:"))
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .is_some_and(|n| body.len() >= n)
+}
+
 /// One GET to `addr`; `None` when nothing HTTP answers within the timeout.
-fn get_once(addr: SocketAddr, port: u16, path: &str, max_body: usize) -> Option<Response> {
-    let deadline = Instant::now() + PROBE_TIMEOUT;
+fn get_once(
+    addr: SocketAddr,
+    port: u16,
+    path: &str,
+    max_body: usize,
+    deadline: Instant,
+) -> Option<Response> {
     let left = |d: Instant| {
         d.checked_duration_since(Instant::now())
             .filter(|l| !l.is_zero())
     };
-    let mut s = TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).ok()?;
-    s.set_write_timeout(Some(PROBE_TIMEOUT)).ok()?;
+    let mut s = TcpStream::connect_timeout(&addr, left(deadline)?).ok()?;
+    s.set_write_timeout(Some(left(deadline)?)).ok()?;
     let req = format!(
         "GET {path} HTTP/1.1\r\nHost: localhost:{port}\r\nAccept: text/html,image/*;q=0.8,*/*;q=0.5\r\nUser-Agent: balance-ton-port\r\nConnection: close\r\n\r\n"
     );
@@ -400,6 +433,9 @@ fn get_once(addr: SocketAddr, port: u16, path: &str, max_body: usize) -> Option<
         match s.read(&mut buf) {
             Ok(0) | Err(_) => break,
             Ok(n) => raw.extend_from_slice(&buf[..n]),
+        }
+        if response_complete(&raw) {
+            break;
         }
     }
     parse_response(&raw, max_body)
@@ -420,12 +456,12 @@ fn redirect_path(location: &str, port: u16) -> Option<String> {
 
 /// GET `path` on the loopback addresses in turn, following at most two
 /// redirects within the same port.
-fn get(port: u16, path: &str, max_body: usize) -> Option<Response> {
+fn get(port: u16, path: &str, max_body: usize, deadline: Instant) -> Option<Response> {
     let mut path = path.to_string();
     for _ in 0..=MAX_REDIRECTS {
         let r = loopbacks(port)
             .into_iter()
-            .find_map(|a| get_once(a, port, &path, max_body))?;
+            .find_map(|a| get_once(a, port, &path, max_body, deadline))?;
         if (300..400).contains(&r.status) {
             path = redirect_path(r.location.as_deref()?, port)?;
             continue;
@@ -453,7 +489,7 @@ fn guess_mime(path: &str) -> Option<&'static str> {
     })
 }
 
-fn fetch_icon(port: u16, href: Option<&str>) -> Option<Favicon> {
+fn fetch_icon(port: u16, href: Option<&str>, deadline: Instant) -> Option<Favicon> {
     if let Some(h) = href {
         if let Some(icon) = data_icon(h) {
             return Some(icon);
@@ -463,8 +499,8 @@ fn fetch_icon(port: u16, href: Option<&str>) -> Option<Favicon> {
         Some(h) => local_icon_path(h, port)?,
         None => "/favicon.ico".to_string(),
     };
-    let r = get(port, &path, MAX_ICON_BYTES)?;
-    if r.status != 200 || r.body.is_empty() {
+    let r = get(port, &path, MAX_ICON_BYTES, deadline)?;
+    if r.status != 200 || r.body.is_empty() || r.truncated {
         return None;
     }
     let declared = r
@@ -493,16 +529,18 @@ fn fetch_icon(port: u16, href: Option<&str>) -> Option<Favicon> {
 /// Title and favicon of `GET /` on `port`, `None` when nothing HTTP answers
 /// or the page has neither.
 pub fn fetch_page_meta(port: u16) -> Option<PageMeta> {
-    let page = get(port, "/", MAX_PAGE_BYTES)?;
+    // One budget for the whole probe: page, redirects, both addresses, icons.
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let page = get(port, "/", MAX_PAGE_BYTES, deadline)?;
     if !(200..300).contains(&page.status) {
         return None;
     }
     let html = String::from_utf8_lossy(&page.body);
     let title = parse_title(&html);
     let href = icon_href(&html);
-    let mut icon = fetch_icon(port, href.as_deref());
+    let mut icon = fetch_icon(port, href.as_deref(), deadline);
     if icon.is_none() && href.is_some() {
-        icon = fetch_icon(port, None);
+        icon = fetch_icon(port, None, deadline);
     }
     if title.is_none() && icon.is_none() {
         return None;
@@ -539,26 +577,23 @@ impl ProbeCache {
         now_ms.saturating_sub(e.at_ms) < ttl
     }
 
-    /// Probes the entries of `wanted` that are missing or expired, at most
-    /// `MAX_PROBES_PER_PASS` (never probed first, then the oldest), and
-    /// forgets entries no longer wanted. A failed refresh keeps the previous
-    /// answer.
-    pub fn refresh(
-        &mut self,
-        wanted: &[(ServerKey, u16)],
-        now_ms: u64,
-        mut fetch: impl FnMut(u16) -> Option<PageMeta>,
-    ) {
-        self.entries.retain(|k, _| wanted.contains(k));
-        let mut due: Vec<(ServerKey, u16)> = wanted
-            .iter()
-            .filter(|k| self.entries.get(k).is_none_or(|e| !Self::fresh(e, now_ms)))
-            .copied()
-            .collect();
+    /// The entries of `wanted` that are missing or expired, at most
+    /// `MAX_PROBES_PER_PASS`: never probed first, then the oldest.
+    pub fn due(&self, wanted: &[(ServerKey, u16)], now_ms: u64) -> Vec<(ServerKey, u16)> {
+        let mut due: Vec<(ServerKey, u16)> = Vec::new();
+        for k in wanted {
+            if !due.contains(k) && self.entries.get(k).is_none_or(|e| !Self::fresh(e, now_ms)) {
+                due.push(*k);
+            }
+        }
         due.sort_by_key(|k| self.entries.get(k).map(|e| e.at_ms));
-        due.dedup();
-        for k in due.into_iter().take(MAX_PROBES_PER_PASS) {
-            let fetched = fetch(k.1);
+        due.truncate(MAX_PROBES_PER_PASS);
+        due
+    }
+
+    /// Records probe answers. A failed refresh keeps the previous answer.
+    pub fn store(&mut self, results: Vec<((ServerKey, u16), Option<PageMeta>)>, now_ms: u64) {
+        for (k, fetched) in results {
             let old = self.entries.remove(&k).and_then(|e| e.meta);
             self.entries.insert(
                 k,
@@ -568,6 +603,25 @@ impl ProbeCache {
                 },
             );
         }
+    }
+
+    /// Forgets the entries of servers that are gone.
+    pub fn retain(&mut self, wanted: &[(ServerKey, u16)]) {
+        self.entries.retain(|k, _| wanted.contains(k));
+    }
+
+    /// Test helper: one whole pass with an injected fetch.
+    #[cfg(test)]
+    fn refresh(
+        &mut self,
+        wanted: &[(ServerKey, u16)],
+        now_ms: u64,
+        mut fetch: impl FnMut(u16) -> Option<PageMeta>,
+    ) {
+        self.retain(wanted);
+        let due = self.due(wanted, now_ms);
+        let results = due.into_iter().map(|k| (k, fetch(k.1))).collect();
+        self.store(results, now_ms);
     }
 }
 
@@ -804,6 +858,105 @@ mod tests {
         let port = l.local_addr().unwrap().port();
         drop(l);
         assert_eq!(fetch_page_meta(port), None);
+    }
+
+    #[test]
+    fn huge_chunk_size_does_not_panic() {
+        let port = serve_raw(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\nabc\r\n0\r\n\r\n",
+        );
+        assert_eq!(fetch_page_meta(port), None);
+        assert!(dechunk(b"ffffffffffffffff\r\nabc").len() <= 3);
+    }
+
+    #[test]
+    fn redirect_chain_to_a_hanging_path_is_bounded() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let mut held = Vec::new();
+            for s in l.incoming() {
+                let Ok(mut s) = s else { break };
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                match req.split_whitespace().nth(1) {
+                    Some("/") => {
+                        let _ = s.write_all(
+                            b"HTTP/1.1 302 Found\r\nLocation: /a\r\nContent-Length: 0\r\n\r\n",
+                        );
+                    }
+                    Some("/a") => {
+                        let _ = s.write_all(
+                            b"HTTP/1.1 302 Found\r\nLocation: /b\r\nContent-Length: 0\r\n\r\n",
+                        );
+                    }
+                    _ => held.push(s),
+                }
+            }
+        });
+        let t = Instant::now();
+        assert_eq!(fetch_page_meta(port), None);
+        assert!(
+            t.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            t.elapsed()
+        );
+    }
+
+    #[test]
+    fn keep_alive_server_with_content_length_returns_promptly() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let mut held = Vec::new();
+            for s in l.incoming() {
+                let Ok(mut s) = s else { break };
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let b = "<title>ka</title>";
+                let _ = s.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{b}",
+                        b.len()
+                    )
+                    .as_bytes(),
+                );
+                held.push(s); // never closed
+            }
+        });
+        let t = Instant::now();
+        assert_eq!(fetch_page_meta(port).unwrap().title.as_deref(), Some("ka"));
+        assert!(
+            t.elapsed() < Duration::from_millis(600),
+            "{:?}",
+            t.elapsed()
+        );
+    }
+
+    #[test]
+    fn oversized_icon_gives_no_icon() {
+        let port = serve(vec![
+            ("/", "text/html", b"<title>big</title>".to_vec()),
+            ("/favicon.ico", "image/x-icon", vec![7; MAX_ICON_BYTES + 10]),
+        ]);
+        let m = fetch_page_meta(port).unwrap();
+        assert_eq!(m.title.as_deref(), Some("big"));
+        assert!(m.icon.is_none());
+    }
+
+    #[test]
+    fn paths_with_whitespace_or_control_chars_are_rejected() {
+        assert_eq!(local_icon_path("/a b.png", 1), None);
+        assert_eq!(local_icon_path("/a\r\nHost: x", 1), None);
+        assert_eq!(local_icon_path("/a\u{7f}", 1), None);
+    }
+
+    #[test]
+    fn due_dedups_non_adjacent_duplicates() {
+        let c = ProbeCache::default();
+        let w = [(key(1), 1), (key(2), 2), (key(1), 1), (key(3), 3)];
+        assert_eq!(c.due(&w, 0), vec![(key(1), 1), (key(2), 2)]);
     }
 
     fn meta(t: &str) -> Option<PageMeta> {
