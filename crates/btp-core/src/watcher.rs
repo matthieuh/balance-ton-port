@@ -575,6 +575,10 @@ pub struct Watcher<P: Platform> {
     discover: fn() -> Vec<PathBuf>,
     /// Codex's home (`~/.codex`) when the process env names none.
     codex_home: Option<PathBuf>,
+    /// Whether a pass also scans observed servers and feeds the history,
+    /// leak alerts, cards and probe targets (the app); the CLI only needs
+    /// the tracked servers.
+    observed: bool,
     /// Whether Codex sessions are followed (tests turn it off: a live Codex
     /// names its own `CODEX_HOME`, so a temp home cannot hide it).
     codex: bool,
@@ -620,6 +624,7 @@ impl<P: Platform> Watcher<P> {
             data_dir,
             discover: default_config_dirs,
             codex_home: dirs::home_dir().map(|h| h.join(".codex")),
+            observed: false,
             codex: true,
             last_good: None,
             config_error: None,
@@ -644,6 +649,13 @@ impl<P: Platform> Watcher<P> {
     /// program).
     pub fn with_spawner(mut self, spawner: Box<dyn Spawner>) -> Self {
         self.spawner = Arc::from(spawner);
+        self
+    }
+
+    /// Turns on (or off) what only the app uses: observed servers, the
+    /// history, leak alerts, cards and probe targets. Off by default.
+    pub fn with_observed(mut self, on: bool) -> Self {
+        self.observed = on;
         self
     }
 
@@ -1378,6 +1390,10 @@ impl<P: Platform> Watcher<P> {
                 )
             })?;
         let mut feeds = feeds;
+        if !self.observed {
+            // The CLI: no observed servers, history, leaks, cards or probes.
+            return self.finish(report, to_kill, mode, &scan.cfg, now_ms);
+        }
         if mode != Mode::Sweep {
             report.observed = self.observed(&listeners, &tracked, &scan.cfg);
             self.last_observed = report.observed.clone();
@@ -1398,7 +1414,15 @@ impl<P: Platform> Watcher<P> {
                 .servers
                 .iter()
                 .map(|v| v.key)
-                .chain(report.observed.iter().map(|o| o.key))
+                // An excluded server is left alone: no leak card or
+                // notification.
+                .chain(
+                    report
+                        .observed
+                        .iter()
+                        .filter(|o| !o.excluded)
+                        .map(|o| o.key),
+                )
                 .collect();
             let leaks = self.leaks.pass(&self.history, &keys, &scan.cfg, now_ms);
             for &key in &leaks.rearmed {
@@ -1441,7 +1465,18 @@ impl<P: Platform> Watcher<P> {
                 .filter(|o| !o.excluded)
                 .map(|o| (o.key, o.port)),
         );
+        self.finish(report, to_kill, mode, &scan.cfg, now_ms)
+    }
 
+    /// The end of a pass: the kills (only reported in `Mode::Observe`).
+    fn finish(
+        &mut self,
+        mut report: TickReport,
+        to_kill: Vec<(TrackedServer, KillReason)>,
+        mode: Mode,
+        cfg: &Config,
+        now_ms: u64,
+    ) -> io::Result<TickReport> {
         if mode == Mode::Observe {
             report.killed = to_kill
                 .into_iter()
@@ -1449,7 +1484,7 @@ impl<P: Platform> Watcher<P> {
                 .collect();
             return Ok(report);
         }
-        let (killed, gone) = self.execute(to_kill, &scan.cfg, now_ms)?;
+        let (killed, gone) = self.execute(to_kill, cfg, now_ms)?;
         report.killed = killed;
         report.servers.retain(|v| !gone.contains(&v.key));
         report.leaks.retain(|k| !gone.contains(k));
@@ -1800,7 +1835,8 @@ mod tests {
         write_session(claude.path(), 20, "sess-a", &wt, START + 20 * SEC);
         let w = Watcher::new(p, data.path().to_path_buf())
             .with_discovery(Vec::new)
-            .with_codex_home(None);
+            .with_codex_home(None)
+            .with_observed(true);
         Fx {
             data,
             claude,
@@ -3058,7 +3094,8 @@ mod tests {
         fs::write(f.data.path().join("config.toml"), "nope = [").unwrap();
         let mut w = Watcher::new(FakePlatform::new(), f.data.path().to_path_buf())
             .with_discovery(Vec::new)
-            .with_codex_home(None);
+            .with_codex_home(None)
+            .with_observed(true);
         let e = w.tick(T0).unwrap().config_error.expect("reported");
         assert!(e.contains("defaults"), "{e}");
         assert_eq!(w.config_error(), Some(e.as_str()));
@@ -3766,6 +3803,46 @@ mod tests {
         // Idle a long time: never an idle alert or a countdown.
         f.p().set_resources(50, 10 * MB, 0);
         assert_eq!(card(&f.w.tick(T0 + 90 * MIN).unwrap(), key50()), None);
+    }
+
+    #[test]
+    fn excluded_observed_server_gets_no_leak_card_or_notification() {
+        let mut f = fx();
+        f.p()
+            .spawn(50, 10, START + 50 * SEC, "postgres -D /db", "/w");
+        f.p().set_exe(50, "/opt/homebrew/bin/postgres");
+        f.p().add_listener(50, 5432);
+        f.p().set_resources(50, 3000 * MB, 0);
+        for i in 0..3 {
+            let r = f.w.tick(T0 + i * 10 * MIN).unwrap();
+            assert!(r.observed[0].excluded);
+            assert!(!r.leaks.contains(&key50()), "{:?}", r.leaks);
+            assert_eq!(card(&r, key50()), None);
+        }
+        let leak = EventKind::Alert {
+            alert: AlertKind::Leak,
+        };
+        assert_eq!(count_events(&f, key50(), &leak), 0);
+    }
+
+    #[test]
+    fn without_observed_a_pass_skips_what_only_the_app_uses() {
+        let mut f = observed_fx();
+        f.w = std::mem::replace(
+            &mut f.w,
+            Watcher::new(FakePlatform::new(), f.data.path().to_path_buf()),
+        )
+        .with_observed(false);
+        f.p().set_resources(30, 3000 * MB, 0);
+        f.p().set_resources(50, 3000 * MB, 0);
+        let r = f.w.tick(T0).unwrap();
+        // The tracked server is still reported (and decided on).
+        assert_eq!(r.servers.len(), 1);
+        assert!(r.observed.is_empty());
+        assert!(r.leaks.is_empty() && r.needs_you.is_empty());
+        assert!(f.w.history().samples(key30()).is_empty());
+        assert!(f.w.history().events(key50()).is_empty());
+        assert!(f.w.due_probes(T0).is_empty());
     }
 
     #[test]
