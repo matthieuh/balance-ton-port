@@ -24,6 +24,7 @@ fn btp(data: &tempfile::TempDir) -> Command {
     c.env("BTP_DATA_DIR", data.path());
     c.env("HOME", data.path());
     c.env_remove("CLAUDE_CONFIG_DIR");
+    c.env("BTP_TEST_NO_CODEX", "1");
     c
 }
 

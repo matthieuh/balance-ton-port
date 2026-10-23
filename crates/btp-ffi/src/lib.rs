@@ -295,8 +295,13 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Core {
     fn at(dir: PathBuf, discover: fn() -> Vec<PathBuf>) -> Self {
+        let watcher = Watcher::new(MacOs, dir.clone()).with_discovery(discover);
+        // Tests run on the real platform: a live Codex of the machine must not
+        // show up in them.
+        #[cfg(test)]
+        let watcher = watcher.without_codex();
         Core {
-            watcher: Mutex::new(Watcher::new(MacOs, dir.clone()).with_discovery(discover)),
+            watcher: Mutex::new(watcher),
             dir,
             discover,
             watch_lock: Mutex::new(None),
