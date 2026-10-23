@@ -9,7 +9,7 @@
 use assert_cmd::Command;
 use btp_core::config::{save_config, Config};
 use btp_core::platform::{MacOs, Platform};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
@@ -88,6 +88,34 @@ impl Sandbox {
     fn notified(&self) -> String {
         std::fs::read_to_string(self.notify_file()).unwrap_or_default()
     }
+
+    /// Where `perl_server` writes its port.
+    fn port_file(&self) -> PathBuf {
+        self.data.path().join("port")
+    }
+
+    /// The port of the session's `perl_server`, as a shell word for the
+    /// btp arguments (read once the test writes `go`).
+    fn port_arg(&self) -> String {
+        format!("$(cat '{}')", self.port_file().display())
+    }
+
+    /// The port `perl_server` listens on. Fails at once when it could not
+    /// listen or the session exited.
+    fn server_port(&self, session: &mut Owned) -> u16 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(t) = std::fs::read_to_string(self.port_file()) {
+                assert!(!t.starts_with("died"), "server failed: {t}");
+                return t.trim().parse().expect("a port");
+            }
+            if let Some(status) = session.0.try_wait().unwrap() {
+                panic!("the session exited ({status}) before its server listened");
+            }
+            assert!(Instant::now() < deadline, "server never listened");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 /// A process this test spawned. SIGKILLed and reaped on drop.
@@ -120,14 +148,6 @@ impl Drop for Spawned {
 
 fn libc_sigkill() -> i32 {
     9
-}
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 /// The fake session: starts the dev server, waits for `go`, then runs
@@ -164,16 +184,22 @@ wait"#,
     Owned(c.spawn().unwrap())
 }
 
-/// A perl dev server on `port`; `ignore_term` makes it survive SIGTERM;
-/// it accepts connections and holds them.
-fn perl_server(port: u16, ignore_term: bool) -> String {
+/// A perl dev server on a port the system picks; once it listens it
+/// writes the port to `sb.port_file()` (or `died: <error>` when it cannot
+/// listen). `ignore_term` makes it survive SIGTERM; it accepts connections
+/// and holds them.
+fn perl_server(sb: &Sandbox, ignore_term: bool) -> String {
     let term = if ignore_term {
         "$SIG{TERM}=q(IGNORE);"
     } else {
         ""
     };
+    let file = sb.port_file();
+    let tmp = file.with_extension("tmp");
     format!(
-        "perl -MIO::Socket::INET -e '{term} $s=IO::Socket::INET->new(LocalAddr=>q(127.0.0.1),LocalPort=>{port},Listen=>5,ReuseAddr=>1) or die; @c=(); while(1){{ push @c, $s->accept }}'"
+        "perl -MIO::Socket::INET -e '{term} sub out {{ open(my $f, q(>), q({tmp})) or die; print $f @_; close $f; rename q({tmp}), q({file}) }} $s=IO::Socket::INET->new(LocalAddr=>q(127.0.0.1),LocalPort=>0,Listen=>5) or do {{ out(qq(died: $!)); exit 1 }}; out($s->sockport); @c=(); while(1){{ push @c, $s->accept }}'",
+        tmp = tmp.display(),
+        file = file.display(),
     )
 }
 
@@ -261,13 +287,13 @@ fn waiters(sh: i32) -> Vec<Spawned> {
 #[test]
 fn session_end_kills_nothing_and_starts_one_waiter() {
     let sb = Sandbox::new();
-    let port = free_port();
-    let session = spawn_session(
+    let mut session = spawn_session(
         &sb,
-        &perl_server(port, false),
+        &perl_server(&sb, false),
         "session-end --session-pid $$ --reason prompt_input_exit --session-id conv-1",
     );
     let sh = session.0.id() as i32;
+    let port = sb.server_port(&mut session);
     let server = wait_listener(sh, port);
     sb.session_file(sh, "conv-1");
     std::fs::write(sb.data.path().join("go"), "").unwrap();
@@ -323,13 +349,13 @@ fn session_end_works_after_the_session_file_is_gone() {
     // Claude Code removes its session file before SessionEnd hooks run, and
     // no watcher tracked the server: the process identity is enough.
     let sb = Sandbox::new();
-    let port = free_port();
-    let session = spawn_session(
+    let mut session = spawn_session(
         &sb,
-        &perl_server(port, false),
+        &perl_server(&sb, false),
         "session-end --session-pid $$ --reason other --session-id conv-1",
     );
     let sh = session.0.id() as i32;
+    let port = sb.server_port(&mut session);
     let server = wait_listener(sh, port);
     sb.session_file(sh, "conv-1");
     std::fs::remove_file(sb.claude.path().join(format!("sessions/{sh}.json"))).unwrap();
@@ -349,12 +375,12 @@ fn a_server_already_moved_out_of_the_session_is_left_and_traced() {
     // A background task detached before the hook ran: its parent exited and
     // it hangs off launchd. Nothing proves it was the session's: left.
     let sb = Sandbox::new();
-    let port = free_port();
-    let session = spawn_session(
+    let mut session = spawn_session(
         &sb,
-        &format!("( {} & ); sleep 0", perl_server(port, false)),
+        &format!("( {} & ); sleep 0", perl_server(&sb, false)),
         "session-end --session-pid $$ --reason other",
     );
+    let port = sb.server_port(&mut session);
     let server = wait_port(port);
     assert_eq!(MacOs.proc_info(server.pid).unwrap().ppid, 1);
     let sh = session.0.id() as i32;
@@ -373,13 +399,13 @@ fn a_server_already_moved_out_of_the_session_is_left_and_traced() {
 #[test]
 fn session_end_leaves_a_server_with_an_open_connection() {
     let sb = Sandbox::new();
-    let port = free_port();
-    let session = spawn_session(
+    let mut session = spawn_session(
         &sb,
-        &perl_server(port, false),
+        &perl_server(&sb, false),
         "session-end --session-pid $$ --reason other",
     );
     let sh = session.0.id() as i32;
+    let port = sb.server_port(&mut session);
     let guard = wait_listener(sh, port);
     sb.session_file(sh, "conv-1");
     let _tab = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -401,13 +427,13 @@ fn the_waiter_stops_a_done_server_once_the_session_is_gone() {
     // behind (reparented). The waiter then applies the rule, unless a
     // watcher holds the lock.
     let sb = Sandbox::new();
-    let port = free_port();
-    let session = spawn_session(
+    let mut session = spawn_session(
         &sb,
-        &perl_server(port, false),
-        &format!("note {port} --done"),
+        &perl_server(&sb, false),
+        &format!("note {} --done", sb.port_arg()),
     );
     let sh = session.0.id() as i32;
+    let port = sb.server_port(&mut session);
     let server = wait_listener(sh, port);
     sb.session_file(sh, "conv-1");
     let proc_start = MacOs.proc_start_string(sh).unwrap();
@@ -452,13 +478,13 @@ fn the_waiter_stops_a_done_server_once_the_session_is_gone() {
 fn clear_and_resume_kill_nothing() {
     for reason in ["clear", "resume"] {
         let sb = Sandbox::new();
-        let port = free_port();
-        let session = spawn_session(
+        let mut session = spawn_session(
             &sb,
-            &perl_server(port, false),
+            &perl_server(&sb, false),
             &format!("session-end --session-pid $$ --reason {reason}"),
         );
         let sh = session.0.id() as i32;
+        let port = sb.server_port(&mut session);
         let guard = wait_listener(sh, port);
         sb.session_file(sh, "conv-1");
         std::fs::write(sb.data.path().join("go"), "").unwrap();
@@ -472,13 +498,13 @@ fn clear_and_resume_kill_nothing() {
 #[test]
 fn note_from_the_owning_session_is_stored() {
     let sb = Sandbox::new();
-    let port = free_port();
-    let session = spawn_session(
+    let mut session = spawn_session(
         &sb,
-        &perl_server(port, false),
-        &format!("note {port} --keep 'form demo'"),
+        &perl_server(&sb, false),
+        &format!("note {} --keep 'form demo'", sb.port_arg()),
     );
     let sh = session.0.id() as i32;
+    let port = sb.server_port(&mut session);
     let _server = wait_listener(sh, port);
     sb.session_file(sh, "conv-1");
     std::fs::write(sb.data.path().join("go"), "").unwrap();
@@ -494,11 +520,11 @@ fn note_from_the_owning_session_is_stored() {
 #[test]
 fn note_from_outside_the_session_is_refused() {
     let sb = Sandbox::new();
-    let port = free_port();
     // The session runs nothing but its server here; `note` comes from the
     // test process, which is not under it.
-    let session = spawn_session(&sb, &perl_server(port, false), "--version");
+    let mut session = spawn_session(&sb, &perl_server(&sb, false), "--version");
     let sh = session.0.id() as i32;
+    let port = sb.server_port(&mut session);
     let _server = wait_listener(sh, port);
     sb.session_file(sh, "conv-1");
     sb.btp()
@@ -520,9 +546,9 @@ fn note_from_outside_the_session_is_refused() {
 #[test]
 fn kill_by_key_from_outside_the_session_is_refused() {
     let sb = Sandbox::new();
-    let port = free_port();
-    let session = spawn_session(&sb, &perl_server(port, false), "--version");
+    let mut session = spawn_session(&sb, &perl_server(&sb, false), "--version");
     let sh = session.0.id() as i32;
+    let port = sb.server_port(&mut session);
     let server = wait_listener(sh, port);
     sb.session_file(sh, "conv-1");
     sb.btp().args(["list"]).assert().success();
