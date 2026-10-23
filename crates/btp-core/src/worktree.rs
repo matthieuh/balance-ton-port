@@ -1,6 +1,6 @@
 use crate::labels;
 use crate::model::ServerKey;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// The nearest ancestor of `cwd` (itself included) holding a `.git` entry,
@@ -88,6 +88,14 @@ impl MetaCache {
             }
         };
         (framework, package, branch)
+    }
+
+    /// Forgets the servers not in `live`, and the branches older than their
+    /// 30 s (read again on the next `get` anyway).
+    pub fn retain(&mut self, live: &HashSet<ServerKey>, now_ms: u64) {
+        self.servers.retain(|k, _| live.contains(k));
+        self.branches
+            .retain(|_, (at, _)| now_ms.saturating_sub(*at) < BRANCH_TTL_MS);
     }
 }
 
@@ -190,6 +198,27 @@ mod tests {
         assert_eq!(
             (m.0.as_deref(), m.1.as_deref(), m.2.as_deref()),
             (Some("Vite"), Some("web"), Some("b"))
+        );
+    }
+
+    #[test]
+    fn meta_cache_retain_forgets_gone_servers_and_stale_branches() {
+        let d = tempfile::tempdir().unwrap();
+        fs::write(d.path().join("package.json"), r#"{"name":"web"}"#).unwrap();
+        let key = |pid| ServerKey { pid, start_time: 1 };
+        let mut c = MetaCache::default();
+        c.get(&key(1), "vite", d.path(), d.path(), 0);
+        c.get(&key(2), "vite", d.path(), d.path(), 0);
+        c.retain(&HashSet::from([key(1)]), 30_000);
+        assert_eq!(c.servers.keys().collect::<Vec<_>>(), vec![&key(1)]);
+        assert!(c.branches.is_empty());
+        // A server forgotten reads its package.json again.
+        fs::write(d.path().join("package.json"), r#"{"name":"api"}"#).unwrap();
+        assert_eq!(
+            c.get(&key(2), "vite", d.path(), d.path(), 30_000)
+                .1
+                .as_deref(),
+            Some("api")
         );
     }
 }

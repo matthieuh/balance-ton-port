@@ -172,6 +172,12 @@ impl History {
         }
     }
 
+    /// A connection was open on it at the last pass (probes and previews
+    /// excluded).
+    pub fn in_use(&self, key: ServerKey) -> bool {
+        self.servers.get(&key).is_some_and(|s| s.established > 0)
+    }
+
     pub fn samples(&self, key: ServerKey) -> &[Sample] {
         self.servers.get(&key).map_or(&[], |s| &s.samples)
     }
@@ -622,6 +628,17 @@ mod tests {
             kinds,
             vec![EventKind::BrowserConnected, EventKind::BrowserClosed]
         );
+    }
+
+    #[test]
+    fn in_use_follows_the_last_connection_count() {
+        let mut h = History::default();
+        let k = key(1);
+        assert!(!h.in_use(k));
+        h.note_connections(k, 0, 2);
+        assert!(h.in_use(k));
+        h.note_connections(k, 1, 0);
+        assert!(!h.in_use(k));
     }
 
     #[test]

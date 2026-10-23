@@ -204,8 +204,10 @@ final class CoreModel: ObservableObject {
                 // back to the default interval, the core keeps its last
                 // valid config anyway.
                 let scan = (try? core.config())?.scanIntervalS ?? 5
+                // Observed rows (no agent) wait for the menu that shows
+                // them; this one lists and kills agent servers only.
                 return PassResult(
-                    owner: owner, servers: report.servers, alerts: report.alerts,
+                    owner: owner, servers: report.servers.filter(\.managed), alerts: report.alerts,
                     kills: kills, scanIntervalS: scan, configError: report.configError
                 )
             }

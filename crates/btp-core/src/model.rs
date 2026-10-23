@@ -53,6 +53,10 @@ pub struct TrackedServer {
     /// handed it its session, note, Keep and Postpone.
     #[serde(default)]
     pub restarted_from: Option<ServerKey>,
+    /// The session's working directory at link time, where its resume
+    /// command runs. `None` for servers tracked before it existed.
+    #[serde(default)]
+    pub session_cwd: Option<PathBuf>,
 }
 
 impl TrackedServer {

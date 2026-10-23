@@ -220,6 +220,7 @@ pub fn link(
         agent: session.agent,
         postponed_until_ms: None,
         restarted_from: None,
+        session_cwd: Some(session.cwd.clone()),
     })
 }
 
@@ -670,6 +671,37 @@ impl<P: Platform> Watcher<P> {
     /// The cached page title and favicon of a server's port.
     pub fn page_meta(&self, key: ServerKey, port: u16) -> Option<&PageMeta> {
         self.probes.get(key, port)
+    }
+
+    /// `page_meta` of the port the last pass probes for this server.
+    pub fn page_meta_of(&self, key: ServerKey) -> Option<&PageMeta> {
+        let &(_, port) = self.probe_targets.iter().find(|(k, _)| *k == key)?;
+        self.probes.get(key, port)
+    }
+
+    /// The pids whose connections never count as use (`with_ignored_peers`).
+    pub fn ignored_peers(&self) -> &[i32] {
+        &self.ignored_peers
+    }
+
+    /// The processes of a server, itself first, then its descendants (an
+    /// agent CLI's subtree left out, as for its history). Empty once `key`
+    /// is no longer running.
+    pub fn server_procs(&self, key: ServerKey) -> Vec<ProcInfo> {
+        let p = &self.platform;
+        let Some(server) = p
+            .proc_info(key.pid)
+            .filter(|i| i.start_time == key.start_time)
+        else {
+            return Vec::new();
+        };
+        let mut out = vec![server];
+        out.extend(
+            own_descendants(p, key.pid, &|_| false)
+                .into_iter()
+                .filter_map(|(pid, start)| p.proc_info(pid).filter(|i| i.start_time == start)),
+        );
+        out
     }
 
     /// Replaces the automatic discovery of Claude config dirs (tests pass
@@ -1403,6 +1435,7 @@ impl<P: Platform> Watcher<P> {
         let mut live: HashSet<ServerKey> = report.servers.iter().map(|v| v.key).collect();
         live.extend(self.last_observed.iter().map(|o| o.key));
         self.history.retain(&live, now_ms);
+        self.meta.retain(&live, now_ms);
         self.leaks.retain(&live);
         self.idle_ignored.retain(|k| live.contains(k));
         // An excluded server (a database, say) is never probed.
@@ -1953,6 +1986,9 @@ mod tests {
         assert_eq!(s.agent, AgentKind::ClaudeCode);
         assert_eq!(s.session_pid, 70);
         assert_eq!(s.session_id, "sess-in");
+        // Where its resume command runs: the session's folder, not the
+        // server's worktree root.
+        assert_eq!(s.session_cwd, Some(f.wt.join("apps/web")));
     }
 
     #[test]
@@ -2107,6 +2143,7 @@ mod tests {
                 agent: crate::agents::AgentKind::ClaudeCode,
                 postponed_until_ms: None,
                 restarted_from: None,
+                session_cwd: Some(f.wt.clone()),
             }
         );
 
@@ -2721,6 +2758,7 @@ mod tests {
                 agent: crate::agents::AgentKind::ClaudeCode,
                 postponed_until_ms: None,
                 restarted_from: None,
+                session_cwd: None,
             })
         })
         .unwrap();
@@ -2787,6 +2825,28 @@ mod tests {
         f.w.store_probes(vec![(due[0], ProbeOutcome::Meta(meta.clone()))], T0);
         assert!(f.w.due_probes(T0 + 1000).is_empty());
         assert_eq!(f.w.page_meta(key30(), 3000), Some(&meta));
+        assert_eq!(f.w.page_meta_of(key30()), Some(&meta));
+        assert_eq!(
+            f.w.page_meta_of(ServerKey {
+                pid: 30,
+                start_time: 1
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn server_procs_lists_the_tree_server_first_and_spares_agents() {
+        let f = fx();
+        f.p().spawn(32, 30, START + 32 * SEC, "claude", "/");
+        f.p().spawn(33, 32, START + 33 * SEC, "node child", "/");
+        let pids: Vec<i32> = f.w.server_procs(key30()).iter().map(|i| i.pid).collect();
+        assert_eq!(pids, vec![30, 31]);
+        let stale = ServerKey {
+            pid: 30,
+            start_time: key30().start_time + 1,
+        };
+        assert!(f.w.server_procs(stale).is_empty());
     }
 
     #[test]

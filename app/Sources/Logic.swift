@@ -388,6 +388,9 @@ struct SettingsDraft: Equatable, Sendable {
     var claudeConfigDirs: [String]
     var excludeCommands: [String]
     var excludePorts: [UInt16]
+    /// Leak thresholds (MB): no field in the form yet, saved back unchanged.
+    var leakMemoryMb: UInt64
+    var leakGrowthMb: UInt64
 
     init(_ c: ConfigFfi) {
         deadSessionIdleS = c.deadSessionIdleS
@@ -397,6 +400,8 @@ struct SettingsDraft: Equatable, Sendable {
         claudeConfigDirs = c.claudeConfigDirs
         excludeCommands = c.excludeCommands
         excludePorts = c.excludePorts
+        leakMemoryMb = c.leakMemoryMb
+        leakGrowthMb = c.leakGrowthMb
     }
 
     var ffi: ConfigFfi {
@@ -407,7 +412,9 @@ struct SettingsDraft: Equatable, Sendable {
             scanIntervalS: scanIntervalS,
             claudeConfigDirs: claudeConfigDirs,
             excludeCommands: excludeCommands,
-            excludePorts: excludePorts
+            excludePorts: excludePorts,
+            leakMemoryMb: leakMemoryMb,
+            leakGrowthMb: leakGrowthMb
         )
     }
 
