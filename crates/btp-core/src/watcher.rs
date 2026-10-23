@@ -1956,6 +1956,18 @@ mod tests {
         fn pids_named(&self, name: &str) -> Vec<i32> {
             self.inner.pids_named(name)
         }
+        fn proc_resources(&self, pid: i32) -> Option<crate::platform::ProcResources> {
+            self.inner.proc_resources(pid)
+        }
+        fn machine_memory(&self) -> Option<crate::platform::MachineMemory> {
+            self.inner.machine_memory()
+        }
+        fn proc_argv(&self, pid: i32) -> Option<Vec<String>> {
+            self.inner.proc_argv(pid)
+        }
+        fn exe_path(&self, pid: i32) -> Option<std::path::PathBuf> {
+            self.inner.exe_path(pid)
+        }
     }
 
     #[test]

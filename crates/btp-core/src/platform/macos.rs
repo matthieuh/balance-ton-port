@@ -5,7 +5,7 @@
 //! Processes we may not inspect (other users, permission denied, gone
 //! between two calls) are skipped silently.
 
-use super::{format_proc_start, Listener, Platform, ProcInfo};
+use super::{format_proc_start, Listener, MachineMemory, Platform, ProcInfo, ProcResources};
 use libproc::bsd_info::BSDInfo;
 use libproc::file_info::{pidfdinfo, ListFDs, ProcFDType};
 use libproc::net_info::{SocketFDInfo, SocketInfoKind, TcpSIState, TcpSockInfo};
@@ -71,6 +71,11 @@ fn for_each_tcp_socket(pid: i32, mut f: impl FnMut(&TcpSockInfo)) {
 /// order in its low 16 bits.
 fn local_port(tcp: &TcpSockInfo) -> u16 {
     u16::from_be(tcp.tcpsi_ini.insi_lport as u16)
+}
+
+/// Remote port of a TCP socket, same encoding as `local_port`.
+fn remote_port(tcp: &TcpSockInfo) -> u16 {
+    u16::from_be(tcp.tcpsi_ini.insi_fport as u16)
 }
 
 fn tcp_state(tcp: &TcpSockInfo) -> TcpSIState {
@@ -199,13 +204,18 @@ fn split_procargs2(data: &[u8]) -> Option<(Vec<&[u8]>, &[u8])> {
     Some((args, rest))
 }
 
-fn parse_procargs2(data: &[u8]) -> Option<String> {
+/// The argv vector, one entry per argument.
+fn parse_procargs2_argv(data: &[u8]) -> Option<Vec<String>> {
     let (args, _) = split_procargs2(data)?;
     let args: Vec<String> = args
         .into_iter()
         .map(|a| String::from_utf8_lossy(a).into_owned())
         .collect();
-    (!args.is_empty()).then(|| args.join(" "))
+    (!args.is_empty()).then_some(args)
+}
+
+fn parse_procargs2(data: &[u8]) -> Option<String> {
+    parse_procargs2_argv(data).map(|args| args.join(" "))
 }
 
 /// The `NAME=value` strings after the arguments. Entries without `=` are
@@ -296,6 +306,111 @@ fn vnode_paths(pid: i32) -> Vec<PathBuf> {
     out
 }
 
+/// Nanoseconds per Mach absolute-time tick, as a `(numer, denom)` pair.
+// libc marks the Mach bindings deprecated in favour of the mach2 crate; two
+// calls do not justify a new dependency.
+#[allow(deprecated)]
+fn timebase() -> (u64, u64) {
+    static TIMEBASE: OnceLock<(u64, u64)> = OnceLock::new();
+    *TIMEBASE.get_or_init(|| {
+        let mut tb = libc::mach_timebase_info { numer: 0, denom: 0 };
+        // SAFETY: `tb` is a valid mach_timebase_info to fill.
+        let rc = unsafe { libc::mach_timebase_info(&mut tb) };
+        if rc == 0 && tb.numer > 0 && tb.denom > 0 {
+            (u64::from(tb.numer), u64::from(tb.denom))
+        } else {
+            (1, 1)
+        }
+    })
+}
+
+fn resources(pid: i32) -> Option<ProcResources> {
+    if pid <= 0 {
+        return None;
+    }
+    // SAFETY: proc_taskinfo is plain old data, so all-zero is valid.
+    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_taskinfo>() as c_int;
+    // SAFETY: the buffer is a proc_taskinfo of exactly `size` bytes, as
+    // PROC_PIDTASKINFO expects; the kernel writes at most `size` bytes.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTASKINFO,
+            0,
+            (&mut info as *mut libc::proc_taskinfo).cast::<c_void>(),
+            size,
+        )
+    };
+    if n != size {
+        return None;
+    }
+    let (numer, denom) = timebase();
+    let ticks = info.pti_total_user.saturating_add(info.pti_total_system);
+    Some(ProcResources {
+        rss_bytes: info.pti_resident_size,
+        cpu_time_ns: (u128::from(ticks) * u128::from(numer) / u128::from(denom)) as u64,
+    })
+}
+
+/// `hw.memsize` through sysctl.
+fn total_memory() -> Option<u64> {
+    let mut value: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    // SAFETY: hw.memsize is a u64; `value` and `len` describe exactly that.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"hw.memsize".as_ptr(),
+            (&mut value as *mut u64).cast::<c_void>(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && value > 0).then_some(value)
+}
+
+// libc marks the Mach bindings deprecated in favour of the mach2 crate; two
+// calls do not justify a new dependency.
+#[allow(deprecated)]
+fn used_memory() -> Option<u64> {
+    // SAFETY: vm_statistics64 is plain old data, so all-zero is valid.
+    let mut vm: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    // SAFETY: `vm` is a vm_statistics64 and `count` its size in 32-bit
+    // words, as HOST_VM_INFO64 expects; the kernel writes at most that.
+    let rc = unsafe {
+        libc::host_statistics64(
+            libc::mach_host_self(),
+            libc::HOST_VM_INFO64,
+            (&mut vm as *mut libc::vm_statistics64).cast::<libc::integer_t>(),
+            &mut count,
+        )
+    };
+    if rc != libc::KERN_SUCCESS {
+        return None;
+    }
+    // SAFETY: sysconf has no preconditions.
+    let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
+    let app = u64::from(vm.internal_page_count).saturating_sub(u64::from(vm.purgeable_count));
+    let pages = app + u64::from(vm.wire_count) + u64::from(vm.compressor_page_count);
+    Some(pages * page)
+}
+
+fn exe(pid: i32) -> Option<PathBuf> {
+    if pid <= 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: `buf` is `len` writable bytes; the kernel writes at most that.
+    let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast::<c_void>(), buf.len() as u32) };
+    if n <= 0 {
+        return None;
+    }
+    buf.truncate(n as usize);
+    Some(PathBuf::from(OsStr::from_bytes(&buf)))
+}
+
 fn c_name(raw: &[c_char]) -> String {
     let bytes: Vec<u8> = raw
         .iter()
@@ -376,6 +491,39 @@ impl Platform for MacOs {
         n
     }
 
+    fn established_excluding(&self, pid: i32, port: u16, peer_pids: &[i32]) -> u32 {
+        if peer_pids.is_empty() {
+            return self.established(pid, port);
+        }
+        if pid <= 0 {
+            return 0;
+        }
+        // The server's connections as (client port, IP family flag).
+        let mut conns: Vec<(u16, u8)> = Vec::new();
+        for_each_tcp_socket(pid, |tcp| {
+            if matches!(tcp_state(tcp), TcpSIState::Established) && local_port(tcp) == port {
+                conns.push((remote_port(tcp), tcp.tcpsi_ini.insi_vflag));
+            }
+        });
+        // A connection is the peer's when one of its sockets is the mirror
+        // image: local port = our remote port, remote port = our port.
+        for &peer in peer_pids.iter().filter(|&&p| p > 0 && p != pid) {
+            if conns.is_empty() {
+                break;
+            }
+            for_each_tcp_socket(peer, |tcp| {
+                if !matches!(tcp_state(tcp), TcpSIState::Established) || remote_port(tcp) != port {
+                    return;
+                }
+                let mirror = (local_port(tcp), tcp.tcpsi_ini.insi_vflag);
+                if let Some(i) = conns.iter().position(|&c| c == mirror) {
+                    conns.swap_remove(i);
+                }
+            });
+        }
+        conns.len() as u32
+    }
+
     fn descendants(&self, pid: i32) -> Vec<i32> {
         let mut out = Vec::new();
         if pid <= 0 {
@@ -428,6 +576,27 @@ impl Platform for MacOs {
 
     fn open_paths(&self, pid: i32) -> Vec<PathBuf> {
         vnode_paths(pid)
+    }
+
+    fn proc_resources(&self, pid: i32) -> Option<ProcResources> {
+        resources(pid)
+    }
+
+    fn machine_memory(&self) -> Option<MachineMemory> {
+        let total_bytes = total_memory()?;
+        let used_bytes = used_memory()?.min(total_bytes);
+        Some(MachineMemory {
+            total_bytes,
+            used_bytes,
+        })
+    }
+
+    fn proc_argv(&self, pid: i32) -> Option<Vec<String>> {
+        parse_procargs2_argv(&procargs2(pid)?)
+    }
+
+    fn exe_path(&self, pid: i32) -> Option<PathBuf> {
+        exe(pid)
     }
 
     fn pids_named(&self, name: &str) -> Vec<i32> {
