@@ -96,17 +96,20 @@ pub fn observed_servers_cached(
         found.insert(l.pid, (info, vec![l.port]));
     }
     // Each listener belongs to its topmost ancestor that is also observed
-    // (same process, by start time), else to itself.
+    // (same process, by start time), else to itself. The search stops at an
+    // agent CLI or an excluded command: a Stop spares those and whatever
+    // they run, so it would never reach the listener.
     let mut groups: BTreeMap<i32, Vec<i32>> = BTreeMap::new();
     for (&pid, (info, _)) in &found {
         let owner = ancestry(p, info.ppid)
             .iter()
-            .rev()
-            .find(|a| {
+            .take_while(|a| is_agent_cli(&a.command).is_none() && !is_excluded(&a.command, cfg))
+            .filter(|a| {
                 found
                     .get(&a.pid)
                     .is_some_and(|(i, _)| i.start_time == a.start_time)
             })
+            .last()
             .map_or(pid, |a| a.pid);
         groups.entry(owner).or_default().push(pid);
     }
@@ -214,6 +217,21 @@ mod tests {
         assert_eq!(o[0].command, "next dev");
         assert_eq!(o[0].cwd.as_deref(), Some(Path::new("/w")));
         assert!(!o[0].excluded);
+    }
+
+    #[test]
+    fn grouping_stops_at_an_agent_cli_or_an_excluded_command() {
+        let p = base();
+        listen(&p, 20, 10, "node tools.js", NODE, 3000);
+        // tools.js started an agent CLI, which started a dev server.
+        p.spawn(21, 20, 21, "claude", "/w");
+        listen(&p, 22, 21, "vite", NODE, 5173);
+        // And a database that runs a listener of its own.
+        p.spawn(23, 20, 23, "postgres -D /db", "/w");
+        listen(&p, 24, 23, "node exporter.js", NODE, 9187);
+        let o = scan(&p, &[]);
+        let keys: Vec<(i32, Vec<u16>)> = o.iter().map(|o| (o.key.pid, o.ports.clone())).collect();
+        assert_eq!(keys, [(20, vec![3000]), (22, vec![5173]), (24, vec![9187])]);
     }
 
     #[test]

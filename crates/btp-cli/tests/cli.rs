@@ -111,41 +111,57 @@ fn kill_unknown_port_exits_1() {
         .code(1);
 }
 
-/// A real child that listens on a free loopback port, and that port.
-fn child_listener() -> (std::process::Child, u16) {
-    use std::io::BufRead;
-    let mut child = std::process::Command::new("/usr/bin/perl")
-        .args([
-            "-MIO::Socket::INET",
-            "-e",
-            "$s = IO::Socket::INET->new(Listen => 5, LocalAddr => '127.0.0.1', \
-             LocalPort => 0) or die; $| = 1; print $s->sockport, \"\\n\"; sleep 60",
-        ])
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut line = String::new();
-    std::io::BufReader::new(child.stdout.take().unwrap())
-        .read_line(&mut line)
-        .unwrap();
-    (child, line.trim().parse().unwrap())
+/// A real child that listens on a free loopback port. Killed on drop, so a
+/// failing assertion never leaks it.
+struct ChildListener {
+    child: std::process::Child,
+    port: u16,
+}
+
+impl ChildListener {
+    fn spawn() -> Self {
+        use std::io::BufRead;
+        let mut child = std::process::Command::new("/usr/bin/perl")
+            .args([
+                "-MIO::Socket::INET",
+                "-e",
+                "$s = IO::Socket::INET->new(Listen => 5, LocalAddr => '127.0.0.1', \
+                 LocalPort => 0) or die; $| = 1; print $s->sockport, \"\\n\"; sleep 60",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut guard = ChildListener { child, port: 0 };
+        let mut line = String::new();
+        std::io::BufReader::new(stdout)
+            .read_line(&mut line)
+            .unwrap();
+        guard.port = line.trim().parse().unwrap();
+        guard
+    }
+}
+
+impl Drop for ChildListener {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 #[test]
-fn kill_refuses_an_observed_server() {
+fn kill_refuses_an_untracked_listener() {
     let (data, _e) = sandbox();
-    let (mut child, port) = child_listener();
+    let mut l = ChildListener::spawn();
     btp_isolated(&data)
-        .args(["kill", &port.to_string()])
+        .args(["kill", &l.port.to_string()])
         .assert()
         .code(1);
     btp_isolated(&data)
-        .args(["kill", "--pid", &child.id().to_string()])
+        .args(["kill", "--pid", &l.child.id().to_string()])
         .assert()
         .code(1);
-    assert!(child.try_wait().unwrap().is_none(), "child was killed");
-    child.kill().unwrap();
-    child.wait().unwrap();
+    assert!(l.child.try_wait().unwrap().is_none(), "child was killed");
 }
 
 #[test]

@@ -32,6 +32,24 @@ pub struct PageMeta {
     pub icon: Option<Favicon>,
 }
 
+/// What one probe of a port found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    Meta(PageMeta),
+    /// No answer in time, refused, or an HTTP page with no title or icon:
+    /// asked again after `FAILURE_TTL_MS`.
+    Nothing,
+    /// Bytes came back but not an HTTP response (a database, say): never
+    /// asked again while the server lives.
+    NotHttp,
+}
+
+impl From<Option<PageMeta>> for ProbeOutcome {
+    fn from(m: Option<PageMeta>) -> Self {
+        m.map_or(ProbeOutcome::Nothing, ProbeOutcome::Meta)
+    }
+}
+
 // ---------------------------------------------------------------- parsing
 
 fn decode_entities(s: &str) -> String {
@@ -405,14 +423,46 @@ fn response_complete(raw: &[u8]) -> bool {
         .is_some_and(|n| body.len() >= n)
 }
 
-/// One GET to `addr`; `None` when nothing HTTP answers within the timeout.
+/// Why a GET got no response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Miss {
+    /// Refused, timed out, or cut before a whole HTTP head.
+    NoAnswer,
+    /// The first bytes back are not an HTTP status line.
+    NotHttp,
+}
+
+/// Bytes that can no longer become an `HTTP/1.` status line.
+fn not_http(raw: &[u8]) -> bool {
+    const STATUS: &[u8] = b"HTTP/1.";
+    let n = raw.len().min(STATUS.len());
+    n > 0 && raw[..n] != STATUS[..n]
+}
+
+/// One GET to `addr`, `Err` when nothing HTTP answers within the timeout.
 fn get_once(
     addr: SocketAddr,
     port: u16,
     path: &str,
     max_body: usize,
     deadline: Instant,
-) -> Option<Response> {
+) -> Result<Response, Miss> {
+    get_raw(addr, port, path, max_body, deadline).map_or(Err(Miss::NoAnswer), |raw| {
+        if not_http(&raw) {
+            return Err(Miss::NotHttp);
+        }
+        parse_response(&raw, max_body).ok_or(Miss::NoAnswer)
+    })
+}
+
+/// The raw bytes one GET to `addr` read before the deadline.
+fn get_raw(
+    addr: SocketAddr,
+    port: u16,
+    path: &str,
+    max_body: usize,
+    deadline: Instant,
+) -> Option<Vec<u8>> {
     let left = |d: Instant| {
         d.checked_duration_since(Instant::now())
             .filter(|l| !l.is_zero())
@@ -434,11 +484,11 @@ fn get_once(
             Ok(0) | Err(_) => break,
             Ok(n) => raw.extend_from_slice(&buf[..n]),
         }
-        if response_complete(&raw) {
+        if response_complete(&raw) || not_http(&raw) {
             break;
         }
     }
-    parse_response(&raw, max_body)
+    Some(raw)
 }
 
 fn loopbacks(port: u16) -> [SocketAddr; 2] {
@@ -455,20 +505,35 @@ fn redirect_path(location: &str, port: u16) -> Option<String> {
 }
 
 /// GET `path` on the loopback addresses in turn, following at most two
-/// redirects within the same port.
-fn get(port: u16, path: &str, max_body: usize, deadline: Instant) -> Option<Response> {
+/// redirects within the same port. `NotHttp` when an address answered
+/// with something else and none answered HTTP.
+fn get(port: u16, path: &str, max_body: usize, deadline: Instant) -> Result<Response, Miss> {
     let mut path = path.to_string();
     for _ in 0..=MAX_REDIRECTS {
-        let r = loopbacks(port)
-            .into_iter()
-            .find_map(|a| get_once(a, port, &path, max_body, deadline))?;
+        let mut miss = Miss::NoAnswer;
+        let mut found = None;
+        for a in loopbacks(port) {
+            match get_once(a, port, &path, max_body, deadline) {
+                Ok(r) => {
+                    found = Some(r);
+                    break;
+                }
+                Err(Miss::NotHttp) => miss = Miss::NotHttp,
+                Err(Miss::NoAnswer) => {}
+            }
+        }
+        let r = found.ok_or(miss)?;
         if (300..400).contains(&r.status) {
-            path = redirect_path(r.location.as_deref()?, port)?;
+            path = r
+                .location
+                .as_deref()
+                .and_then(|l| redirect_path(l, port))
+                .ok_or(Miss::NoAnswer)?;
             continue;
         }
-        return Some(r);
+        return Ok(r);
     }
-    None
+    Err(Miss::NoAnswer)
 }
 
 fn guess_mime(path: &str) -> Option<&'static str> {
@@ -499,7 +564,7 @@ fn fetch_icon(port: u16, href: Option<&str>, deadline: Instant) -> Option<Favico
         Some(h) => local_icon_path(h, port)?,
         None => "/favicon.ico".to_string(),
     };
-    let r = get(port, &path, MAX_ICON_BYTES, deadline)?;
+    let r = get(port, &path, MAX_ICON_BYTES, deadline).ok()?;
     if r.status != 200 || r.body.is_empty() || r.truncated {
         return None;
     }
@@ -529,11 +594,24 @@ fn fetch_icon(port: u16, href: Option<&str>, deadline: Instant) -> Option<Favico
 /// Title and favicon of `GET /` on `port`, `None` when nothing HTTP answers
 /// or the page has neither.
 pub fn fetch_page_meta(port: u16) -> Option<PageMeta> {
+    match probe_port(port) {
+        ProbeOutcome::Meta(m) => Some(m),
+        ProbeOutcome::Nothing | ProbeOutcome::NotHttp => None,
+    }
+}
+
+/// `fetch_page_meta`, telling a port that answered something other than
+/// HTTP apart from one that did not answer.
+pub fn probe_port(port: u16) -> ProbeOutcome {
     // One budget for the whole probe: page, redirects, both addresses, icons.
     let deadline = Instant::now() + PROBE_TIMEOUT;
-    let page = get(port, "/", MAX_PAGE_BYTES, deadline)?;
+    let page = match get(port, "/", MAX_PAGE_BYTES, deadline) {
+        Ok(page) => page,
+        Err(Miss::NotHttp) => return ProbeOutcome::NotHttp,
+        Err(Miss::NoAnswer) => return ProbeOutcome::Nothing,
+    };
     if !(200..300).contains(&page.status) {
-        return None;
+        return ProbeOutcome::Nothing;
     }
     let html = String::from_utf8_lossy(&page.body);
     let title = parse_title(&html);
@@ -543,9 +621,9 @@ pub fn fetch_page_meta(port: u16) -> Option<PageMeta> {
         icon = fetch_icon(port, None, deadline);
     }
     if title.is_none() && icon.is_none() {
-        return None;
+        return ProbeOutcome::Nothing;
     }
-    Some(PageMeta { title, icon })
+    ProbeOutcome::Meta(PageMeta { title, icon })
 }
 
 // ------------------------------------------------------------------ cache
@@ -554,10 +632,12 @@ pub fn fetch_page_meta(port: u16) -> Option<PageMeta> {
 struct Entry {
     at_ms: u64,
     meta: Option<PageMeta>,
+    /// The port answered something other than HTTP: never probed again.
+    not_http: bool,
 }
 
 /// Probe results by (server, port): successes live `META_TTL_MS`, failures
-/// (including non-HTTP ports) `FAILURE_TTL_MS`.
+/// `FAILURE_TTL_MS`; a non-HTTP port is not probed again while it lives.
 #[derive(Debug, Default)]
 pub struct ProbeCache {
     entries: HashMap<(ServerKey, u16), Entry>,
@@ -569,6 +649,9 @@ impl ProbeCache {
     }
 
     fn fresh(e: &Entry, now_ms: u64) -> bool {
+        if e.not_http {
+            return true;
+        }
         let ttl = if e.meta.is_some() {
             META_TTL_MS
         } else {
@@ -592,14 +675,20 @@ impl ProbeCache {
     }
 
     /// Records probe answers. A failed refresh keeps the previous answer.
-    pub fn store(&mut self, results: Vec<((ServerKey, u16), Option<PageMeta>)>, now_ms: u64) {
-        for (k, fetched) in results {
+    pub fn store(&mut self, results: Vec<((ServerKey, u16), ProbeOutcome)>, now_ms: u64) {
+        for (k, outcome) in results {
             let old = self.entries.remove(&k).and_then(|e| e.meta);
+            let not_http = outcome == ProbeOutcome::NotHttp;
+            let fetched = match outcome {
+                ProbeOutcome::Meta(m) => Some(m),
+                ProbeOutcome::Nothing | ProbeOutcome::NotHttp => None,
+            };
             self.entries.insert(
                 k,
                 Entry {
                     at_ms: now_ms,
                     meta: fetched.or(old),
+                    not_http,
                 },
             );
         }
@@ -612,15 +701,15 @@ impl ProbeCache {
 
     /// Test helper: one whole pass with an injected fetch.
     #[cfg(test)]
-    fn refresh(
+    fn refresh<R: Into<ProbeOutcome>>(
         &mut self,
         wanted: &[(ServerKey, u16)],
         now_ms: u64,
-        mut fetch: impl FnMut(u16) -> Option<PageMeta>,
+        mut fetch: impl FnMut(u16) -> R,
     ) {
         self.retain(wanted);
         let due = self.due(wanted, now_ms);
-        let results = due.into_iter().map(|k| (k, fetch(k.1))).collect();
+        let results = due.into_iter().map(|k| (k, fetch(k.1).into())).collect();
         self.store(results, now_ms);
     }
 }
@@ -985,6 +1074,45 @@ mod tests {
             None
         });
         assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn non_http_port_is_probed_once() {
+        let mut c = ProbeCache::default();
+        let wanted = [(key(1), 5432)];
+        let mut calls = 0;
+        for now in [0, FAILURE_TTL_MS, 10 * FAILURE_TTL_MS, 10 * META_TTL_MS] {
+            c.refresh(&wanted, now, |_| {
+                calls += 1;
+                ProbeOutcome::NotHttp
+            });
+        }
+        assert_eq!(calls, 1);
+        // A new process on that port is probed again.
+        let other = [(key(2), 5432)];
+        c.refresh(&other, 10 * META_TTL_MS + 1, |_| {
+            calls += 1;
+            ProbeOutcome::NotHttp
+        });
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn probe_tells_not_http_from_no_answer() {
+        assert_eq!(
+            probe_port(serve_raw(b"-ERR unknown\r\n")),
+            ProbeOutcome::NotHttp
+        );
+        assert_eq!(probe_port(serve_raw(b"N\0\0\0")), ProbeOutcome::NotHttp);
+        // Closed without a byte: no answer.
+        assert_eq!(probe_port(serve_raw(b"")), ProbeOutcome::Nothing);
+        let refused = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = refused.local_addr().unwrap().port();
+        drop(refused);
+        assert_eq!(probe_port(port), ProbeOutcome::Nothing);
+        assert!(!not_http(b"HTT"));
+        assert!(!not_http(b"HTTP/1.1 200"));
+        assert!(not_http(b"HTTX"));
     }
 
     #[test]
