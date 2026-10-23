@@ -1,4 +1,5 @@
 import AppKit
+import Network
 import WebKit
 
 /// Live page previews for the detail's hero: one offscreen snapshot per
@@ -87,8 +88,11 @@ final class PreviewStore: ObservableObject {
 /// to the server's own port on loopback; navigations elsewhere (links,
 /// redirects, frames) are cancelled as well; a document-start script turns
 /// DNS prefetch off, drops resource hints to other origins and takes
-/// service workers away (`previewUserScript`). Without the rule list there
-/// is no preview.
+/// service workers away (`previewUserScript`), in every frame. Below both,
+/// the data store sends every connection that is not to loopback through
+/// a SOCKS proxy on a dead loopback port (`previewProxy()`), so what slips
+/// past them (a preconnect, a DNS prefetch, a font) dies on this machine.
+/// Without the rule list there is no preview.
 @MainActor
 final class PagePreview: NSObject, WKNavigationDelegate {
     private let port: UInt16
@@ -113,10 +117,12 @@ final class PagePreview: NSObject, WKNavigationDelegate {
                 return
             }
             let config = WKWebViewConfiguration()
-            config.websiteDataStore = .nonPersistent()
+            let store = WKWebsiteDataStore.nonPersistent()
+            store.proxyConfigurations = [previewProxy()]
+            config.websiteDataStore = store
             config.userContentController.add(rules)
             config.userContentController.addUserScript(WKUserScript(
-                source: previewUserScript(port: port), injectionTime: .atDocumentStart, forMainFrameOnly: true
+                source: previewUserScript(port: port), injectionTime: .atDocumentStart, forMainFrameOnly: false
             ))
             config.defaultWebpagePreferences.allowsContentJavaScript = true
             config.mediaTypesRequiringUserActionForPlayback = .all
@@ -173,4 +179,13 @@ final class PagePreview: NSObject, WKNavigationDelegate {
         webView = nil
         done(image)
     }
+}
+
+/// A SOCKSv5 proxy at 127.0.0.1:9 (discard, nothing listens there) for
+/// everything but loopback, with no fallback to a direct connection.
+private func previewProxy() -> ProxyConfiguration {
+    var proxy = ProxyConfiguration(socksv5Proxy: .hostPort(host: "127.0.0.1", port: 9))
+    proxy.excludedDomains = ["localhost", "127.0.0.1"]
+    proxy.allowFailover = false
+    return proxy
 }
