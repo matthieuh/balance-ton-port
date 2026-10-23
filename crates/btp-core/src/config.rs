@@ -85,12 +85,18 @@ pub const MIN_DELAY_S: u64 = 60;
 /// Minimum for `kill_grace_s` (0 means SIGKILL at once) and
 /// `scan_interval_s` (0 would busy-loop).
 pub const MIN_SECONDS_S: u64 = 1;
+/// Minimum for `leak_memory_mb`: below it every server would leak.
+pub const MIN_LEAK_MEMORY_MB: u64 = 100;
+/// Minimum for `leak_growth_mb`: below it ordinary churn would leak.
+pub const MIN_LEAK_GROWTH_MB: u64 = 50;
 
 /// The minimum for a numeric key, `None` for an unknown key.
 fn minimum(key: &str) -> Option<u64> {
     match key {
         "dead_session_idle_s" | "alert_after_s" => Some(MIN_DELAY_S),
         "kill_grace_s" | "scan_interval_s" => Some(MIN_SECONDS_S),
+        "leak_memory_mb" => Some(MIN_LEAK_MEMORY_MB),
+        "leak_growth_mb" => Some(MIN_LEAK_GROWTH_MB),
         _ => None,
     }
 }
@@ -165,12 +171,14 @@ impl Config {
         std::time::Duration::from_secs(self.scan_interval_s.max(MIN_SECONDS_S))
     }
 
-    fn numeric_mut(&mut self) -> [(&'static str, &mut u64); 4] {
+    fn numeric_mut(&mut self) -> [(&'static str, &mut u64); 6] {
         [
             ("dead_session_idle_s", &mut self.dead_session_idle_s),
             ("alert_after_s", &mut self.alert_after_s),
             ("kill_grace_s", &mut self.kill_grace_s),
             ("scan_interval_s", &mut self.scan_interval_s),
+            ("leak_memory_mb", &mut self.leak_memory_mb),
+            ("leak_growth_mb", &mut self.leak_growth_mb),
         ]
     }
 
@@ -303,6 +311,36 @@ mod tests {
         }
         assert_eq!(c.dead_session_idle_s, 60);
         assert_eq!(c.kill_grace_s, 1);
+    }
+
+    #[test]
+    fn leak_defaults_and_minimums() {
+        let mut c = Config::default();
+        assert_eq!((c.leak_memory_mb, c.leak_growth_mb), (2048, 500));
+        assert!(c
+            .set("leak_growth_mb", "10")
+            .unwrap_err()
+            .contains("at least 50"));
+        assert!(c
+            .set("leak_memory_mb", "99")
+            .unwrap_err()
+            .contains("at least 100"));
+        c.set("leak_memory_mb", "100").unwrap();
+        c.set("leak_growth_mb", "50").unwrap();
+        assert_eq!((c.leak_memory_mb, c.leak_growth_mb), (100, 50));
+        let low = Config {
+            leak_growth_mb: 1,
+            ..Config::default()
+        };
+        assert!(low.validate().unwrap_err().contains("leak_growth_mb"));
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("config.toml"),
+            "leak_memory_mb = 0\nleak_growth_mb = 0\n",
+        )
+        .unwrap();
+        let c = read_config(d.path()).unwrap();
+        assert_eq!((c.leak_memory_mb, c.leak_growth_mb), (100, 50));
     }
 
     #[test]

@@ -15,9 +15,10 @@ pub const HISTORY_MS: u64 = 7_200_000;
 pub const GROWTH_WINDOW_MS: u64 = 600_000;
 pub const MB: u64 = 1_048_576;
 
-/// Memory above which a server is red whatever its growth.
-const RED_MEMORY_MB: u64 = 2048;
+/// Memory from which a server is amber (red is a leak).
 const AMBER_MEMORY_MB: u64 = 500;
+/// An ignored leak alert comes back once memory grew this much more.
+pub const LEAK_REARM_MB: u64 = 500;
 
 /// One process of a tree: (pid, start time), so a reused pid is a new process.
 pub type ProcId = (i32, u64);
@@ -206,8 +207,10 @@ impl History {
     }
 }
 
+/// Red exactly when the server leaks (`is_leak`), amber from 500 MB, green
+/// below.
 pub fn health(rss_bytes: u64, growth_bytes: i64, cfg: &Config) -> Health {
-    if rss_bytes > RED_MEMORY_MB * MB || growth_bytes > (cfg.leak_growth_mb * MB) as i64 {
+    if is_leak(rss_bytes, growth_bytes, cfg) {
         Health::Red
     } else if rss_bytes >= AMBER_MEMORY_MB * MB {
         Health::Amber
@@ -217,7 +220,119 @@ pub fn health(rss_bytes: u64, growth_bytes: i64, cfg: &Config) -> Health {
 }
 
 pub fn is_leak(rss_bytes: u64, growth_bytes: i64, cfg: &Config) -> bool {
-    rss_bytes > cfg.leak_memory_mb * MB || growth_bytes > (cfg.leak_growth_mb * MB) as i64
+    leak(rss_bytes, growth_bytes, cfg).is_some()
+}
+
+/// What makes a server leak.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeakCause {
+    /// Above `leak_memory_mb`.
+    Size,
+    /// Grew by more than `leak_growth_mb` in 10 minutes (wins over `Size`).
+    Growth,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Leak {
+    pub rss_bytes: u64,
+    pub growth_bytes: i64,
+    pub cause: LeakCause,
+}
+
+/// The leak of a server with this memory and growth, if it leaks.
+pub fn leak(rss_bytes: u64, growth_bytes: i64, cfg: &Config) -> Option<Leak> {
+    let cause = if growth_bytes > cfg.leak_growth_mb.saturating_mul(MB) as i64 {
+        LeakCause::Growth
+    } else if rss_bytes > cfg.leak_memory_mb.saturating_mul(MB) {
+        LeakCause::Size
+    } else {
+        return None;
+    };
+    Some(Leak {
+        rss_bytes,
+        growth_bytes,
+        cause,
+    })
+}
+
+/// The leak alert of one server.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LeakState {
+    /// The notification of the current leak went out.
+    pub notified: bool,
+    /// "Ignore this alert": the memory at that moment. The alert stays
+    /// dismissed until memory grows `LEAK_REARM_MB` more.
+    pub ignored_at_rss: Option<u64>,
+}
+
+/// What one pass decided about a server's leak alert.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LeakUpdate {
+    /// The leak its card shows (a leak that is not ignored).
+    pub shown: Option<Leak>,
+    /// Report it for a notification (shown and not notified yet).
+    pub notify: bool,
+    /// An ignored alert came back this pass.
+    pub rearmed: bool,
+}
+
+/// The leak alerts of every server, in memory only. One notification per
+/// leak: a leak stays notified while its server lives, unless it was
+/// ignored and memory then grew `LEAK_REARM_MB` more.
+#[derive(Debug, Default)]
+pub struct LeakAlerts {
+    states: HashMap<ServerKey, LeakState>,
+    shown: HashSet<ServerKey>,
+}
+
+impl LeakAlerts {
+    /// One pass for a server with memory `rss_bytes`, leaking or not.
+    pub fn update(&mut self, key: ServerKey, rss_bytes: u64, leak: Option<Leak>) -> LeakUpdate {
+        let st = self.states.entry(key).or_default();
+        let mut rearmed = false;
+        if let Some(at) = st.ignored_at_rss {
+            if rss_bytes >= at.saturating_add(LEAK_REARM_MB * MB) {
+                *st = LeakState::default();
+                rearmed = true;
+            }
+        }
+        let shown = leak.filter(|_| st.ignored_at_rss.is_none());
+        if shown.is_some() {
+            self.shown.insert(key);
+        } else {
+            self.shown.remove(&key);
+        }
+        LeakUpdate {
+            shown,
+            notify: shown.is_some() && !st.notified,
+            rearmed,
+        }
+    }
+
+    pub fn state(&self, key: ServerKey) -> LeakState {
+        self.states.get(&key).copied().unwrap_or_default()
+    }
+
+    /// The last pass showed a leak card for this server.
+    pub fn is_shown(&self, key: ServerKey) -> bool {
+        self.shown.contains(&key)
+    }
+
+    pub fn mark_notified(&mut self, key: ServerKey) {
+        self.states.entry(key).or_default().notified = true;
+    }
+
+    /// Dismisses the current alert at memory `rss_bytes`.
+    pub fn ignore(&mut self, key: ServerKey, rss_bytes: u64) {
+        self.states.entry(key).or_default().ignored_at_rss = Some(rss_bytes);
+        self.shown.remove(&key);
+    }
+
+    pub fn retain(&mut self, live: &HashSet<ServerKey>) {
+        self.states.retain(|k, _| live.contains(k));
+        self.shown.retain(|k| live.contains(k));
+    }
 }
 
 #[cfg(test)]
@@ -248,6 +363,51 @@ mod tests {
         assert_eq!(health(mb(2049), 0, &c), Health::Red);
         assert_eq!(health(mb(100), mb(501) as i64, &c), Health::Red);
         assert_eq!(health(mb(100), mb(500) as i64, &c), Health::Green);
+        // Red follows the configured leak size.
+        let c = Config {
+            leak_memory_mb: 1024,
+            ..Config::default()
+        };
+        assert_eq!(health(mb(1025), 0, &c), Health::Red);
+        assert_eq!(health(mb(1024), 0, &c), Health::Amber);
+    }
+
+    #[test]
+    fn leak_cause_growth_wins() {
+        let c = Config::default();
+        assert_eq!(leak(mb(100), 0, &c), None);
+        assert_eq!(leak(mb(3000), 0, &c).unwrap().cause, LeakCause::Size);
+        assert_eq!(
+            leak(mb(100), mb(600) as i64, &c).unwrap().cause,
+            LeakCause::Growth
+        );
+        assert_eq!(
+            leak(mb(3000), mb(600) as i64, &c).unwrap().cause,
+            LeakCause::Growth
+        );
+    }
+
+    #[test]
+    fn leak_alert_notified_once_ignored_then_rearmed() {
+        let c = Config::default();
+        let mut a = LeakAlerts::default();
+        let k = key(1);
+        let big = |r| leak(r, 0, &c);
+        let u = a.update(k, mb(3000), big(mb(3000)));
+        assert!(u.notify && u.shown.is_some() && !u.rearmed);
+        assert!(a.update(k, mb(3000), big(mb(3000))).notify);
+        a.mark_notified(k);
+        let u = a.update(k, mb(3000), big(mb(3000)));
+        assert!(!u.notify && u.shown.is_some());
+        a.ignore(k, mb(3000));
+        assert!(!a.is_shown(k));
+        let u = a.update(k, mb(3499), big(mb(3499)));
+        assert_eq!(u, LeakUpdate::default());
+        let u = a.update(k, mb(3500), big(mb(3500)));
+        assert!(u.rearmed && u.notify && u.shown.is_some());
+        assert_eq!(a.state(k), LeakState::default());
+        a.retain(&HashSet::new());
+        assert!(!a.is_shown(k));
     }
 
     #[test]

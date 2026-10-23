@@ -74,6 +74,8 @@ Only servers Balance ton port tracks can be killed; an unknown port or pid exits
 | `alert_after_s` | 1800 | Idle time before the Kill / Keep alert (at least 60) |
 | `kill_grace_s` | 5 | Delay between SIGTERM and SIGKILL (at least 1) |
 | `scan_interval_s` | 5 | Scan period (at least 1) |
+| `leak_memory_mb` | 2048 | A server above this much memory (MB) is flagged as a leak (at least 100) |
+| `leak_growth_mb` | 500 | A server growing by more than this (MB) in 10 minutes is flagged as a leak (at least 50) |
 | `claude_config_dirs` | `[]` | Extra Claude config dirs only. `~/.claude`, `$CLAUDE_CONFIG_DIR` and every `~/.claude-*` with a `sessions/` folder are found automatically |
 | `exclude_commands` | `mcp`, `argent`, `postgres`, `redis-server`, `mysqld`, `mongod` | Never tracked or killed when the command line contains one of these (case-insensitive) |
 | `exclude_ports` | `[]` | Never tracked or killed when the server, or one of its child processes, listens on one of these ports |

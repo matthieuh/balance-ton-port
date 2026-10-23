@@ -111,12 +111,14 @@ pub struct StaleServer {
 /// gone: idle `dead_session_idle_s`, or at once for a `--done` note (it is
 /// then stopped only if no connection is open).
 fn due_at(s: &TrackedServer, cfg: &Config, now_ms: u64) -> u64 {
-    if s.is_done() && !s.is_kept() {
+    let rule = if s.is_done() && !s.is_kept() {
         now_ms
     } else {
         s.last_active_ms
             .saturating_add(cfg.dead_session_idle_s.saturating_mul(1000))
-    }
+    };
+    // "Postpone 1 h" holds the kill until then.
+    rule.max(s.postponed_until_ms.unwrap_or(0))
 }
 
 impl<P: Platform> Watcher<P> {

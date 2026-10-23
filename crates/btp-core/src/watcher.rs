@@ -11,7 +11,8 @@ use crate::agents::codex::{classify_codex, env_thread, CodexAgent, CodexRole};
 use crate::agents::{is_agent_cli, session_idle_ms, Agent, AgentKind, AgentSession};
 use crate::config::{effective_claude_dirs_with, read_config, Config};
 use crate::decide::{decide, touch};
-use crate::history::{AlertKind, EventKind, History, ProcId, ServerEvent};
+use crate::display::{needs_you, NeedsYou};
+use crate::history::{leak, AlertKind, EventKind, History, LeakAlerts, ProcId, ServerEvent};
 use crate::labels::{location_label, session_display_name, tool_label};
 use crate::model::{Action, KillReason, KillTarget, Note, Observation, ServerKey, TrackedServer};
 use crate::observed::{observed_servers_cached, ObservedServer, SystemCache};
@@ -57,10 +58,22 @@ pub struct ServerView {
     /// Port idle time, or the larger of port and session idle time while the
     /// session is alive (what the alert compares against).
     pub idle_ms: u64,
-    /// Time left before the dead-session kill, `Some(0)` when the worktree is
-    /// gone; `None` while nothing is scheduled.
+    /// Time left before the dead-session kill (a postpone included),
+    /// `Some(0)` when the worktree is gone; `None` while nothing is
+    /// scheduled.
     pub kill_in_ms: Option<u64>,
+    /// A connection is open on it this pass (probes and previews excluded).
+    pub in_use: bool,
+    /// "Postpone 1 h" holds the dead-session kill until then (Unix ms).
+    pub postponed_until_ms: Option<u64>,
+    /// Kept by the agent's note: its reason, empty when it gave none.
+    pub note_reason: Option<String>,
+    /// Kept by the user (Keep).
+    pub kept_by_user: bool,
 }
+
+/// How long "Postpone 1 h" holds the dead-session kill.
+pub const POSTPONE_MS: u64 = 3_600_000;
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TickReport {
@@ -74,6 +87,14 @@ pub struct TickReport {
     /// Listeners no agent started (`tick` and `observe`; always empty for
     /// `sweep`). Never stopped by a pass.
     pub observed: Vec<ObservedServer>,
+    /// Servers (tracked or observed) whose leak is due a notification,
+    /// reported on every pass until `mark_leak_notified`. Always empty for
+    /// `sweep`.
+    pub leaks: Vec<ServerKey>,
+    /// The "Needs you" card of each server that has one, tracked servers in
+    /// `servers` order, then observed ones (a leak only). Always empty for
+    /// `sweep`.
+    pub needs_you: Vec<(ServerKey, NeedsYou)>,
     /// Set while `config.toml` cannot be read or parsed (the pass then ran
     /// on the last valid config, or the defaults if there never was one).
     pub config_error: Option<String>,
@@ -192,6 +213,7 @@ pub fn link(
         note: None,
         asked_stale: false,
         agent: session.agent,
+        postponed_until_ms: None,
     })
 }
 
@@ -544,6 +566,8 @@ pub struct Watcher<P: Platform> {
     /// The observed servers of the last `tick` or `observe`: a `sweep`
     /// keeps their history and probes.
     last_observed: Vec<ObservedServer>,
+    /// Leak alerts, in memory only.
+    leaks: LeakAlerts,
 }
 
 impl<P: Platform> Watcher<P> {
@@ -563,6 +587,7 @@ impl<P: Platform> Watcher<P> {
             ignored_peers: Vec::new(),
             system: SystemCache::default(),
             last_observed: Vec::new(),
+            leaks: LeakAlerts::default(),
         }
     }
 
@@ -804,6 +829,54 @@ impl<P: Platform> Watcher<P> {
         })
     }
 
+    /// Records that the leak notification of this server went out: no
+    /// more until its alert is ignored and re-arms.
+    pub fn mark_leak_notified(&mut self, key: ServerKey) {
+        self.leaks.mark_notified(key);
+    }
+
+    /// "Ignore this alert": dismisses the server's current alert only. A
+    /// leak card shown by the last pass is dismissed until memory grows
+    /// another 500 MB; otherwise the idle alert is marked as delivered
+    /// (`mark_alerted`), until the server is used again.
+    pub fn ignore_alert(&mut self, key: ServerKey) -> io::Result<()> {
+        if self.leaks.is_shown(key) {
+            let rss = self.history.samples(key).last().map_or(0, |s| s.rss_bytes);
+            self.leaks.ignore(key, rss);
+            return Ok(());
+        }
+        self.mark_alerted(key)
+    }
+
+    /// "Postpone 1 h": the dead-session countdown of this server restarts
+    /// for one hour from now; afterwards the rule applies as usual. Keep and
+    /// the note are left as they are.
+    pub fn postpone(&mut self, key: ServerKey) -> io::Result<()> {
+        self.postpone_at(key, now_ms())
+    }
+
+    /// `postpone` at `now_ms`.
+    pub fn postpone_at(&mut self, key: ServerKey, now_ms: u64) -> io::Result<()> {
+        let found = with_state(&self.data_dir, |state| {
+            let mut found = false;
+            for s in state.servers.iter_mut().filter(|s| s.key == key) {
+                s.postponed_until_ms = Some(now_ms.saturating_add(POSTPONE_MS));
+                found = true;
+            }
+            found
+        })?;
+        if found {
+            self.history.push_event(
+                key,
+                ServerEvent {
+                    at_ms: now_ms,
+                    kind: EventKind::Postponed,
+                },
+            );
+        }
+        Ok(())
+    }
+
     /// No more alerts for this server until it restarts.
     pub fn keep(&mut self, key: ServerKey) -> io::Result<()> {
         with_state(&self.data_dir, |state| {
@@ -937,6 +1010,7 @@ impl<P: Platform> Watcher<P> {
             o.last_active_ms = o.last_active_ms.max(c.last_active_ms);
             o.kept |= c.kept;
             o.asked_stale |= c.asked_stale;
+            o.postponed_until_ms = o.postponed_until_ms.max(c.postponed_until_ms);
             o.note = merge_notes(o.note.take(), c.note);
         }
     }
@@ -998,87 +1072,125 @@ impl<P: Platform> Watcher<P> {
     fn run(&mut self, now_ms: u64, mode: Mode) -> io::Result<TickReport> {
         let scan = self.scan();
         let listeners = self.platform.listeners();
-        let (mut report, to_kill, feeds, tracked) = with_state(&self.data_dir, |state| {
-            let trees = self.refresh(state, &scan, &listeners, now_ms);
-            let obs: Vec<Observation> = state
-                .servers
-                .iter()
-                .zip(&trees)
-                .map(|(s, t)| self.observe_one(s, t, &scan, now_ms))
-                .collect();
-            for (s, o) in state.servers.iter_mut().zip(&obs) {
-                if o.alive {
-                    touch(s, o, now_ms);
-                }
-            }
-            let mut report = TickReport {
-                config_error: self.config_error.clone(),
-                ..TickReport::default()
-            };
-            let mut to_kill = Vec::new();
-            let mut alerted = HashSet::new();
-            let mut forget = HashSet::new();
-            for action in decide(&state.servers, &obs, now_ms, &scan.cfg) {
-                match action {
-                    Action::Forget { key } => {
-                        forget.insert(key);
-                    }
-                    Action::Alert { key, .. } => {
-                        if mode != Mode::Sweep {
-                            alerted.insert(key);
-                        }
-                    }
-                    Action::Kill { key, reason } => {
-                        if let Some(s) = state.servers.iter().find(|s| s.key == key) {
-                            to_kill.push((s.clone(), reason));
-                        }
-                    }
-                }
-            }
-            for ((s, o), t) in state.servers.iter_mut().zip(&obs).zip(&trees) {
-                if forget.contains(&s.key) {
-                    continue;
-                }
-                let session = scan
-                    .live
+        let (mut report, to_kill, feeds, tracked, reused, ended_open) =
+            with_state(&self.data_dir, |state| {
+                let trees = self.refresh(state, &scan, &listeners, now_ms);
+                let obs: Vec<Observation> = state
+                    .servers
                     .iter()
-                    .find(|l| {
-                        l.session.pid == s.session_pid
-                            && l.session.proc_start == s.session_proc_start
-                    })
-                    .map(|l| session_display_name(Some(&l.session.name), &l.session.cwd));
-                let view = view(s, o, t, session.as_deref(), now_ms, &scan.cfg);
-                if alerted.contains(&s.key) {
-                    report.alerts.push(view.clone());
+                    .zip(&trees)
+                    .map(|(s, t)| self.observe_one(s, t, &scan, now_ms))
+                    .collect();
+                // A server used again after its idle alert can alert again.
+                let mut reused = Vec::new();
+                for (s, o) in state.servers.iter_mut().zip(&obs) {
+                    if o.alive {
+                        touch(s, o, now_ms);
+                        if o.established > 0 && s.alerted {
+                            s.alerted = false;
+                            reused.push(s.key);
+                        }
+                    }
                 }
-                report.servers.push(view);
-            }
-            state.servers.retain(|s| !forget.contains(&s.key));
-            let feeds: Vec<Feed> = state
-                .servers
-                .iter()
-                .zip(&obs)
-                .zip(&trees)
-                .map(|((s, o), t)| Feed {
-                    key: s.key,
-                    agent: Some(s.agent),
-                    procs: t.procs.clone(),
-                    established: o.established,
-                    session_alive: o.session_alive,
-                })
-                .collect();
-            (report, to_kill, feeds, tracked_pids(&trees))
-        })?;
+                // Still open after its session ended: listed as kept running in
+                // a recorded session end, its session still dead, and a
+                // connection open on it this pass.
+                let ended_open: HashSet<ServerKey> = state
+                    .servers
+                    .iter()
+                    .zip(&obs)
+                    .filter(|(s, o)| {
+                        !o.session_alive
+                            && o.established > 0
+                            && state
+                                .session_ended
+                                .iter()
+                                .any(|g| g.still_open.iter().any(|x| x.key == s.key))
+                    })
+                    .map(|(s, _)| s.key)
+                    .collect();
+                let mut report = TickReport {
+                    config_error: self.config_error.clone(),
+                    ..TickReport::default()
+                };
+                let mut to_kill = Vec::new();
+                let mut alerted = HashSet::new();
+                let mut forget = HashSet::new();
+                for action in decide(&state.servers, &obs, now_ms, &scan.cfg) {
+                    match action {
+                        Action::Forget { key } => {
+                            forget.insert(key);
+                        }
+                        Action::Alert { key, .. } => {
+                            if mode != Mode::Sweep {
+                                alerted.insert(key);
+                            }
+                        }
+                        Action::Kill { key, reason } => {
+                            if let Some(s) = state.servers.iter().find(|s| s.key == key) {
+                                to_kill.push((s.clone(), reason));
+                            }
+                        }
+                    }
+                }
+                for ((s, o), t) in state.servers.iter_mut().zip(&obs).zip(&trees) {
+                    if forget.contains(&s.key) {
+                        continue;
+                    }
+                    let session = scan
+                        .live
+                        .iter()
+                        .find(|l| {
+                            l.session.pid == s.session_pid
+                                && l.session.proc_start == s.session_proc_start
+                        })
+                        .map(|l| session_display_name(Some(&l.session.name), &l.session.cwd));
+                    let view = view(s, o, t, session.as_deref(), now_ms, &scan.cfg);
+                    if alerted.contains(&s.key) {
+                        report.alerts.push(view.clone());
+                    }
+                    report.servers.push(view);
+                }
+                state.servers.retain(|s| !forget.contains(&s.key));
+                let feeds: Vec<Feed> = state
+                    .servers
+                    .iter()
+                    .zip(&obs)
+                    .zip(&trees)
+                    .map(|((s, o), t)| Feed {
+                        key: s.key,
+                        agent: Some(s.agent),
+                        procs: t.procs.clone(),
+                        established: o.established,
+                        session_alive: o.session_alive,
+                    })
+                    .collect();
+                (
+                    report,
+                    to_kill,
+                    feeds,
+                    tracked_pids(&trees),
+                    reused,
+                    ended_open,
+                )
+            })?;
         let mut feeds = feeds;
         if mode != Mode::Sweep {
             report.observed = self.observed(&listeners, &tracked, &scan.cfg);
             self.last_observed = report.observed.clone();
             feeds.extend(report.observed.iter().map(|o| self.observed_feed(o)));
         }
+        for key in reused {
+            self.history.reset_alert(key, AlertKind::Idle);
+        }
         self.feed_history(&feeds, &report, now_ms);
+        if mode != Mode::Sweep {
+            self.leaks_and_needs(&mut report, &ended_open, &scan.cfg, now_ms);
+        }
         let mut live: HashSet<ServerKey> = report.servers.iter().map(|v| v.key).collect();
         live.extend(self.last_observed.iter().map(|o| o.key));
         self.history.retain(&live, now_ms);
+        self.leaks.retain(&live);
         // An excluded server (a database, say) is never probed.
         self.probe_targets = report.servers.iter().map(|v| (v.key, v.port)).collect();
         self.probe_targets.extend(
@@ -1098,7 +1210,49 @@ impl<P: Platform> Watcher<P> {
         let (killed, gone) = self.execute(to_kill, &scan.cfg, now_ms)?;
         report.killed = killed;
         report.servers.retain(|v| !gone.contains(&v.key));
+        report.leaks.retain(|k| !gone.contains(k));
+        report.needs_you.retain(|(k, _)| !gone.contains(k));
         Ok(report)
+    }
+
+    /// Updates the leak alerts from this pass's history, reports the leaks
+    /// due a notification, and builds every "Needs you" card.
+    fn leaks_and_needs(
+        &mut self,
+        report: &mut TickReport,
+        ended_open: &HashSet<ServerKey>,
+        cfg: &Config,
+        now_ms: u64,
+    ) {
+        let mut due = Vec::new();
+        let mut leak_of = |w: &mut Self, key: ServerKey| {
+            let rss = w.history.samples(key).last().map_or(0, |s| s.rss_bytes);
+            let growth = w.history.growth_bytes(key, now_ms);
+            let u = w.leaks.update(key, rss, leak(rss, growth, cfg));
+            if u.rearmed {
+                w.history.reset_alert(key, AlertKind::Leak);
+            }
+            if u.notify {
+                due.push(key);
+                w.history.note_alert(key, now_ms, AlertKind::Leak);
+            }
+            u.shown
+        };
+        let mut cards = Vec::new();
+        for v in &report.servers {
+            let l = leak_of(self, v.key);
+            let idle_alert = report.alerts.iter().any(|a| a.key == v.key);
+            if let Some(n) = needs_you(v, l, ended_open.contains(&v.key), idle_alert) {
+                cards.push((v.key, n));
+            }
+        }
+        for o in &report.observed {
+            if let Some(l) = leak_of(self, o.key) {
+                cards.push((o.key, NeedsYou::from(l)));
+            }
+        }
+        report.leaks = due;
+        report.needs_you = cards;
     }
 
     /// Feeds the history from one pass: a sample and the connection count of
@@ -1221,11 +1375,12 @@ fn view(
     } else if o.shared_with_live_session || o.session_alive {
         None
     } else {
-        Some(
-            cfg.dead_session_idle_s
-                .saturating_mul(1000)
-                .saturating_sub(port_idle),
-        )
+        let rule = cfg
+            .dead_session_idle_s
+            .saturating_mul(1000)
+            .saturating_sub(port_idle);
+        let postponed = s.postponed_until_ms.map_or(0, |u| u.saturating_sub(now_ms));
+        Some(rule.max(postponed))
     };
     let worktree_name = s
         .worktree
@@ -1254,6 +1409,14 @@ fn view(
         session_alive: o.session_alive,
         idle_ms,
         kill_in_ms,
+        in_use: o.established > 0,
+        postponed_until_ms: s.postponed_until_ms,
+        note_reason: s
+            .note
+            .as_ref()
+            .filter(|n| n.keep)
+            .map(|n| n.reason.clone().unwrap_or_default()),
+        kept_by_user: s.kept,
     }
 }
 
@@ -1759,6 +1922,7 @@ mod tests {
                 note: None,
                 asked_stale: false,
                 agent: crate::agents::AgentKind::ClaudeCode,
+                postponed_until_ms: None,
             }
         );
 
@@ -1780,6 +1944,10 @@ mod tests {
                 session_alive: true,
                 idle_ms: 0,
                 kill_in_ms: None,
+                in_use: false,
+                postponed_until_ms: None,
+                note_reason: None,
+                kept_by_user: false,
             }]
         );
         assert_eq!(f.state_servers(), vec![s]);
@@ -2366,6 +2534,7 @@ mod tests {
                 note: None,
                 asked_stale: false,
                 agent: crate::agents::AgentKind::ClaudeCode,
+                postponed_until_ms: None,
             })
         })
         .unwrap();
@@ -3021,5 +3190,224 @@ mod tests {
         let _b = acquire_watch_lock(d.path(), "btp watch").unwrap();
         let e = acquire_watch_lock(d.path(), "x").unwrap_err();
         assert_eq!(e.to_string(), "Already watched by btp watch");
+    }
+
+    // Postpone, leaks and "Needs you".
+
+    const MB: u64 = crate::history::MB;
+
+    fn count_events(f: &Fx, key: ServerKey, kind: &EventKind) -> usize {
+        f.w.history()
+            .events(key)
+            .iter()
+            .filter(|e| &e.kind == kind)
+            .count()
+    }
+
+    fn card(r: &TickReport, key: ServerKey) -> Option<NeedsYou> {
+        r.needs_you
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, n)| n.clone())
+    }
+
+    #[test]
+    fn postpone_restarts_countdown_for_one_hour() {
+        let mut f = fx();
+        f.w.tick(T0).unwrap();
+        f.p().remove_proc(20);
+        let at = T0 + 19 * MIN;
+        let r = f.w.tick(at).unwrap();
+        assert_eq!(r.servers[0].kill_in_ms, Some(MIN));
+        assert_eq!(
+            card(&r, key30()),
+            Some(NeedsYou::AboutToStop { in_ms: MIN })
+        );
+        f.w.postpone_at(key30(), at).unwrap();
+        let r = f.w.tick(at).unwrap();
+        assert_eq!(r.servers[0].kill_in_ms, Some(3_600_000));
+        assert_eq!(r.servers[0].postponed_until_ms, Some(at + POSTPONE_MS));
+        assert_eq!(card(&r, key30()), None);
+        assert_eq!(count_events(&f, key30(), &EventKind::Postponed), 1);
+        let s = &f.state_servers()[0];
+        assert!(!s.kept && s.note.is_none());
+        assert!(f.w.tick(at + 59 * MIN).unwrap().killed.is_empty());
+        assert_eq!(f.w.tick(at + 60 * MIN).unwrap().killed.len(), 1);
+        assert!(!f.p().is_alive(30));
+    }
+
+    #[test]
+    fn postpone_hidden_while_session_alive() {
+        let mut f = fx();
+        f.w.tick(T0).unwrap();
+        f.w.postpone_at(key30(), T0).unwrap();
+        let r = f.w.tick(T0 + MIN).unwrap();
+        assert_eq!(r.servers[0].kill_in_ms, None);
+        assert!(r.needs_you.is_empty());
+        // An unknown server is left alone, no event.
+        let other = ServerKey {
+            pid: 30,
+            start_time: 1,
+        };
+        f.w.postpone_at(other, T0).unwrap();
+        assert_eq!(count_events(&f, other, &EventKind::Postponed), 0);
+    }
+
+    #[test]
+    fn legacy_state_without_postpone_loads() {
+        let f = fx();
+        let json = serde_json::json!({
+            "servers": [{
+                "key": {"pid": 30, "start_time": START + 30 * SEC},
+                "port": 3000,
+                "command": "bun run dev",
+                "worktree": "/w",
+                "session_id": "s",
+                "session_pid": 20,
+                "first_seen_ms": 0,
+                "last_active_ms": 0,
+                "kept": false,
+                "alerted": false
+            }]
+        });
+        fs::write(f.data.path().join("state.json"), json.to_string()).unwrap();
+        let s = f.state_servers();
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].postponed_until_ms, None);
+    }
+
+    #[test]
+    fn leak_reported_until_notified() {
+        let mut f = fx();
+        f.p().set_resources(30, 3000 * MB, 0);
+        let r = f.w.tick(T0).unwrap();
+        assert_eq!(r.leaks, vec![key30()]);
+        let leak_card = NeedsYou::Leak {
+            rss_bytes: 3000 * MB,
+            growth_bytes: 0,
+            cause: crate::history::LeakCause::Size,
+        };
+        assert_eq!(card(&r, key30()), Some(leak_card.clone()));
+        assert_eq!(f.w.tick(T0 + 1000).unwrap().leaks, vec![key30()]);
+        f.w.mark_leak_notified(key30());
+        let r = f.w.tick(T0 + 2000).unwrap();
+        assert!(r.leaks.is_empty());
+        // The card stays until ignored.
+        assert_eq!(card(&r, key30()), Some(leak_card));
+        let leak = EventKind::Alert {
+            alert: AlertKind::Leak,
+        };
+        assert_eq!(count_events(&f, key30(), &leak), 1);
+        // A kept server still shows its leak.
+        f.w.keep(key30()).unwrap();
+        assert!(card(&f.w.tick(T0 + 3000).unwrap(), key30()).is_some());
+    }
+
+    #[test]
+    fn ignore_rearms_after_500_mb_more() {
+        let mut f = fx();
+        f.p().set_resources(30, 3000 * MB, 0);
+        f.w.tick(T0).unwrap();
+        f.w.mark_leak_notified(key30());
+        f.w.ignore_alert(key30()).unwrap();
+        // The idle alert is not touched by ignoring a leak.
+        assert!(!f.state_servers()[0].alerted);
+        let r = f.w.tick(T0 + MIN).unwrap();
+        assert!(r.leaks.is_empty() && r.needs_you.is_empty());
+        f.p().set_resources(30, 3499 * MB, 0);
+        assert!(f.w.tick(T0 + 20 * MIN).unwrap().needs_you.is_empty());
+        f.p().set_resources(30, 3500 * MB, 0);
+        let r = f.w.tick(T0 + 21 * MIN).unwrap();
+        assert_eq!(r.leaks, vec![key30()]);
+        assert!(matches!(card(&r, key30()), Some(NeedsYou::Leak { .. })));
+        let leak = EventKind::Alert {
+            alert: AlertKind::Leak,
+        };
+        assert_eq!(count_events(&f, key30(), &leak), 2);
+    }
+
+    #[test]
+    fn ignore_idle_alert_marks_alerted() {
+        let mut f = fx();
+        f.w.tick(T0).unwrap();
+        let r = f.w.tick(T0 + 30 * MIN).unwrap();
+        assert_eq!(
+            card(&r, key30()),
+            Some(NeedsYou::IdleAlert {
+                idle_ms: 30 * MIN,
+                agent: AgentKind::ClaudeCode
+            })
+        );
+        f.w.ignore_alert(key30()).unwrap();
+        assert!(f.state_servers()[0].alerted);
+        let r = f.w.tick(T0 + 31 * MIN).unwrap();
+        assert!(r.alerts.is_empty() && r.needs_you.is_empty());
+        // Used again: the alert re-arms, and the history shows both.
+        f.p().set_established(30, 3000, 1);
+        let r = f.w.tick(T0 + 32 * MIN).unwrap();
+        assert!(r.servers[0].in_use);
+        assert!(!f.state_servers()[0].alerted);
+        f.p().set_established(30, 3000, 0);
+        assert_eq!(f.w.tick(T0 + 62 * MIN).unwrap().alerts.len(), 1);
+        let idle = EventKind::Alert {
+            alert: AlertKind::Idle,
+        };
+        assert_eq!(count_events(&f, key30(), &idle), 2);
+    }
+
+    #[test]
+    fn session_ended_server_open_in_a_browser_needs_you() {
+        let mut f = fx();
+        f.w.tick(T0).unwrap();
+        f.p().remove_proc(20);
+        f.p().set_established(30, 3000, 1);
+        // Open but not in a recorded session end: no card.
+        assert!(f.w.tick(T0 + MIN).unwrap().needs_you.is_empty());
+        with_state(f.data.path(), |s| {
+            s.record_session_ended(crate::state::SessionEndedGroup {
+                session_pid: 20,
+                session_proc_start: format_proc_start(START + 20 * SEC),
+                conversation_id: String::new(),
+                session_name: "wt".into(),
+                at_ms: T0,
+                stopped: Vec::new(),
+                still_open: vec![crate::state::GroupServer {
+                    key: key30(),
+                    port: 3000,
+                    tool_label: "Bun".into(),
+                    in_use: true,
+                }],
+                delivered: true,
+                agent: AgentKind::ClaudeCode,
+            })
+        })
+        .unwrap();
+        let r = f.w.tick(T0 + 2 * MIN).unwrap();
+        assert_eq!(card(&r, key30()), Some(NeedsYou::SessionEndedOpen));
+        // Closed: no longer open, not about to stop yet.
+        f.p().set_established(30, 3000, 0);
+        assert!(f.w.tick(T0 + 3 * MIN).unwrap().needs_you.is_empty());
+    }
+
+    #[test]
+    fn observed_server_leak_needs_you_only_as_a_leak() {
+        let mut f = observed_fx();
+        f.p().set_resources(50, 3000 * MB, 0);
+        let r = f.w.tick(T0).unwrap();
+        assert!(r.leaks.contains(&key50()));
+        assert!(matches!(card(&r, key50()), Some(NeedsYou::Leak { .. })));
+        f.w.ignore_alert(key50()).unwrap();
+        assert_eq!(card(&f.w.tick(T0 + MIN).unwrap(), key50()), None);
+        // Idle a long time: never an idle alert or a countdown.
+        f.p().set_resources(50, 10 * MB, 0);
+        assert_eq!(card(&f.w.tick(T0 + 90 * MIN).unwrap(), key50()), None);
+    }
+
+    #[test]
+    fn sweep_reports_no_leak_and_no_card() {
+        let mut f = fx();
+        f.p().set_resources(30, 3000 * MB, 0);
+        let r = f.w.sweep(T0).unwrap();
+        assert!(r.leaks.is_empty() && r.needs_you.is_empty());
     }
 }
