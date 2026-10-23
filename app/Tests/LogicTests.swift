@@ -320,7 +320,7 @@ final class NotificationSetupTests: XCTestCase {
 
     func testNotAskedOffersToTurnOn() {
         let setup = notificationSetup(.notAsked)
-        XCTAssertEqual(setup.message, "Get a notification when a server sits idle, with Kill and Keep buttons.")
+        XCTAssertEqual(setup.message, "Get a notification for servers that sit idle and for sessions that end with servers still running, with buttons to stop or keep them.")
         XCTAssertFalse(setup.isOn)
         XCTAssertNil(setup.hint)
         XCTAssertEqual(setup.button, .turnOn)

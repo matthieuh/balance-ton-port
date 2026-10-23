@@ -200,15 +200,13 @@ final class CoreModel: ObservableObject {
                 let owner = try core.acquireWatch()
                 let report = owner ? try core.tick() : try core.observe()
                 let kills = try core.recentKills()
-                let ended = try core.pendingSessionEnded()
                 // The file may be broken (reported in `configError`): fall
                 // back to the default interval, the core keeps its last
                 // valid config anyway.
                 let scan = (try? core.config())?.scanIntervalS ?? 5
                 return PassResult(
                     owner: owner, servers: report.servers, alerts: report.alerts,
-                    sessionEnded: ended, kills: kills, scanIntervalS: scan,
-                    configError: report.configError
+                    kills: kills, scanIntervalS: scan, configError: report.configError
                 )
             }
             watchedElsewhere = !result.owner
@@ -238,29 +236,49 @@ final class CoreModel: ObservableObject {
             } else {
                 unnotified = []
             }
-            // The hook leaves a session's group to whoever holds the watch
-            // lock, so the app posts it even while `btp watch` holds it.
-            // Marked only once added; when notifications are off nothing is
-            // marked and the menu's notifications line says so.
-            if !result.sessionEnded.isEmpty {
-                let delivered = await notifier.postSessionEnded(result.sessionEnded)
-                if !delivered.isEmpty {
-                    try await onCore { core in
-                        for id in delivered {
-                            try core.markSessionEndedDelivered(
-                                sessionPid: id.sessionPid, sessionProcStart: id.sessionProcStart, atMs: id.atMs
-                            )
-                        }
-                    }
-                }
-            }
             await refreshNotificationPermission()
             interval = TimeInterval(max(1, result.scanIntervalS))
             lastError = result.configError
+            await deliverSessionEnded()
         } catch {
             lastError = error.localizedDescription
         }
         scheduleNextPass(after: interval)
+    }
+
+    /// One notification per ended session that kept servers running. The
+    /// hook leaves a group to the app only when the app holds the watch lock,
+    /// and the app posts it whether or not it still does. Claim, then post:
+    /// claiming marks a group delivered under the state lock, so nobody
+    /// posts it twice; one whose `center.add` failed is handed back for the
+    /// next pass. With notifications off nothing is claimed (the menu's
+    /// notifications line says so).
+    private func deliverSessionEnded() async {
+        guard await notifier.canPost() else { return }
+        let claimed: [SessionEndedFfi]
+        do {
+            claimed = try await onCore { core in try core.claimSessionEnded() }
+        } catch {
+            lastError = error.localizedDescription
+            return
+        }
+        guard !claimed.isEmpty else { return }
+        let delivered = Set(await notifier.postSessionEnded(claimed))
+        let failed = claimed.map(\.id).filter { !delivered.contains($0) }
+        guard !failed.isEmpty else { return }
+        // Its own catch: a failed hand-back leaves the group marked, so it
+        // is not posted again rather than posted on every pass.
+        do {
+            try await onCore { core in
+                for id in failed {
+                    try core.unclaimSessionEnded(
+                        sessionPid: id.sessionPid, sessionProcStart: id.sessionProcStart, atMs: id.atMs
+                    )
+                }
+            }
+        } catch {
+            lastError = error.localizedDescription
+        }
     }
 
     private func scheduleNextPass(after interval: TimeInterval) {
@@ -293,7 +311,6 @@ private struct PassResult: Sendable {
     let owner: Bool
     let servers: [ServerViewFfi]
     let alerts: [ServerViewFfi]
-    let sessionEnded: [SessionEndedFfi]
     let kills: [KillRecordFfi]
     let scanIntervalS: UInt64
     let configError: String?

@@ -270,7 +270,7 @@ func notificationSetup(_ permission: NotificationPermission) -> NotificationSetu
     switch permission {
     case .notAsked:
         return NotificationSetup(
-            message: "Get a notification when a server sits idle, with Kill and Keep buttons.",
+            message: "Get a notification for servers that sit idle and for sessions that end with servers still running, with buttons to stop or keep them.",
             isOn: false, hint: nil, button: .turnOn, canSendTest: false
         )
     case .allowed(let bannersOff):

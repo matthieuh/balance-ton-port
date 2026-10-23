@@ -18,8 +18,10 @@ use crate::state::{GroupServer, SessionEndedGroup};
 pub struct SessionEndReport {
     /// The servers kept running, `None` when there are none.
     pub group: Option<SessionEndedGroup>,
-    /// No app holds the watch lock: the caller posts the notification
-    /// itself (the group is recorded as delivered).
+    /// The app does not hold the watch lock (no holder, or `btp watch`):
+    /// the caller posts the notification itself. The group is recorded as
+    /// delivered under the state lock before that, so the app never posts
+    /// it too.
     pub post_notification: bool,
     /// When the first kept server becomes due under the dead-session rule
     /// (Unix ms): the caller starts the waiter for then. `None` when no
@@ -142,7 +144,8 @@ impl<P: Platform> Watcher<P> {
         )];
         let mut scan = self.scan();
         let listeners = self.platform.listeners();
-        let app_running = watch_lock_held(&self.data_dir);
+        // Only the app delivers groups; with `btp watch` the hook posts.
+        let app_running = app_owns_watch(watch_lock_owner(&self.data_dir).as_deref());
 
         // The quitting process may still look alive: never "another" session.
         let ending =
@@ -750,6 +753,27 @@ mod tests {
         let r = end(&mut f, T0);
         assert!(!r.post_notification);
         assert!(!r.group.unwrap().delivered);
+    }
+
+    #[test]
+    fn with_btp_watch_holding_the_lock_the_hook_posts() {
+        let mut f = fx();
+        hook(&f);
+        tracked(&mut f);
+        let _lock = acquire_watch_lock(f.data.path(), "btp watch").unwrap();
+        let r = end(&mut f, T0);
+        assert!(r.post_notification);
+        assert!(r.group.unwrap().delivered);
+        let stored = with_state(f.data.path(), |s| s.session_ended.clone()).unwrap();
+        assert!(stored[0].delivered, "marked before the hook posts");
+    }
+
+    #[test]
+    fn only_the_app_as_lock_owner_takes_the_group() {
+        assert!(app_owns_watch(Some(APP_OWNER)));
+        assert!(!app_owns_watch(Some("btp watch")));
+        assert!(!app_owns_watch(Some("")));
+        assert!(!app_owns_watch(None));
     }
 
     // The waiter.

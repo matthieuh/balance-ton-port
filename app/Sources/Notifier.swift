@@ -125,7 +125,8 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         return delivered
     }
 
-    private func canPost() async -> Bool {
+    /// Notifications are allowed (nothing is posted otherwise).
+    func canPost() async -> Bool {
         let settings = await center.notificationSettings()
         switch settings.authorizationStatus {
         case .authorized, .provisional, .ephemeral:

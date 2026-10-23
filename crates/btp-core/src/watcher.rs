@@ -404,6 +404,28 @@ pub fn watch_lock_held(dir: &Path) -> bool {
     }
 }
 
+/// Owner written into `watch.lock` while the macOS app holds it.
+pub const APP_OWNER: &str = "Balance ton port.app";
+
+/// The owner name in `watch.lock` while some process holds it, `None` when
+/// nobody does (or the file cannot be read). Empty while the holder has not
+/// written it yet.
+pub fn watch_lock_owner(dir: &Path) -> Option<String> {
+    if !watch_lock_held(dir) {
+        return None;
+    }
+    std::fs::read_to_string(dir.join("watch.lock"))
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+/// The lock owner is the app, which notifies session-ended groups itself.
+/// `btp watch`, an unknown or not yet written owner, or no holder at all:
+/// the hook posts.
+pub fn app_owns_watch(owner: Option<&str>) -> bool {
+    owner == Some(APP_OWNER)
+}
+
 /// Milliseconds since the Unix epoch, from the system clock.
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()

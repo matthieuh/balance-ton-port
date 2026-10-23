@@ -99,6 +99,34 @@ impl State {
         pending
     }
 
+    /// `pending_session_ended`, each returned group marked delivered in the
+    /// same state-lock section: whoever claims a group is the only one to
+    /// post it. A failed post calls `unmark_session_ended_delivered`.
+    pub fn claim_session_ended(&mut self) -> Vec<SessionEndedGroup> {
+        let claimed = self.pending_session_ended();
+        for g in &claimed {
+            self.mark_session_ended_delivered(g.session_pid, &g.session_proc_start, g.at_ms);
+        }
+        claimed
+    }
+
+    /// Hands a claimed group back (its notification could not be added), so
+    /// the next pass tries again.
+    pub fn unmark_session_ended_delivered(
+        &mut self,
+        session_pid: i32,
+        session_proc_start: &str,
+        at_ms: u64,
+    ) {
+        for g in self
+            .session_ended
+            .iter_mut()
+            .filter(|g| g.is(session_pid, session_proc_start, at_ms))
+        {
+            g.delivered = false;
+        }
+    }
+
     /// The group with this identity, if still recorded.
     pub fn session_ended_group(
         &self,
@@ -451,6 +479,18 @@ mod tests {
         assert!(s
             .session_ended_group(50, "Thu Oct 22 10:00:00 2026", 30)
             .is_none());
+    }
+
+    #[test]
+    fn a_claimed_group_is_claimed_once_until_handed_back() {
+        let mut s = State::default();
+        s.servers.push(server(1));
+        s.record_session_ended(group(10, &[1]));
+        assert_eq!(s.claim_session_ended().len(), 1);
+        assert!(s.session_ended[0].delivered);
+        assert!(s.claim_session_ended().is_empty());
+        s.unmark_session_ended_delivered(50, "Thu Oct 22 10:00:00 2026", 10);
+        assert_eq!(s.claim_session_ended().len(), 1);
     }
 
     #[test]
