@@ -1536,6 +1536,15 @@ mod tests {
         fn proc_start_string(&self, pid: i32) -> Option<String> {
             self.inner.proc_start_string(pid)
         }
+        fn proc_env(&self, pid: i32) -> Option<Vec<(String, String)>> {
+            self.inner.proc_env(pid)
+        }
+        fn open_paths(&self, pid: i32) -> Vec<std::path::PathBuf> {
+            self.inner.open_paths(pid)
+        }
+        fn pids_named(&self, name: &str) -> Vec<i32> {
+            self.inner.pids_named(name)
+        }
     }
 
     #[test]

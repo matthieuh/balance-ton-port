@@ -41,6 +41,13 @@ pub trait Platform {
     fn signal(&self, pid: i32, sig: i32) -> bool;
     /// Start time formatted like Claude Code's `procStart`.
     fn proc_start_string(&self, pid: i32) -> Option<String>;
+    /// Environment of one of the current user's processes, `None` when
+    /// unreadable or owned by someone else. Entries without `=` are skipped.
+    fn proc_env(&self, pid: i32) -> Option<Vec<(String, String)>>;
+    /// Paths of the vnode file descriptors `pid` holds open.
+    fn open_paths(&self, pid: i32) -> Vec<PathBuf>;
+    /// Current-user pids whose process name equals `name`.
+    fn pids_named(&self, name: &str) -> Vec<i32>;
 }
 
 const MAX_ANCESTRY: usize = 64;
@@ -104,6 +111,7 @@ pub use fake::FakePlatform;
 mod fake {
     use super::{format_proc_start, Listener, Platform, ProcInfo};
     use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::path::PathBuf;
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -114,6 +122,8 @@ mod fake {
         ignores_sigterm: HashSet<i32>,
         fails_signals: HashSet<i32>,
         signals: Vec<(i32, i32)>,
+        env: HashMap<i32, Vec<(String, String)>>,
+        open_paths: HashMap<i32, Vec<PathBuf>>,
     }
 
     /// In-memory platform for tests. SIGTERM and SIGKILL remove a process
@@ -174,6 +184,19 @@ mod fake {
         /// `false`.
         pub fn fail_signals(&self, pid: i32) {
             self.st().fails_signals.insert(pid);
+        }
+
+        pub fn set_env(&self, pid: i32, env: &[(&str, &str)]) {
+            let env = env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            self.st().env.insert(pid, env);
+        }
+
+        pub fn set_open_paths(&self, pid: i32, paths: &[&str]) {
+            let paths = paths.iter().map(PathBuf::from).collect();
+            self.st().open_paths.insert(pid, paths);
         }
 
         /// Every `(pid, sig)` sent so far, in order.
@@ -242,6 +265,34 @@ mod fake {
 
         fn proc_start_string(&self, pid: i32) -> Option<String> {
             self.proc_info(pid).map(|p| format_proc_start(p.start_time))
+        }
+
+        fn proc_env(&self, pid: i32) -> Option<Vec<(String, String)>> {
+            let st = self.st();
+            if !st.procs.contains_key(&pid) {
+                return None;
+            }
+            st.env.get(&pid).cloned()
+        }
+
+        fn open_paths(&self, pid: i32) -> Vec<PathBuf> {
+            let st = self.st();
+            if !st.procs.contains_key(&pid) {
+                return Vec::new();
+            }
+            st.open_paths.get(&pid).cloned().unwrap_or_default()
+        }
+
+        fn pids_named(&self, name: &str) -> Vec<i32> {
+            let st = self.st();
+            st.procs
+                .values()
+                .filter(|p| {
+                    let argv0 = p.command.split(' ').next().unwrap_or("");
+                    argv0.rsplit('/').next() == Some(name)
+                })
+                .map(|p| p.pid)
+                .collect()
         }
     }
 }
@@ -368,6 +419,20 @@ mod tests {
                 (40, libc::SIGTERM)
             ]
         );
+    }
+
+    #[test]
+    fn fake_env_open_paths_and_names() {
+        let f = FakePlatform::new();
+        f.spawn(7, 1, 1, "/usr/local/bin/codex --flag", "/w");
+        f.spawn(8, 1, 1, "codex-helper", "/w");
+        f.set_env(7, &[("A", "1")]);
+        f.set_open_paths(7, &["/x/y.lock"]);
+        assert_eq!(f.proc_env(7), Some(vec![("A".into(), "1".into())]));
+        assert_eq!(f.proc_env(8), None);
+        assert_eq!(f.open_paths(7), vec![PathBuf::from("/x/y.lock")]);
+        assert!(f.open_paths(8).is_empty());
+        assert_eq!(f.pids_named("codex"), vec![7]);
     }
 
     #[test]
