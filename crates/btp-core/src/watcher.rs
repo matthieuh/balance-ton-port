@@ -19,8 +19,8 @@ use crate::observed::{observed_servers_cached, ObservedServer, SystemCache};
 use crate::platform::{ancestry, format_proc_start, Listener, Platform, ProcInfo, ProcResources};
 use crate::probe::{PageMeta, ProbeCache, ProbeOutcome};
 use crate::restart::{
-    create_log, pending_for, pending_holds, plan_restart, relinked, wait_port_free, CommandSpawner,
-    PendingRestart, RestartBlocked, Spawner,
+    pending_for, pending_holds, plan_restart, relinked, CommandSpawner, PendingRestart,
+    RestartBlocked, RestartCheck, RestartJob, RestartTarget, Spawner,
 };
 use crate::session_end::session_ended_open;
 use crate::sessions::default_config_dirs;
@@ -31,6 +31,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod session;
@@ -227,6 +228,25 @@ pub fn link(
 /// `thread` is the session's conversation or one of its others.
 fn holds_thread(s: &AgentSession, thread: &str) -> bool {
     s.conversation_id == thread || s.other_conversations.iter().any(|c| c == thread)
+}
+
+/// The server, any port of its tree, or a process between it and its
+/// session matches the current exclusions.
+fn excluded_now(p: &dyn Platform, s: &TrackedServer, tree: &Tree, cfg: &Config) -> bool {
+    if is_excluded(&s.command, cfg)
+        || cfg.exclude_ports.contains(&s.port)
+        || tree.ports.iter().any(|p| cfg.exclude_ports.contains(p))
+    {
+        return true;
+    }
+    if tree.pids.is_empty() {
+        return false;
+    }
+    ancestry(p, s.key.pid)
+        .iter()
+        .skip(1)
+        .take_while(|p| p.pid != s.session_pid)
+        .any(|p| is_excluded(&p.command, cfg))
 }
 
 /// `true` when `pid` is the very process that started at `start_time`.
@@ -583,10 +603,12 @@ pub struct Watcher<P: Platform> {
     /// The cards of the last `tick` or `observe`, for `ignore_alert`.
     last_cards: HashMap<ServerKey, NeedsYou>,
     /// Starts a restart's process.
-    spawner: Box<dyn Spawner>,
+    spawner: Arc<dyn Spawner>,
     /// How long a restart waits for the port to be free, and how often it
     /// looks.
     restart_wait: (Duration, Duration),
+    /// Whether each server could restart, its environment read once.
+    restart_check: RestartCheck,
 }
 
 impl<P: Platform> Watcher<P> {
@@ -609,15 +631,16 @@ impl<P: Platform> Watcher<P> {
             leaks: LeakAlerts::default(),
             idle_ignored: HashSet::new(),
             last_cards: HashMap::new(),
-            spawner: Box::new(CommandSpawner),
+            spawner: Arc::new(CommandSpawner),
             restart_wait: (Duration::from_secs(5), Duration::from_millis(100)),
+            restart_check: RestartCheck::default(),
         }
     }
 
     /// Replaces the process spawner of `restart` (tests never run a real
     /// program).
     pub fn with_spawner(mut self, spawner: Box<dyn Spawner>) -> Self {
-        self.spawner = spawner;
+        self.spawner = Arc::from(spawner);
         self
     }
 
@@ -677,6 +700,12 @@ impl<P: Platform> Watcher<P> {
     pub fn page_meta_of(&self, key: ServerKey) -> Option<&PageMeta> {
         let &(_, port) = self.probe_targets.iter().find(|(k, _)| *k == key)?;
         self.probes.get(key, port)
+    }
+
+    /// The Restart button of a server is enabled: `restart::can_restart`,
+    /// the environment read once per process.
+    pub fn can_restart(&mut self, key: ServerKey) -> bool {
+        self.restart_check.can_restart(&self.platform, key)
     }
 
     /// The pids whose connections never count as use (`with_ignored_peers`).
@@ -820,44 +849,32 @@ impl<P: Platform> Watcher<P> {
     /// `key` is still an observed, non-excluded server with that start time.
     /// The kill re-checks every start time like any other.
     pub fn stop_observed(&mut self, key: ServerKey) -> io::Result<Option<KillRecord>> {
+        match self.prepare_stop_observed(key)? {
+            Some(job) => job.run(&self.platform),
+            None => Ok(None),
+        }
+    }
+
+    /// The checks of `stop_observed`, without the kill: the job runs on its
+    /// own, so a caller can release the watcher during the kill grace.
+    /// `None` unless `key` is still an observed, non-excluded server.
+    pub fn prepare_stop_observed(&mut self, key: ServerKey) -> io::Result<Option<StopObservedJob>> {
         let now = now_ms();
         let scan = self.scan();
         let listeners = self.platform.listeners();
         let tracked = with_state(&self.data_dir, |state| {
             tracked_pids(&self.refresh(state, &scan, &listeners, now))
         })?;
-        let Some(o) = self
+        Ok(self
             .observed(&listeners, &tracked, &scan.cfg)
             .into_iter()
             .find(|o| o.key == key && !o.excluded)
-        else {
-            return Ok(None);
-        };
-        self.stop_observed_now(&o, &scan.cfg, now)
-    }
-
-    /// Kills an observed server's tree and records a manual kill; `None`
-    /// when the kill sent nothing.
-    fn stop_observed_now(
-        &self,
-        o: &ObservedServer,
-        cfg: &Config,
-        now_ms: u64,
-    ) -> io::Result<Option<KillRecord>> {
-        let grace = Duration::from_secs(cfg.kill_grace_s);
-        if !kill_tree(&self.platform, o.key, grace, cfg) {
-            return Ok(None);
-        }
-        let r = KillRecord {
-            port: o.port,
-            command: o.command.clone(),
-            worktree: o.cwd.as_deref().map(worktree_root).unwrap_or_default(),
-            reason: KillReason::Manual,
-            at_ms: now_ms,
-        };
-        with_state(&self.data_dir, |state| state.record_kill(r.clone()))?;
-        append_kill_log(&self.data_dir, &r)?;
-        Ok(Some(r))
+            .map(|server| StopObservedJob {
+                server,
+                cfg: scan.cfg,
+                data_dir: self.data_dir.clone(),
+                now_ms: now,
+            }))
     }
 
     /// Restarts a server (the app only): stops it and starts its command
@@ -877,6 +894,20 @@ impl<P: Platform> Watcher<P> {
         key: ServerKey,
         now_ms: u64,
     ) -> io::Result<Result<(), RestartBlocked>> {
+        match self.prepare_restart(key, now_ms)? {
+            Ok(job) => job.run(&self.platform),
+            Err(blocked) => Ok(Err(blocked)),
+        }
+    }
+
+    /// The checks and the plan of `restart`, without the stop, the port
+    /// wait and the start: the job runs on its own, so a caller can release
+    /// the watcher while it waits (seconds).
+    pub fn prepare_restart(
+        &mut self,
+        key: ServerKey,
+        now_ms: u64,
+    ) -> io::Result<Result<RestartJob, RestartBlocked>> {
         let scan = self.scan();
         let listeners = self.platform.listeners();
         let (owner, tracked) = with_state(&self.data_dir, |state| {
@@ -889,68 +920,35 @@ impl<P: Platform> Watcher<P> {
                 .map(|(s, _)| s.clone());
             (owner, tracked_pids(&trees))
         })?;
-        let observed = match owner {
-            Some(_) => None,
+        let target = match owner {
+            Some(s) => RestartTarget::Tracked(s),
             None => match self
                 .observed(&listeners, &tracked, &scan.cfg)
                 .into_iter()
                 .find(|o| o.key == key && !o.excluded)
             {
-                Some(o) => Some(o),
+                Some(o) => RestartTarget::Observed(o),
                 None => return Ok(Err(RestartBlocked::Gone)),
             },
         };
-        let port = owner
-            .as_ref()
-            .map(|s| s.port)
-            .or(observed.as_ref().map(|o| o.port))
-            .unwrap_or_default();
+        let port = match &target {
+            RestartTarget::Tracked(s) => s.port,
+            RestartTarget::Observed(o) => o.port,
+        };
         let plan = match plan_restart(&self.platform, key, port) {
             Ok(plan) => plan,
             Err(blocked) => return Ok(Err(blocked)),
         };
-        // `dropped`: no longer tracked although not killed, which for a
-        // process still running means an exclusion saved meanwhile matched.
-        let (stopped, dropped) = match (&owner, &observed) {
-            (Some(s), _) => {
-                let (killed, gone) =
-                    self.execute(vec![(s.clone(), KillReason::Manual)], &scan.cfg, now_ms)?;
-                (!killed.is_empty(), killed.is_empty() && gone.contains(&key))
-            }
-            (None, Some(o)) => (
-                self.stop_observed_now(o, &scan.cfg, now_ms)?.is_some(),
-                false,
-            ),
-            (None, None) => (false, false),
-        };
-        if !stopped && same_process(&self.platform, key.pid, key.start_time) {
-            return Ok(Err(if dropped {
-                RestartBlocked::Excluded
-            } else {
-                // A refused signal leaves it running: no point waiting.
-                RestartBlocked::PortStillTaken
-            }));
-        }
-        // Only the recorded port is waited for, not every port of the tree.
-        let (limit, interval) = self.restart_wait;
-        if !wait_port_free(&self.platform, port, limit, interval) {
-            return Ok(Err(RestartBlocked::PortStillTaken));
-        }
-        let spawned = create_log(&self.data_dir, port, now_ms)
-            .and_then(|log| self.spawner.spawn(&plan, &log, &self.platform));
-        let Ok((child_pid, child_start)) = spawned else {
-            return Ok(Err(RestartBlocked::SpawnFailed));
-        };
-        with_state(&self.data_dir, |state| {
-            state.pending_restarts.push(PendingRestart {
-                child_pid,
-                child_start,
-                from: key,
-                owner,
-                at_ms: now_ms,
-            })
-        })?;
-        Ok(Ok(()))
+        Ok(Ok(RestartJob {
+            key,
+            target,
+            plan,
+            cfg: scan.cfg,
+            data_dir: self.data_dir.clone(),
+            spawner: Arc::clone(&self.spawner),
+            wait: self.restart_wait,
+            now_ms,
+        }))
     }
 
     /// The observed servers among `listeners`, outside the `tracked` trees.
@@ -1185,7 +1183,7 @@ impl<P: Platform> Watcher<P> {
             .collect();
         let mut i = 0;
         while i < state.servers.len() {
-            if self.excluded_now(&state.servers[i], &trees[i], &scan.cfg) {
+            if excluded_now(&self.platform, &state.servers[i], &trees[i], &scan.cfg) {
                 state.servers.remove(i);
                 trees.remove(i);
             } else {
@@ -1221,25 +1219,6 @@ impl<P: Platform> Watcher<P> {
             o.postponed_until_ms = o.postponed_until_ms.max(c.postponed_until_ms);
             o.note = merge_notes(o.note.take(), c.note);
         }
-    }
-
-    /// The server, any port of its tree, or a process between it and its
-    /// session matches the current exclusions.
-    fn excluded_now(&self, s: &TrackedServer, tree: &Tree, cfg: &Config) -> bool {
-        if is_excluded(&s.command, cfg)
-            || cfg.exclude_ports.contains(&s.port)
-            || tree.ports.iter().any(|p| cfg.exclude_ports.contains(p))
-        {
-            return true;
-        }
-        if tree.pids.is_empty() {
-            return false;
-        }
-        ancestry(&self.platform, s.key.pid)
-            .iter()
-            .skip(1)
-            .take_while(|p| p.pid != s.session_pid)
-            .any(|p| is_excluded(&p.command, cfg))
     }
 
     fn observe_one(&self, s: &TrackedServer, tree: &Tree, scan: &Scan, now_ms: u64) -> Observation {
@@ -1436,6 +1415,7 @@ impl<P: Platform> Watcher<P> {
         live.extend(self.last_observed.iter().map(|o| o.key));
         self.history.retain(&live, now_ms);
         self.meta.retain(&live, now_ms);
+        self.restart_check.retain(&live);
         self.leaks.retain(&live);
         self.idle_ignored.retain(|k| live.contains(k));
         // An excluded server (a database, say) is never probed.
@@ -1502,55 +1482,107 @@ impl<P: Platform> Watcher<P> {
         }
     }
 
-    /// Kills each server's tree outside the state lock (the grace period can
-    /// last seconds), then records what was killed. Stops tracking every
-    /// target except one that is still our process but refused the signal.
-    /// Returns the kills and the keys no longer tracked.
     fn execute(
         &self,
         targets: Vec<(TrackedServer, KillReason)>,
         cfg: &Config,
         now_ms: u64,
     ) -> io::Result<(Vec<KillRecord>, HashSet<ServerKey>)> {
-        if targets.is_empty() {
-            return Ok((Vec::new(), HashSet::new()));
-        }
-        let grace = Duration::from_secs(cfg.kill_grace_s);
-        let mut killed = Vec::new();
-        let mut dropped = HashSet::new();
-        for (s, reason) in &targets {
-            // Kills can wait seconds each: an exclusion saved meanwhile
-            // still protects the next target, with the same check as a pass
-            // (command, any port of the tree, ancestors below the session).
-            let fresh = read_config(&self.data_dir).unwrap_or_else(|_| cfg.clone());
-            let tree = tree_of(&self.platform, s, &self.platform.listeners());
-            if self.excluded_now(s, &tree, &fresh) {
-                dropped.insert(s.key);
-                continue;
-            }
-            if kill_tree(&self.platform, s.key, grace, &fresh) {
-                killed.push(record(s, reason.clone(), now_ms));
-            } else if same_process(&self.platform, s.key.pid, s.key.start_time) {
-                // Still our process but the signal was refused (EPERM):
-                // keep tracking it so a later pass can retry.
-                eprintln!(
-                    "btp: could not signal pid {} (port {}), still tracked",
-                    s.key.pid, s.port
-                );
-                continue;
-            }
+        execute_kills(&self.platform, &self.data_dir, targets, cfg, now_ms)
+    }
+}
+
+/// Kills each server's tree outside the state lock (the grace period can
+/// last seconds), then records what was killed. Stops tracking every
+/// target except one that is still our process but refused the signal.
+/// Returns the kills and the keys no longer tracked.
+pub(crate) fn execute_kills(
+    p: &dyn Platform,
+    data_dir: &Path,
+    targets: Vec<(TrackedServer, KillReason)>,
+    cfg: &Config,
+    now_ms: u64,
+) -> io::Result<(Vec<KillRecord>, HashSet<ServerKey>)> {
+    if targets.is_empty() {
+        return Ok((Vec::new(), HashSet::new()));
+    }
+    let grace = Duration::from_secs(cfg.kill_grace_s);
+    let mut killed = Vec::new();
+    let mut dropped = HashSet::new();
+    for (s, reason) in &targets {
+        // Kills can wait seconds each: an exclusion saved meanwhile
+        // still protects the next target, with the same check as a pass
+        // (command, any port of the tree, ancestors below the session).
+        let fresh = read_config(data_dir).unwrap_or_else(|_| cfg.clone());
+        let tree = tree_of(p, s, &p.listeners());
+        if excluded_now(p, s, &tree, &fresh) {
             dropped.insert(s.key);
+            continue;
         }
-        with_state(&self.data_dir, |state| {
-            state.servers.retain(|s| !dropped.contains(&s.key));
-            for r in &killed {
-                state.record_kill(r.clone());
-            }
-        })?;
+        if kill_tree(p, s.key, grace, &fresh) {
+            killed.push(record(s, reason.clone(), now_ms));
+        } else if same_process(p, s.key.pid, s.key.start_time) {
+            // Still our process but the signal was refused (EPERM):
+            // keep tracking it so a later pass can retry.
+            eprintln!(
+                "btp: could not signal pid {} (port {}), still tracked",
+                s.key.pid, s.port
+            );
+            continue;
+        }
+        dropped.insert(s.key);
+    }
+    with_state(data_dir, |state| {
+        state.servers.retain(|s| !dropped.contains(&s.key));
         for r in &killed {
-            append_kill_log(&self.data_dir, r)?;
+            state.record_kill(r.clone());
         }
-        Ok((killed, dropped))
+    })?;
+    for r in &killed {
+        append_kill_log(data_dir, r)?;
+    }
+    Ok((killed, dropped))
+}
+
+/// Kills an observed server's tree and records a manual kill; `None` when
+/// the kill sent nothing.
+pub(crate) fn stop_observed_tree(
+    p: &dyn Platform,
+    data_dir: &Path,
+    o: &ObservedServer,
+    cfg: &Config,
+    now_ms: u64,
+) -> io::Result<Option<KillRecord>> {
+    let grace = Duration::from_secs(cfg.kill_grace_s);
+    if !kill_tree(p, o.key, grace, cfg) {
+        return Ok(None);
+    }
+    let r = KillRecord {
+        port: o.port,
+        command: o.command.clone(),
+        worktree: o.cwd.as_deref().map(worktree_root).unwrap_or_default(),
+        reason: KillReason::Manual,
+        at_ms: now_ms,
+    };
+    with_state(data_dir, |state| state.record_kill(r.clone()))?;
+    append_kill_log(data_dir, &r)?;
+    Ok(Some(r))
+}
+
+/// The observed server a `StopObservedJob` stops, as checked by
+/// `Watcher::prepare_stop_observed`.
+pub struct StopObservedJob {
+    server: ObservedServer,
+    cfg: Config,
+    data_dir: PathBuf,
+    now_ms: u64,
+}
+
+impl StopObservedJob {
+    /// Kills it (every start time re-checked) and records the kill. Needs
+    /// no watcher: `p` is the platform it was prepared on.
+    pub fn run(self, p: &dyn Platform) -> io::Result<Option<KillRecord>> {
+        stop_observed_tree(p, &self.data_dir, &self.server, &self.cfg, self.now_ms)
     }
 }
 
@@ -3816,6 +3848,23 @@ mod tests {
 
     fn pending(f: &Fx) -> Vec<PendingRestart> {
         with_state(f.data.path(), |s| s.pending_restarts.clone()).unwrap()
+    }
+
+    #[test]
+    fn a_prepared_restart_leaves_the_watcher_free_until_it_runs() {
+        let (mut f, calls) = restart_fx();
+        f.w.tick(T0).unwrap();
+        let job = f.w.prepare_restart(key30(), T0 + MIN).unwrap().unwrap();
+        // Nothing stopped or started yet; the watcher runs passes meanwhile.
+        assert!(f.p().is_alive(30));
+        let r = f.w.observe(T0 + MIN).unwrap();
+        assert_eq!(r.servers.len(), 1);
+        assert_eq!(job.run(f.w.platform()).unwrap(), Ok(()));
+        assert!(!f.p().is_alive(30));
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(pending(&f).len(), 1);
+        // An observed server's stop is prepared the same way.
+        assert!(f.w.prepare_stop_observed(key30()).unwrap().is_none());
     }
 
     #[test]
