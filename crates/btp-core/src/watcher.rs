@@ -19,8 +19,8 @@ use crate::observed::{observed_servers_cached, ObservedServer, SystemCache};
 use crate::platform::{ancestry, format_proc_start, Listener, Platform, ProcInfo, ProcResources};
 use crate::probe::{PageMeta, ProbeCache, ProbeOutcome};
 use crate::restart::{
-    log_path, pending_for, plan_restart, relinked, wait_port_free, CommandSpawner, PendingRestart,
-    RestartBlocked, Spawner, RESTART_LINK_MS,
+    create_log, pending_for, pending_holds, plan_restart, relinked, wait_port_free, CommandSpawner,
+    PendingRestart, RestartBlocked, Spawner,
 };
 use crate::session_end::session_ended_open;
 use crate::sessions::default_config_dirs;
@@ -877,27 +877,35 @@ impl<P: Platform> Watcher<P> {
             Ok(plan) => plan,
             Err(blocked) => return Ok(Err(blocked)),
         };
-        let stopped = match (&owner, &observed) {
-            (Some(s), _) => !self
-                .execute(vec![(s.clone(), KillReason::Manual)], &scan.cfg, now_ms)?
-                .0
-                .is_empty(),
-            (None, Some(o)) => self.stop_observed_now(o, &scan.cfg, now_ms)?.is_some(),
-            (None, None) => false,
+        // `dropped`: no longer tracked although not killed, which for a
+        // process still running means an exclusion saved meanwhile matched.
+        let (stopped, dropped) = match (&owner, &observed) {
+            (Some(s), _) => {
+                let (killed, gone) =
+                    self.execute(vec![(s.clone(), KillReason::Manual)], &scan.cfg, now_ms)?;
+                (!killed.is_empty(), killed.is_empty() && gone.contains(&key))
+            }
+            (None, Some(o)) => (
+                self.stop_observed_now(o, &scan.cfg, now_ms)?.is_some(),
+                false,
+            ),
+            (None, None) => (false, false),
         };
-        // A refused signal leaves it running: no point waiting for the port.
         if !stopped && same_process(&self.platform, key.pid, key.start_time) {
-            return Ok(Err(RestartBlocked::PortStillTaken));
+            return Ok(Err(if dropped {
+                RestartBlocked::Excluded
+            } else {
+                // A refused signal leaves it running: no point waiting.
+                RestartBlocked::PortStillTaken
+            }));
         }
+        // Only the recorded port is waited for, not every port of the tree.
         let (limit, interval) = self.restart_wait;
         if !wait_port_free(&self.platform, port, limit, interval) {
             return Ok(Err(RestartBlocked::PortStillTaken));
         }
-        let log = log_path(&self.data_dir, port, now_ms);
-        let spawned = log
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| self.spawner.spawn(&plan, &log));
+        let spawned = create_log(&self.data_dir, port, now_ms)
+            .and_then(|log| self.spawner.spawn(&plan, &log, &self.platform));
         let Ok((child_pid, child_start)) = spawned else {
             return Ok(Err(RestartBlocked::SpawnFailed));
         };
@@ -948,7 +956,11 @@ impl<P: Platform> Watcher<P> {
             procs,
             established,
             session_alive: true,
+            // Only for a server new to the history: the event is pushed
+            // once, and the ancestry is not read again every pass.
             restarted_at: (!pending.is_empty()
+                && self.history.samples(o.key).is_empty()
+                && self.history.events(o.key).is_empty()
                 && pending_for(pending, &ancestry(&self.platform, o.key.pid)).is_some())
             .then_some(now_ms),
         }
@@ -1078,8 +1090,8 @@ impl<P: Platform> Watcher<P> {
     /// - forgets servers that now match an exclusion (command, port, or an
     ///   ancestor below the session), so a later exclusion still protects;
     /// - links a listener started by a pending restart to the stopped
-    ///   server's row (an observed server's restart links to nothing), and
-    ///   drops pending restarts older than `RESTART_LINK_MS`;
+    ///   server's row (an observed server's restart links to nothing), then
+    ///   drops pending restarts whose process is gone or that are a day old;
     /// - links new listeners, except those inside a tracked server's tree
     ///   (a server is a process tree: its children's ports are its ports);
     /// - folds a tracked server into a tracked ancestor (a child that started
@@ -1092,9 +1104,6 @@ impl<P: Platform> Watcher<P> {
         now_ms: u64,
     ) -> Vec<Tree> {
         state.servers.retain(|s| !s.session_proc_start.is_empty());
-        state
-            .pending_restarts
-            .retain(|r| now_ms.saturating_sub(r.at_ms) < RESTART_LINK_MS);
         let sessions = scan.sessions();
         for l in listeners {
             // A tracked pid (same process, or a reused pid that this pass
@@ -1105,7 +1114,7 @@ impl<P: Platform> Watcher<P> {
             let chain = ancestry(&self.platform, l.pid);
             if let Some((i, server)) = pending_for(&state.pending_restarts, &chain) {
                 // An observed server's restart stays pending (and observed)
-                // until it expires.
+                // while its process lives.
                 let r = &state.pending_restarts[i];
                 if let Some(owner) = &r.owner {
                     let new = relinked(owner, r.from, server, l, now_ms);
@@ -1129,6 +1138,11 @@ impl<P: Platform> Watcher<P> {
             }
             state.servers.push(new);
         }
+        // After the linking: a process that only starts listening now still
+        // finds its pending restart.
+        state
+            .pending_restarts
+            .retain(|r| pending_holds(&self.platform, r, now_ms));
         // Every pass, not only when something new links: a state written
         // before servers were trees may still hold a separate child row.
         self.fold(state);
@@ -3666,7 +3680,12 @@ mod tests {
     }
 
     impl Spawner for FakeSpawner {
-        fn spawn(&self, plan: &crate::restart::RestartPlan, log: &Path) -> io::Result<(i32, u64)> {
+        fn spawn(
+            &self,
+            plan: &crate::restart::RestartPlan,
+            log: &Path,
+            _p: &dyn Platform,
+        ) -> io::Result<(i32, u64)> {
             fs::write(
                 log,
                 format!("{} in {}\n", plan.argv.join(" "), plan.cwd.display()),
@@ -3860,17 +3879,64 @@ mod tests {
         assert!(!f.p().is_alive(CHILD));
     }
 
+    /// The restarted process runs (a child of launchd) but does not listen
+    /// yet.
+    fn child_runs(f: &Fx) {
+        let web = f.wt.join("apps/web");
+        f.p()
+            .spawn(CHILD, 1, CHILD_START, "bun run dev", web.to_str().unwrap());
+    }
+
     #[test]
-    fn pending_restart_expires_after_two_minutes() {
+    fn a_child_listening_10_min_after_the_restart_still_links() {
         let (mut f, _) = restart_fx();
         let web = f.wt.join("apps/web");
         f.w.tick(T0).unwrap();
         assert_eq!(f.w.restart_at(key30(), T0).unwrap(), Ok(()));
-        f.w.tick(T0 + 2 * MIN - 1).unwrap();
+        child_runs(&f);
+        f.w.tick(T0 + 5 * MIN).unwrap();
         assert_eq!(pending(&f).len(), 1);
         child_listens(&f, 1, "bun run dev", &web, 3000);
-        let r = f.w.tick(T0 + 2 * MIN).unwrap();
+        f.w.tick(T0 + 10 * MIN).unwrap();
+        let s = server_of(&f, CHILD).expect("relinked");
+        assert_eq!(s.restarted_from, Some(key30()));
+        assert_eq!(s.session_pid, 20);
         assert!(pending(&f).is_empty());
+    }
+
+    #[test]
+    fn a_pending_restart_whose_child_died_is_dropped() {
+        let (mut f, _) = restart_fx();
+        f.w.tick(T0).unwrap();
+        assert_eq!(f.w.restart_at(key30(), T0).unwrap(), Ok(()));
+        child_runs(&f);
+        f.w.tick(T0 + MIN).unwrap();
+        assert_eq!(pending(&f).len(), 1);
+        f.p().remove_proc(CHILD);
+        f.w.tick(T0 + 2 * MIN).unwrap();
+        assert!(pending(&f).is_empty());
+        // A reused pid is not the child either.
+        let (mut f, _) = restart_fx();
+        f.w.tick(T0).unwrap();
+        assert_eq!(f.w.restart_at(key30(), T0).unwrap(), Ok(()));
+        f.p().spawn(CHILD, 1, CHILD_START + SEC, "other", "/");
+        f.w.tick(T0 + MIN).unwrap();
+        assert!(pending(&f).is_empty());
+    }
+
+    #[test]
+    fn a_pending_restart_is_dropped_after_a_day() {
+        let (mut f, _) = restart_fx();
+        let web = f.wt.join("apps/web");
+        f.w.tick(T0).unwrap();
+        assert_eq!(f.w.restart_at(key30(), T0).unwrap(), Ok(()));
+        child_runs(&f);
+        f.w.tick(T0 + 24 * 60 * MIN - 1).unwrap();
+        assert_eq!(pending(&f).len(), 1);
+        f.w.tick(T0 + 24 * 60 * MIN).unwrap();
+        assert!(pending(&f).is_empty());
+        child_listens(&f, 1, "bun run dev", &web, 3000);
+        let r = f.w.tick(T0 + 24 * 60 * MIN + 1).unwrap();
         assert!(f.state_servers().is_empty());
         assert!(r.observed.iter().any(|o| o.key == child_key()));
     }
