@@ -14,6 +14,7 @@ use crate::decide::{decide, touch};
 use crate::history::{AlertKind, EventKind, History, ProcId, ServerEvent};
 use crate::labels::{location_label, session_display_name, tool_label};
 use crate::model::{Action, KillReason, KillTarget, Note, Observation, ServerKey, TrackedServer};
+use crate::observed::{observed_servers_cached, ObservedServer, SystemCache};
 use crate::platform::{ancestry, format_proc_start, Listener, Platform, ProcInfo, ProcResources};
 use crate::probe::{PageMeta, ProbeCache};
 use crate::sessions::default_config_dirs;
@@ -70,6 +71,9 @@ pub struct TickReport {
     pub alerts: Vec<ServerView>,
     /// Kills done (`tick`, `sweep`) or planned (`observe`).
     pub killed: Vec<KillRecord>,
+    /// Listeners no agent started (`tick` and `observe`; always empty for
+    /// `sweep`). Never stopped by a pass.
+    pub observed: Vec<ObservedServer>,
     /// Set while `config.toml` cannot be read or parsed (the pass then ran
     /// on the last valid config, or the defaults if there never was one).
     pub config_error: Option<String>,
@@ -204,9 +208,11 @@ fn same_process(p: &dyn Platform, pid: i32, start_time: u64) -> bool {
 /// What one pass learned about a server, for the history.
 struct Feed {
     key: ServerKey,
-    agent: AgentKind,
+    /// `None` for an observed server.
+    agent: Option<AgentKind>,
     procs: Vec<ProcId>,
     established: u32,
+    /// Always `true` for an observed server, which has no session.
     session_alive: bool,
 }
 
@@ -305,6 +311,11 @@ fn owner_in_chain(
                 .position(|s| s.key.pid == p.pid && s.key.start_time == p.start_time)
         })
         .last()
+}
+
+/// Every process of the tracked trees.
+fn tracked_pids(trees: &[Tree]) -> HashSet<i32> {
+    trees.iter().flat_map(|t| t.pids.iter().copied()).collect()
 }
 
 /// Signals `pid` only if it is still the process we snapshotted, and never
@@ -528,6 +539,11 @@ pub struct Watcher<P: Platform> {
     /// Pids whose connections to a server never count as use (the app's
     /// own process, which probes and previews).
     ignored_peers: Vec<i32>,
+    /// Which listening processes are system ones, read once per process.
+    system: SystemCache,
+    /// The observed servers of the last `tick` or `observe`, as (key, port):
+    /// a `sweep` keeps their history and probes.
+    observed_targets: Vec<(ServerKey, u16)>,
 }
 
 impl<P: Platform> Watcher<P> {
@@ -545,6 +561,8 @@ impl<P: Platform> Watcher<P> {
             probes: ProbeCache::default(),
             probe_targets: Vec::new(),
             ignored_peers: Vec::new(),
+            system: SystemCache::default(),
+            observed_targets: Vec::new(),
         }
     }
 
@@ -707,6 +725,76 @@ impl<P: Platform> Watcher<P> {
             .execute(vec![(server, KillReason::Manual)], &scan.cfg, now)?
             .0
             .pop())
+    }
+
+    /// Stops an observed server by hand (the app only, after a
+    /// confirmation). Re-scans first: `Ok(None)`, sending nothing, unless
+    /// `key` is still an observed, non-excluded server with that start time.
+    /// The kill re-checks every start time like any other.
+    pub fn stop_observed(&mut self, key: ServerKey) -> io::Result<Option<KillRecord>> {
+        let now = now_ms();
+        let scan = self.scan();
+        let listeners = self.platform.listeners();
+        let tracked = with_state(&self.data_dir, |state| {
+            tracked_pids(&self.refresh(state, &scan, &listeners, now))
+        })?;
+        let Some(o) = self
+            .observed(&listeners, &tracked, &scan.cfg)
+            .into_iter()
+            .find(|o| o.key == key && !o.excluded)
+        else {
+            return Ok(None);
+        };
+        let grace = Duration::from_secs(scan.cfg.kill_grace_s);
+        if !kill_tree(&self.platform, key, grace, &scan.cfg) {
+            return Ok(None);
+        }
+        let r = KillRecord {
+            port: o.port,
+            command: o.command,
+            worktree: o.cwd.as_deref().map(worktree_root).unwrap_or_default(),
+            reason: KillReason::Manual,
+            at_ms: now,
+        };
+        with_state(&self.data_dir, |state| state.record_kill(r.clone()))?;
+        append_kill_log(&self.data_dir, &r)?;
+        Ok(Some(r))
+    }
+
+    /// The observed servers among `listeners`, outside the `tracked` trees.
+    fn observed(
+        &mut self,
+        listeners: &[Listener],
+        tracked: &HashSet<i32>,
+        cfg: &Config,
+    ) -> Vec<ObservedServer> {
+        let found =
+            observed_servers_cached(&self.platform, listeners, tracked, cfg, &mut self.system);
+        self.system
+            .retain(&listeners.iter().map(|l| l.pid).collect());
+        found
+    }
+
+    /// What this pass learned about an observed server: its whole tree (an
+    /// agent CLI subtree left out) and the connections on its ports.
+    fn observed_feed(&self, o: &ObservedServer) -> Feed {
+        let mut procs = vec![(o.key.pid, o.key.start_time)];
+        procs.extend(own_descendants(&self.platform, o.key.pid, &|_| false));
+        let established = procs
+            .iter()
+            .flat_map(|&(pid, _)| o.ports.iter().map(move |&port| (pid, port)))
+            .map(|(pid, port)| {
+                self.platform
+                    .established_excluding(pid, port, &self.ignored_peers)
+            })
+            .sum();
+        Feed {
+            key: o.key,
+            agent: None,
+            procs,
+            established,
+            session_alive: true,
+        }
     }
 
     /// Records that the alert for this exact server was delivered (the app
@@ -914,7 +1002,7 @@ impl<P: Platform> Watcher<P> {
     fn run(&mut self, now_ms: u64, mode: Mode) -> io::Result<TickReport> {
         let scan = self.scan();
         let listeners = self.platform.listeners();
-        let (mut report, to_kill, feeds) = with_state(&self.data_dir, |state| {
+        let (mut report, to_kill, feeds, tracked) = with_state(&self.data_dir, |state| {
             let trees = self.refresh(state, &scan, &listeners, now_ms);
             let obs: Vec<Observation> = state
                 .servers
@@ -977,18 +1065,27 @@ impl<P: Platform> Watcher<P> {
                 .zip(&trees)
                 .map(|((s, o), t)| Feed {
                     key: s.key,
-                    agent: s.agent,
+                    agent: Some(s.agent),
                     procs: t.procs.clone(),
                     established: o.established,
                     session_alive: o.session_alive,
                 })
                 .collect();
-            (report, to_kill, feeds)
+            (report, to_kill, feeds, tracked_pids(&trees))
         })?;
+        let mut feeds = feeds;
+        if mode != Mode::Sweep {
+            report.observed = self.observed(&listeners, &tracked, &scan.cfg);
+            self.observed_targets = report.observed.iter().map(|o| (o.key, o.port)).collect();
+            feeds.extend(report.observed.iter().map(|o| self.observed_feed(o)));
+        }
         self.feed_history(&feeds, &report, now_ms);
-        let live: HashSet<ServerKey> = report.servers.iter().map(|v| v.key).collect();
+        let mut targets: Vec<(ServerKey, u16)> =
+            report.servers.iter().map(|v| (v.key, v.port)).collect();
+        targets.extend(self.observed_targets.iter().copied());
+        let live: HashSet<ServerKey> = targets.iter().map(|&(k, _)| k).collect();
         self.history.retain(&live, now_ms);
-        self.probe_targets = report.servers.iter().map(|v| (v.key, v.port)).collect();
+        self.probe_targets = targets;
 
         if mode == Mode::Observe {
             report.killed = to_kill
@@ -1012,9 +1109,7 @@ impl<P: Platform> Watcher<P> {
                     f.key,
                     ServerEvent {
                         at_ms: now_ms,
-                        kind: EventKind::Started {
-                            agent: Some(f.agent),
-                        },
+                        kind: EventKind::Started { agent: f.agent },
                     },
                 );
             }
@@ -1986,7 +2081,7 @@ mod tests {
         let mut f = fx();
         let feed = Feed {
             key: key30(),
-            agent: AgentKind::ClaudeCode,
+            agent: Some(AgentKind::ClaudeCode),
             procs: Vec::new(),
             established: 0,
             session_alive: false,
@@ -2706,6 +2801,172 @@ mod tests {
             "{:?}",
             f.p().signals()
         );
+    }
+
+    // Observed servers: listeners no agent started.
+
+    const NODE: &str = "/opt/homebrew/bin/node";
+
+    /// `next dev` (50, a child of zsh, no agent) listens on 4000.
+    fn observed_fx() -> Fx {
+        let f = fx();
+        f.p().spawn(50, 10, START + 50 * SEC, "next dev", "/w");
+        f.p().set_exe(50, NODE);
+        f.p().add_listener(50, 4000);
+        f
+    }
+
+    fn key50() -> ServerKey {
+        ServerKey {
+            pid: 50,
+            start_time: START + 50 * SEC,
+        }
+    }
+
+    #[test]
+    fn tick_reports_observed_servers_and_feeds_their_history() {
+        let mut f = observed_fx();
+        // The tracked server's processes have an executable too.
+        f.p().set_exe(30, NODE);
+        f.p().set_exe(31, NODE);
+        f.p().add_listener(31, 8787);
+        f.p().set_resources(50, 80 * 1_048_576, 0);
+        f.p().set_established(50, 4000, 2);
+        let r = f.w.tick(T0).unwrap();
+        assert_eq!(r.servers.len(), 1);
+        assert_eq!(r.observed.len(), 1, "{:?}", r.observed);
+        assert_eq!(r.observed[0].key, key50());
+        assert_eq!(r.observed[0].ports, [4000]);
+        assert!(f.w.observe(T0 + 1000).unwrap().observed.len() == 1);
+        assert!(f.w.sweep(T0 + 2000).unwrap().observed.is_empty());
+        let h = f.w.history();
+        assert_eq!(h.samples(key50()).len(), 2);
+        assert_eq!(h.samples(key50())[0].rss_bytes, 80 * 1_048_576);
+        let started: Vec<&EventKind> = h
+            .events(key50())
+            .iter()
+            .map(|e| &e.kind)
+            .filter(|k| matches!(k, EventKind::Started { .. }))
+            .collect();
+        assert_eq!(started, [&EventKind::Started { agent: None }]);
+        assert!(h
+            .events(key50())
+            .iter()
+            .any(|e| e.kind == EventKind::BrowserConnected));
+        assert!(f.w.due_probes(T0).contains(&(key50(), 4000)));
+        // A sweep keeps the history of observed servers.
+        f.w.sweep(T0 + 3000).unwrap();
+        assert_eq!(f.w.history().samples(key50()).len(), 2);
+        assert!(f.state_servers().iter().all(|s| s.key.pid != 50));
+    }
+
+    #[test]
+    fn observed_server_never_killed_by_tick() {
+        let mut f = observed_fx();
+        for i in 0..20 {
+            let r = f.w.tick(T0 + i * 60 * MIN).unwrap();
+            assert_eq!(r.observed.len(), 1);
+            assert!(r.alerts.iter().all(|a| a.key != key50()));
+        }
+        f.w.sweep(T0 + 30 * 60 * MIN).unwrap();
+        assert!(f.p().signals().iter().all(|&(pid, _)| pid != 50));
+        assert!(f.p().is_alive(50));
+    }
+
+    #[test]
+    fn stop_observed_kills_the_tree_and_records_a_manual_kill() {
+        let mut f = observed_fx();
+        f.p().spawn(51, 50, START + 51 * SEC, "node worker", "/w");
+        f.p()
+            .spawn(52, 50, START + 52 * SEC, "postgres -D /db", "/w");
+        let r = f.w.stop_observed(key50()).unwrap().expect("stopped");
+        assert_eq!((r.port, r.command.as_str()), (4000, "next dev"));
+        assert_eq!(r.reason, KillReason::Manual);
+        assert!(!f.p().is_alive(50));
+        assert!(!f.p().is_alive(51));
+        assert!(f.p().is_alive(52), "excluded descendant spared");
+        assert_eq!(f.state_kills(), std::slice::from_ref(&r));
+        assert_eq!(f.kill_log(), [r]);
+    }
+
+    #[test]
+    fn excluded_command_is_marked_excluded() {
+        let mut f = fx();
+        f.p()
+            .spawn(50, 10, START + 50 * SEC, "postgres -D /db", "/w");
+        f.p().set_exe(50, "/opt/homebrew/bin/postgres");
+        f.p().add_listener(50, 5432);
+        let r = f.w.tick(T0).unwrap();
+        assert_eq!(r.observed.len(), 1);
+        assert!(r.observed[0].excluded);
+        assert_eq!(f.w.stop_observed(key50()).unwrap(), None);
+        assert!(f.p().signals().is_empty());
+        assert!(f.p().is_alive(50));
+    }
+
+    #[test]
+    fn stop_observed_checks_start_time() {
+        let mut f = observed_fx();
+        f.w.tick(T0).unwrap();
+        f.p().remove_proc(50);
+        f.p().spawn(50, 10, START + 99 * SEC, "next dev", "/w");
+        f.p().set_exe(50, NODE);
+        f.p().add_listener(50, 4000);
+        assert_eq!(f.w.stop_observed(key50()).unwrap(), None);
+        assert!(f.p().signals().is_empty());
+        assert!(f.p().is_alive(50));
+    }
+
+    #[test]
+    fn stop_observed_refuses_tracked_and_unknown_servers() {
+        let mut f = observed_fx();
+        f.p().set_exe(30, NODE);
+        f.w.tick(T0).unwrap();
+        assert_eq!(f.w.stop_observed(key30()).unwrap(), None);
+        let gone = ServerKey {
+            pid: 77,
+            start_time: 1,
+        };
+        assert_eq!(f.w.stop_observed(gone).unwrap(), None);
+        assert!(f.p().signals().is_empty());
+    }
+
+    #[test]
+    fn kill_still_refuses_an_observed_server() {
+        let mut f = observed_fx();
+        f.w.tick(T0).unwrap();
+        assert_eq!(f.w.kill(KillTarget::Port(4000)).unwrap(), None);
+        assert_eq!(f.w.kill(KillTarget::Pid(50)).unwrap(), None);
+        assert_eq!(f.w.kill(KillTarget::Key(key50())).unwrap(), None);
+        assert!(f.p().signals().is_empty());
+    }
+
+    #[test]
+    fn observed_scan_cost_is_bounded() {
+        let mut f = fx();
+        for i in 0..200 {
+            let pid = 1000 + i;
+            f.p()
+                .spawn(pid, 10, START + pid as u64 * SEC, "node app.js", "/w");
+            f.p().set_exe(pid, NODE);
+            f.p().add_listener(pid, 10_000 + i as u16);
+        }
+        // The tracked server is never looked up: it is in a tracked tree.
+        f.w.tick(T0).unwrap();
+        let first = f.p().exe_calls();
+        assert_eq!(first, 200);
+        let r = f.w.tick(T0 + 1000).unwrap();
+        assert_eq!(r.observed.len(), 200);
+        assert_eq!(f.p().exe_calls(), first, "no new process, no new read");
+        // A reused pid is a new process: read once more.
+        f.p().remove_proc(1000);
+        f.p()
+            .spawn(1000, 10, START + 5000 * SEC, "node app.js", "/w");
+        f.p().set_exe(1000, NODE);
+        f.p().add_listener(1000, 10_000);
+        f.w.tick(T0 + 2000).unwrap();
+        f.w.tick(T0 + 3000).unwrap();
+        assert_eq!(f.p().exe_calls(), first + 1);
     }
 
     #[test]

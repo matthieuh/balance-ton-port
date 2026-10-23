@@ -5,6 +5,7 @@ pub mod display;
 pub mod history;
 pub mod labels;
 pub mod model;
+pub mod observed;
 pub mod platform;
 pub mod probe;
 pub mod session_end;
