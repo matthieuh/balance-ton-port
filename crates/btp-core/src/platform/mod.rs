@@ -160,6 +160,7 @@ mod fake {
         resources: HashMap<i32, ProcResources>,
         machine_memory: Option<MachineMemory>,
         exe: HashMap<i32, PathBuf>,
+        exe_calls: usize,
         /// `(pid, port)` -> `(peer pid, connections from it)`.
         established_from: Vec<(i32, u16, i32, u32)>,
     }
@@ -268,6 +269,11 @@ mod fake {
             st.established_from.push((pid, port, peer_pid, n));
         }
 
+        /// How many times `exe_path` was called.
+        pub fn exe_calls(&self) -> usize {
+            self.st().exe_calls
+        }
+
         /// Every `(pid, sig)` sent so far, in order.
         pub fn signals(&self) -> Vec<(i32, i32)> {
             self.st().signals.clone()
@@ -371,7 +377,8 @@ mod fake {
         }
 
         fn exe_path(&self, pid: i32) -> Option<PathBuf> {
-            let st = self.st();
+            let mut st = self.st();
+            st.exe_calls += 1;
             if !st.procs.contains_key(&pid) {
                 return None;
             }
