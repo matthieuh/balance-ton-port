@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub mod claude;
+pub mod codex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -61,7 +62,11 @@ pub trait Agent {
 
 /// Which agent's CLI `command` is, if any.
 pub fn is_agent_cli(command: &str) -> Option<AgentKind> {
-    claude::is_claude_cli(command).then_some(AgentKind::ClaudeCode)
+    if claude::is_claude_cli(command) {
+        Some(AgentKind::ClaudeCode)
+    } else {
+        codex::classify_codex(command).map(|_| AgentKind::Codex)
+    }
 }
 
 #[cfg(test)]
@@ -93,6 +98,12 @@ mod tests {
             assert_eq!(is_agent_cli(c), Some(AgentKind::ClaudeCode), "{c}");
         }
         assert_eq!(is_agent_cli("node claude-dashboard.js"), None);
+    }
+
+    #[test]
+    fn is_agent_cli_matches_codex() {
+        assert_eq!(is_agent_cli("codex app-server"), Some(AgentKind::Codex));
+        assert_eq!(is_agent_cli("claude"), Some(AgentKind::ClaudeCode));
     }
 
     #[test]
