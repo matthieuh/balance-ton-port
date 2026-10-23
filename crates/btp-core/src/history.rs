@@ -30,7 +30,7 @@ pub struct Sample {
     pub cpu_pct: f32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AlertKind {
     Idle,
@@ -71,6 +71,8 @@ struct Series {
     last_at_ms: Option<u64>,
     established: u32,
     session_ended: bool,
+    /// Alert kinds already pushed, so pruning never lets one repeat.
+    alerted: HashSet<AlertKind>,
 }
 
 #[derive(Default)]
@@ -95,6 +97,7 @@ impl History {
         let rss_bytes = tree.iter().map(|(_, r)| r.rss_bytes).sum();
         let cpu_pct = match s.last_at_ms {
             Some(prev) if at_ms > prev => {
+                // A process new this pass has no earlier counter: it adds no CPU yet.
                 let delta: u64 = tree
                     .iter()
                     .filter_map(|(id, r)| {
@@ -146,6 +149,26 @@ impl History {
             kind: EventKind::SessionEnded,
         });
         true
+    }
+
+    /// Records an alert event once per kind; true when it was pushed. Call
+    /// `reset_alert` when the alert legitimately re-arms.
+    pub fn note_alert(&mut self, key: ServerKey, at_ms: u64, kind: AlertKind) -> bool {
+        let s = self.servers.entry(key).or_default();
+        if !s.alerted.insert(kind) {
+            return false;
+        }
+        s.events.push(ServerEvent {
+            at_ms,
+            kind: EventKind::Alert { alert: kind },
+        });
+        true
+    }
+
+    pub fn reset_alert(&mut self, key: ServerKey, kind: AlertKind) {
+        if let Some(s) = self.servers.get_mut(&key) {
+            s.alerted.remove(&kind);
+        }
     }
 
     pub fn samples(&self, key: ServerKey) -> &[Sample] {
@@ -344,6 +367,41 @@ mod tests {
             kinds,
             vec![EventKind::BrowserConnected, EventKind::BrowserClosed]
         );
+    }
+
+    #[test]
+    fn alert_pushed_once_even_after_pruning() {
+        let mut h = History::default();
+        let k = key(1);
+        assert!(h.note_alert(k, 0, AlertKind::Idle));
+        assert!(!h.note_alert(k, 1, AlertKind::Idle));
+        assert!(h.note_alert(k, 2, AlertKind::Leak));
+        h.record(k, HISTORY_MS + 5, &[]);
+        h.retain(&HashSet::from([k]), HISTORY_MS + 5);
+        assert!(h.events(k).is_empty());
+        assert!(!h.note_alert(k, HISTORY_MS + 6, AlertKind::Idle));
+        assert!(h.events(k).is_empty());
+        h.reset_alert(k, AlertKind::Idle);
+        assert!(h.note_alert(k, HISTORY_MS + 7, AlertKind::Idle));
+    }
+
+    #[test]
+    fn same_instant_and_new_process_add_no_cpu() {
+        let mut h = History::default();
+        let k = key(1);
+        h.record(k, 1000, &[((1, 1), res(1, 1_000_000_000))]);
+        h.record(k, 1000, &[((1, 1), res(1, 2_000_000_000))]);
+        assert_eq!(h.samples(k)[1].cpu_pct, 0.0);
+        // Process 2 was absent last pass: only process 1's delta counts.
+        h.record(
+            k,
+            2000,
+            &[
+                ((1, 1), res(1, 2_100_000_000)),
+                ((2, 1), res(1, 9_000_000_000)),
+            ],
+        );
+        assert!((h.samples(k)[2].cpu_pct - 10.0).abs() < 0.01);
     }
 
     #[test]
