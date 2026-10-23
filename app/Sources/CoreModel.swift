@@ -38,11 +38,13 @@ final class CoreModel: ObservableObject {
     private let notifier = Notifier()
 
     init() {
-        notifier.onAction = { [weak self] action, id in
+        notifier.onAction = { [weak self] route in
             guard let self else { return }
-            switch action {
-            case .kill: self.kill(id, fromNotification: true)
-            case .keep: self.keep(id)
+            switch route {
+            case .server(.kill, let id): self.kill(id, fromNotification: true)
+            case .server(.keep, let id): self.keep(id)
+            case .sessionEnded(.stopNow, let id): self.stopSessionEnded(id)
+            case .sessionEnded(.keep, let id): self.keepSessionEnded(id)
             }
         }
         scheduleNextPass(after: 0)
@@ -128,6 +130,40 @@ final class CoreModel: ObservableObject {
         }
     }
 
+    /// A session-ended notification's Stop now: stops each kept server of
+    /// that session (exact pid and start time; one gone or restarted is
+    /// skipped).
+    func stopSessionEnded(_ id: SessionEndedID) {
+        Task {
+            do {
+                recentKills = try await onCore { core in
+                    _ = try core.stopSessionEnded(
+                        sessionPid: id.sessionPid, sessionProcStart: id.sessionProcStart, atMs: id.atMs
+                    )
+                    return try core.recentKills()
+                }
+            } catch {
+                lastError = error.localizedDescription
+            }
+        }
+    }
+
+    /// A session-ended notification's Keep: Keep on each kept server of that
+    /// session.
+    func keepSessionEnded(_ id: SessionEndedID) {
+        Task {
+            do {
+                try await onCore { core in
+                    try core.keepSessionEnded(
+                        sessionPid: id.sessionPid, sessionProcStart: id.sessionProcStart, atMs: id.atMs
+                    )
+                }
+            } catch {
+                lastError = error.localizedDescription
+            }
+        }
+    }
+
     /// The config as saved on disk (defaults when there is no file), whose
     /// `claudeConfigDirs` are the extras, plus the dirs found automatically.
     /// Throws when `config.toml` cannot be parsed: the form must not show (and
@@ -164,13 +200,15 @@ final class CoreModel: ObservableObject {
                 let owner = try core.acquireWatch()
                 let report = owner ? try core.tick() : try core.observe()
                 let kills = try core.recentKills()
+                let ended = try core.pendingSessionEnded()
                 // The file may be broken (reported in `configError`): fall
                 // back to the default interval, the core keeps its last
                 // valid config anyway.
                 let scan = (try? core.config())?.scanIntervalS ?? 5
                 return PassResult(
                     owner: owner, servers: report.servers, alerts: report.alerts,
-                    kills: kills, scanIntervalS: scan, configError: report.configError
+                    sessionEnded: ended, kills: kills, scanIntervalS: scan,
+                    configError: report.configError
                 )
             }
             watchedElsewhere = !result.owner
@@ -199,6 +237,22 @@ final class CoreModel: ObservableObject {
                 unnotified = Set(result.alerts.map(\.id)).subtracting(delivered)
             } else {
                 unnotified = []
+            }
+            // The hook leaves a session's group to whoever holds the watch
+            // lock, so the app posts it even while `btp watch` holds it.
+            // Marked only once added; when notifications are off nothing is
+            // marked and the menu's notifications line says so.
+            if !result.sessionEnded.isEmpty {
+                let delivered = await notifier.postSessionEnded(result.sessionEnded)
+                if !delivered.isEmpty {
+                    try await onCore { core in
+                        for id in delivered {
+                            try core.markSessionEndedDelivered(
+                                sessionPid: id.sessionPid, sessionProcStart: id.sessionProcStart, atMs: id.atMs
+                            )
+                        }
+                    }
+                }
             }
             await refreshNotificationPermission()
             interval = TimeInterval(max(1, result.scanIntervalS))
@@ -239,6 +293,7 @@ private struct PassResult: Sendable {
     let owner: Bool
     let servers: [ServerViewFfi]
     let alerts: [ServerViewFfi]
+    let sessionEnded: [SessionEndedFfi]
     let kills: [KillRecordFfi]
     let scanIntervalS: UInt64
     let configError: String?

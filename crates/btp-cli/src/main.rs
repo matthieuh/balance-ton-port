@@ -4,7 +4,7 @@
 
 use btp_core::config::{data_dir, effective_claude_dirs, read_config, save_config};
 use btp_core::display::format_idle as ago;
-use btp_core::display::{format_idle, server_state as state_label};
+use btp_core::display::{format_idle, name_list, server_state as state_label, session_ended_body};
 use btp_core::labels::tool_label;
 use btp_core::model::{KillReason, KillTarget};
 use btp_core::platform::MacOs;
@@ -483,46 +483,11 @@ fn parse_session(raw: &str) -> Option<(i32, String)> {
     (pid > 1 && !start.is_empty()).then(|| (pid, start.to_string()))
 }
 
-/// At most this many servers are named per list in a notification.
-const NAMED_MAX: usize = 4;
-
-fn name_list(items: Vec<String>) -> String {
-    let more = items.len().saturating_sub(NAMED_MAX);
-    let shown = items
-        .into_iter()
-        .take(NAMED_MAX)
-        .collect::<Vec<_>>()
-        .join(", ");
-    if more > 0 {
-        format!("{shown} and {more} more")
-    } else {
-        shown
-    }
-}
-
-fn servers_word(n: usize) -> String {
-    if n == 1 {
-        "1 server".to_string()
-    } else {
-        format!("{n} servers")
-    }
-}
-
 /// The session-end notification: (subtitle, body), for the servers kept
-/// running. `dead_idle_s` is the dead-session delay.
+/// running. `dead_idle_s` is the dead-session delay. The app posts the same
+/// text (`session_ended_body`).
 fn notification_text(g: &SessionEndedGroup, dead_idle_s: u64) -> (String, String) {
-    let names = g
-        .still_open
-        .iter()
-        .map(|s| format!("{} :{}", s.tool_label, s.port))
-        .collect();
-    let body = format!(
-        "Session ended: {} kept running, stopped after {} unused: {}.",
-        servers_word(g.still_open.len()),
-        ago(dead_idle_s.saturating_mul(1000)),
-        name_list(names)
-    );
-    (g.session_name.clone(), body)
+    (g.session_name.clone(), session_ended_body(g, dead_idle_s))
 }
 
 /// The waiter's notification for what it stopped: (subtitle, body).

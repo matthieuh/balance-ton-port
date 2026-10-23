@@ -431,3 +431,63 @@ final class MissedKillTests: XCTestCase {
         XCTAssertNil(missedKillNotice(id, tracked: [same], fromNotification: false))
     }
 }
+
+final class SessionEndedNotificationTests: XCTestCase {
+    private let group = SessionEndedID(sessionPid: 50, sessionProcStart: "Thu Oct 22 10:00:00 2026", atMs: 1_800_000_000_123)
+
+    private func info(_ dict: [String: Any]) -> [AnyHashable: Any] {
+        dict.reduce(into: [:]) { $0[$1.key] = $1.value }
+    }
+
+    func testUserInfoRoundTrip() {
+        XCTAssertEqual(sessionEndedID(fromUserInfo: info(sessionEndedUserInfo(group))), group)
+    }
+
+    func testUserInfoMissingFields() {
+        XCTAssertNil(sessionEndedID(fromUserInfo: [:]))
+        var partial = sessionEndedUserInfo(group)
+        partial["atMs"] = "nope"
+        XCTAssertNil(sessionEndedID(fromUserInfo: info(partial)))
+        partial = sessionEndedUserInfo(group)
+        partial["sessionProcStart"] = ""
+        XCTAssertNil(sessionEndedID(fromUserInfo: info(partial)))
+        // A server alert's userInfo is not a group.
+        XCTAssertNil(sessionEndedID(fromUserInfo: info(notificationUserInfo(ServerID(pid: 1, startTime: 2)))))
+    }
+
+    func testRequestIDNamesTheProcessAndTheEnd() {
+        XCTAssertEqual(sessionEndedRequestID(group), "session-ended-50-1800000000123")
+    }
+
+    func testFfiGroupID() {
+        let ffi = SessionEndedFfi(
+            sessionPid: 50, sessionProcStart: "Thu Oct 22 10:00:00 2026", atMs: 1_800_000_000_123,
+            sessionName: "web", servers: [], body: "b"
+        )
+        XCTAssertEqual(ffi.id, group)
+    }
+
+    func testRoutesGroupButtons() {
+        let i = info(sessionEndedUserInfo(group))
+        XCTAssertEqual(notificationRoute(actionIdentifier: NotificationIDs.stopNow, userInfo: i), .sessionEnded(.stopNow, group))
+        XCTAssertEqual(notificationRoute(actionIdentifier: NotificationIDs.keep, userInfo: i), .sessionEnded(.keep, group))
+        // Kill is not a group button; a body tap opens nothing.
+        XCTAssertNil(notificationRoute(actionIdentifier: NotificationIDs.kill, userInfo: i))
+        XCTAssertNil(notificationRoute(actionIdentifier: UNNotificationDefaultActionIdentifier, userInfo: i))
+    }
+
+    func testRoutesServerButtons() {
+        let id = ServerID(pid: 7, startTime: 9)
+        let i = info(notificationUserInfo(id))
+        XCTAssertEqual(notificationRoute(actionIdentifier: NotificationIDs.kill, userInfo: i), .server(.kill, id))
+        XCTAssertEqual(notificationRoute(actionIdentifier: NotificationIDs.keep, userInfo: i), .server(.keep, id))
+        XCTAssertNil(notificationRoute(actionIdentifier: NotificationIDs.stopNow, userInfo: i))
+        XCTAssertNil(notificationRoute(actionIdentifier: UNNotificationDismissActionIdentifier, userInfo: i))
+    }
+
+    func testSampleAndUnknownRouteNowhere() {
+        let sample = info(sampleNotificationUserInfo())
+        XCTAssertNil(notificationRoute(actionIdentifier: NotificationIDs.kill, userInfo: sample))
+        XCTAssertNil(notificationRoute(actionIdentifier: NotificationIDs.keep, userInfo: [:]))
+    }
+}

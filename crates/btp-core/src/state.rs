@@ -65,11 +65,66 @@ pub struct SessionEndedGroup {
     pub delivered: bool,
 }
 
+impl SessionEndedGroup {
+    /// This group's identity: the ended process and when it ended.
+    pub fn is(&self, session_pid: i32, session_proc_start: &str, at_ms: u64) -> bool {
+        self.session_pid == session_pid
+            && self.session_proc_start == session_proc_start
+            && self.at_ms == at_ms
+    }
+}
+
 impl State {
     /// Inserts at the front (newest first) and keeps at most 5 records.
     pub fn record_kill(&mut self, r: KillRecord) {
         self.recent_kills.insert(0, r);
         self.recent_kills.truncate(MAX_RECENT_KILLS);
+    }
+
+    /// The groups not notified yet (oldest first), each narrowed to its kept
+    /// servers still tracked. A group with none left is marked delivered
+    /// here: there is nothing to tell any more.
+    pub fn pending_session_ended(&mut self) -> Vec<SessionEndedGroup> {
+        let tracked: Vec<ServerKey> = self.servers.iter().map(|s| s.key).collect();
+        let mut pending = Vec::new();
+        for g in self.session_ended.iter_mut().filter(|g| !g.delivered) {
+            let mut left = g.clone();
+            left.still_open.retain(|s| tracked.contains(&s.key));
+            if left.still_open.is_empty() {
+                g.delivered = true;
+            } else {
+                pending.push(left);
+            }
+        }
+        pending
+    }
+
+    /// The group with this identity, if still recorded.
+    pub fn session_ended_group(
+        &self,
+        session_pid: i32,
+        session_proc_start: &str,
+        at_ms: u64,
+    ) -> Option<&SessionEndedGroup> {
+        self.session_ended
+            .iter()
+            .find(|g| g.is(session_pid, session_proc_start, at_ms))
+    }
+
+    /// Records that this group's notification went out.
+    pub fn mark_session_ended_delivered(
+        &mut self,
+        session_pid: i32,
+        session_proc_start: &str,
+        at_ms: u64,
+    ) {
+        for g in self
+            .session_ended
+            .iter_mut()
+            .filter(|g| g.is(session_pid, session_proc_start, at_ms))
+        {
+            g.delivered = true;
+        }
     }
 
     /// Appends a group and keeps the 20 newest.
@@ -330,6 +385,72 @@ mod tests {
         with_state(d.path(), |st| st.servers.push(s)).unwrap();
         let back = with_state(d.path(), |st| st.servers.clone()).unwrap();
         assert_eq!(back, vec![saved]);
+    }
+
+    fn group(at_ms: u64, pids: &[i32]) -> SessionEndedGroup {
+        SessionEndedGroup {
+            session_pid: 50,
+            session_proc_start: "Thu Oct 22 10:00:00 2026".into(),
+            conversation_id: String::new(),
+            session_name: "web".into(),
+            at_ms,
+            stopped: Vec::new(),
+            still_open: pids
+                .iter()
+                .map(|&pid| GroupServer {
+                    key: ServerKey { pid, start_time: 1 },
+                    port: 3000,
+                    tool_label: "Vite".into(),
+                    in_use: false,
+                })
+                .collect(),
+            delivered: false,
+        }
+    }
+
+    #[test]
+    fn pending_groups_list_only_servers_still_tracked() {
+        let mut s = State::default();
+        s.servers.push(server(1));
+        s.record_session_ended(group(10, &[1, 2]));
+        let pending = s.pending_session_ended();
+        assert_eq!(pending.len(), 1);
+        let pids: Vec<i32> = pending[0].still_open.iter().map(|g| g.key.pid).collect();
+        assert_eq!(pids, vec![1]);
+        // The stored group is left whole and undelivered.
+        assert_eq!(s.session_ended[0].still_open.len(), 2);
+        assert!(!s.session_ended[0].delivered);
+    }
+
+    #[test]
+    fn a_group_with_nothing_left_is_marked_delivered_and_not_listed() {
+        let mut s = State::default();
+        s.record_session_ended(group(10, &[1]));
+        assert!(s.pending_session_ended().is_empty());
+        assert!(s.session_ended[0].delivered);
+    }
+
+    #[test]
+    fn delivered_groups_are_not_pending_and_marking_targets_one_group() {
+        let mut s = State::default();
+        s.servers.push(server(1));
+        s.record_session_ended(group(10, &[1]));
+        s.record_session_ended(group(20, &[1]));
+        s.mark_session_ended_delivered(50, "Thu Oct 22 10:00:00 2026", 10);
+        let pending = s.pending_session_ended();
+        assert_eq!(
+            pending.iter().map(|g| g.at_ms).collect::<Vec<_>>(),
+            vec![20]
+        );
+        // Another start time is another process: untouched.
+        s.mark_session_ended_delivered(50, "other", 20);
+        assert_eq!(s.pending_session_ended().len(), 1);
+        assert!(s
+            .session_ended_group(50, "Thu Oct 22 10:00:00 2026", 20)
+            .is_some());
+        assert!(s
+            .session_ended_group(50, "Thu Oct 22 10:00:00 2026", 30)
+            .is_none());
     }
 
     #[test]

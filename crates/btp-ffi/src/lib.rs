@@ -5,12 +5,12 @@
 uniffi::setup_scaffolding!();
 
 use btp_core::config::{data_dir, read_config, save_config, Config};
-use btp_core::display::{format_idle, server_state, started_label};
+use btp_core::display::{format_idle, server_state, session_ended_body, started_label};
 use btp_core::labels::tool_label;
 use btp_core::model::{KillReason, KillTarget, ServerKey};
 use btp_core::platform::MacOs;
 use btp_core::sessions::default_config_dirs;
-use btp_core::state::{with_state, KillRecord};
+use btp_core::state::{with_state, KillRecord, SessionEndedGroup};
 use btp_core::watcher::{acquire_watch_lock, now_ms, ServerView, TickReport, WatchLock, Watcher};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -96,6 +96,55 @@ pub struct ConfigFfi {
     pub exclude_commands: Vec<String>,
     /// Ports never tracked or killed.
     pub exclude_ports: Vec<u16>,
+}
+
+/// One server a session end left running.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GroupServerFfi {
+    pub pid: i32,
+    pub start_time: u64,
+    pub port: u16,
+    pub tool_label: String,
+    /// A connection kept it open (a browser tab).
+    pub in_use: bool,
+}
+
+/// One ended Claude Code session whose kept servers are not notified yet.
+/// `session_pid`, `session_proc_start` and `at_ms` identify it.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SessionEndedFfi {
+    pub session_pid: i32,
+    pub session_proc_start: String,
+    pub at_ms: u64,
+    pub session_name: String,
+    /// The kept servers still tracked.
+    pub servers: Vec<GroupServerFfi>,
+    /// The notification body, the same text the hook posts.
+    pub body: String,
+}
+
+impl SessionEndedFfi {
+    /// `g` as the app notifies it; `dead_idle_s` is the dead-session delay.
+    pub fn at(g: &SessionEndedGroup, dead_idle_s: u64) -> Self {
+        SessionEndedFfi {
+            session_pid: g.session_pid,
+            session_proc_start: g.session_proc_start.clone(),
+            at_ms: g.at_ms,
+            session_name: g.session_name.clone(),
+            servers: g
+                .still_open
+                .iter()
+                .map(|s| GroupServerFfi {
+                    pid: s.key.pid,
+                    start_time: s.key.start_time,
+                    port: s.port,
+                    tool_label: s.tool_label.clone(),
+                    in_use: s.in_use,
+                })
+                .collect(),
+            body: session_ended_body(g, dead_idle_s),
+        }
+    }
 }
 
 /// The reason as the app shows it.
@@ -243,6 +292,22 @@ impl Core {
     fn kill(&self, target: KillTarget) -> Result<Option<KillRecordFfi>, BtpError> {
         Ok(lock(&self.watcher).kill(target)?.as_ref().map(Into::into))
     }
+
+    /// The kept servers recorded for this ended session, marking it
+    /// delivered (its buttons were pressed, so it was seen).
+    fn take_group(
+        &self,
+        session_pid: i32,
+        session_proc_start: &str,
+        at_ms: u64,
+    ) -> Result<Vec<ServerKey>, BtpError> {
+        Ok(with_state(&self.dir, |s| {
+            s.mark_session_ended_delivered(session_pid, session_proc_start, at_ms);
+            s.session_ended_group(session_pid, session_proc_start, at_ms)
+                .map(|g| g.still_open.iter().map(|o| o.key).collect())
+                .unwrap_or_default()
+        })?)
+    }
 }
 
 impl Default for Core {
@@ -326,6 +391,65 @@ impl Core {
         let c: Config = c.into();
         c.validate().map_err(|message| BtpError::Io { message })?;
         Ok(save_config(&self.dir, &c)?)
+    }
+
+    /// The ended sessions whose kept servers are not notified yet, oldest
+    /// first, each listing only its servers still tracked. The body uses the
+    /// dead-session delay of the saved config.
+    pub fn pending_session_ended(&self) -> Result<Vec<SessionEndedFfi>, BtpError> {
+        let dead_idle_s = read_config(&self.dir)
+            .unwrap_or_else(|_| lock(&self.watcher).config())
+            .dead_session_idle_s;
+        let groups = with_state(&self.dir, |s| s.pending_session_ended())?;
+        Ok(groups
+            .iter()
+            .map(|g| SessionEndedFfi::at(g, dead_idle_s))
+            .collect())
+    }
+
+    /// Records that this ended session's notification was added (call it
+    /// once Notification Center accepted it).
+    pub fn mark_session_ended_delivered(
+        &self,
+        session_pid: i32,
+        session_proc_start: String,
+        at_ms: u64,
+    ) -> Result<(), BtpError> {
+        Ok(with_state(&self.dir, |s| {
+            s.mark_session_ended_delivered(session_pid, &session_proc_start, at_ms)
+        })?)
+    }
+
+    /// "Stop now": stops every kept server of this ended session through
+    /// `kill_server` (exact pid and start time; a server gone or restarted
+    /// is skipped). Returns the kills made. Blocking.
+    pub fn stop_session_ended(
+        &self,
+        session_pid: i32,
+        session_proc_start: String,
+        at_ms: u64,
+    ) -> Result<Vec<KillRecordFfi>, BtpError> {
+        let keys = self.take_group(session_pid, &session_proc_start, at_ms)?;
+        let mut kills = Vec::new();
+        for key in keys {
+            if let Some(r) = self.kill_server(key.pid, key.start_time)? {
+                kills.push(r);
+            }
+        }
+        Ok(kills)
+    }
+
+    /// "Keep": Keep on every kept server of this ended session.
+    pub fn keep_session_ended(
+        &self,
+        session_pid: i32,
+        session_proc_start: String,
+        at_ms: u64,
+    ) -> Result<(), BtpError> {
+        for key in self.take_group(session_pid, &session_proc_start, at_ms)? {
+            self.keep(key.pid, key.start_time)?;
+        }
+        Ok(())
     }
 
     /// The last kills, newest first.
@@ -492,6 +616,111 @@ mod tests {
         assert_eq!(core.kill_server(me, 1).unwrap(), None);
         core.mark_alerted(me, 1).unwrap();
         assert!(core.observe().unwrap().servers.is_empty());
+    }
+
+    /// A state with one tracked server (pid not running) and one undelivered
+    /// group naming it and a server no longer tracked.
+    fn seed_group(dir: &Path) -> (i32, String, u64) {
+        use btp_core::model::TrackedServer;
+        use btp_core::state::GroupServer;
+        let dead_pid = 999_999;
+        let start = "Thu Oct 22 10:00:00 2026".to_string();
+        with_state(dir, |s| {
+            s.servers.push(TrackedServer {
+                key: ServerKey {
+                    pid: dead_pid,
+                    start_time: 1,
+                },
+                port: 5173,
+                command: "node vite".into(),
+                worktree: "/tmp/w".into(),
+                session_id: "c".into(),
+                session_pid: 50,
+                session_proc_start: start.clone(),
+                session_name: "web".into(),
+                first_seen_ms: 0,
+                last_active_ms: 0,
+                kept: false,
+                alerted: false,
+                note: None,
+                asked_stale: false,
+            });
+            let open = |pid, port| GroupServer {
+                key: ServerKey { pid, start_time: 1 },
+                port,
+                tool_label: "Vite".into(),
+                in_use: false,
+            };
+            s.record_session_ended(SessionEndedGroup {
+                session_pid: 50,
+                session_proc_start: start.clone(),
+                conversation_id: String::new(),
+                session_name: "web".into(),
+                at_ms: 7,
+                stopped: Vec::new(),
+                still_open: vec![open(dead_pid, 5173), open(dead_pid + 1, 3000)],
+                delivered: false,
+            });
+        })
+        .unwrap();
+        (50, start, 7)
+    }
+
+    #[test]
+    fn pending_session_ended_lists_tracked_servers_with_the_hook_text() {
+        let d = tempfile::tempdir().unwrap();
+        let core = Core::at(d.path().to_path_buf(), Vec::new);
+        assert!(core.pending_session_ended().unwrap().is_empty());
+        let (pid, start, at) = seed_group(d.path());
+        let mut c = core.config().unwrap();
+        c.dead_session_idle_s = 1800;
+        core.set_config(c).unwrap();
+        let pending = core.pending_session_ended().unwrap();
+        assert_eq!(pending.len(), 1);
+        let g = &pending[0];
+        assert_eq!(
+            (g.session_pid, g.session_proc_start.as_str(), g.at_ms),
+            (pid, start.as_str(), at)
+        );
+        assert_eq!(g.session_name, "web");
+        assert_eq!(g.servers.len(), 1);
+        assert_eq!((g.servers[0].pid, g.servers[0].port), (999_999, 5173));
+        assert_eq!(
+            g.body,
+            "Session ended: 1 server kept running, stopped after 30 min unused: Vite :5173."
+        );
+        core.mark_session_ended_delivered(pid, start, at).unwrap();
+        assert!(core.pending_session_ended().unwrap().is_empty());
+    }
+
+    #[test]
+    fn keep_session_ended_keeps_each_server_and_marks_delivered() {
+        let d = tempfile::tempdir().unwrap();
+        let core = Core::at(d.path().to_path_buf(), Vec::new);
+        let (pid, start, at) = seed_group(d.path());
+        core.keep_session_ended(pid, start, at).unwrap();
+        let (kept, delivered) = with_state(d.path(), |s| {
+            (s.servers[0].kept, s.session_ended[0].delivered)
+        })
+        .unwrap();
+        assert!(kept && delivered);
+    }
+
+    #[test]
+    fn stop_session_ended_never_touches_a_server_not_running() {
+        let d = tempfile::tempdir().unwrap();
+        let core = Core::at(d.path().to_path_buf(), Vec::new);
+        let (pid, start, at) = seed_group(d.path());
+        assert!(core
+            .stop_session_ended(pid, start.clone(), at)
+            .unwrap()
+            .is_empty());
+        assert!(core.pending_session_ended().unwrap().is_empty());
+        // An unknown group stops nothing.
+        assert!(core
+            .stop_session_ended(pid, start, at + 1)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
