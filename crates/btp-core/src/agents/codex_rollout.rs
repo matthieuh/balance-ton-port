@@ -65,19 +65,24 @@ pub fn read_meta(path: &Path) -> Option<SessionMeta> {
 
 /// The newest rollout of a thread: `rollout-<ts>-<id>.jsonl` or
 /// `rollout-<ts>-<id>_<rollout id>.jsonl` under `sessions/Y/M/D/`.
-/// Date dirs are searched newest first, stopping at the first day with a match.
+/// Date dirs are walked lazily, newest first, stopping at the first day with a
+/// match. This is on the scan path (every few seconds per Codex session), so
+/// files are filtered by name before any stat.
 pub fn rollout_for_thread(codex_home: &Path, thread_id: &str) -> Option<PathBuf> {
     if thread_id.is_empty() {
         return None;
     }
     let root = codex_home.join("sessions");
-    for day in date_dirs_newest_first(&root) {
-        let best = jsonl_files(&day)
-            .into_iter()
-            .filter(|(path, _)| is_rollout_of(path, thread_id))
-            .max_by_key(|(_, mtime)| *mtime);
-        if let Some((path, _)) = best {
-            return Some(path);
+    for year in sorted_subdirs_desc(&root) {
+        for month in sorted_subdirs_desc(&year) {
+            for day in sorted_subdirs_desc(&month) {
+                let best = jsonl_files(&day, |p| is_rollout_of(p, thread_id))
+                    .into_iter()
+                    .max_by_key(|(_, mtime)| *mtime);
+                if let Some((path, _)) = best {
+                    return Some(path);
+                }
+            }
         }
     }
     None
@@ -103,7 +108,7 @@ pub fn newest_rollout_for_cwd(
             .join(format!("{y:04}"))
             .join(format!("{m:02}"))
             .join(format!("{d:02}"));
-        for (path, mtime) in jsonl_files(&dir) {
+        for (path, mtime) in jsonl_files(&dir, |_| true) {
             if mtime < not_before_ms || best.as_ref().is_some_and(|(t, _, _)| *t >= mtime) {
                 continue;
             }
@@ -134,14 +139,17 @@ fn is_rollout_of(path: &Path, thread_id: &str) -> bool {
 }
 
 /// `.jsonl` files of a directory with their mtime in ms. Other extensions
-/// (compressed rollouts) are ignored.
-fn jsonl_files(dir: &Path) -> Vec<(PathBuf, u64)> {
+/// (compressed rollouts) are ignored. `keep` runs on the path before the stat.
+fn jsonl_files(dir: &Path, keep: impl Fn(&Path) -> bool) -> Vec<(PathBuf, u64)> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     entries
         .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
+        .filter(|e| {
+            let path = e.path();
+            path.extension().is_some_and(|x| x == "jsonl") && keep(&path)
+        })
         .filter_map(|e| {
             let mtime = e
                 .metadata()
@@ -169,12 +177,12 @@ fn sorted_subdirs_desc(dir: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-fn date_dirs_newest_first(root: &Path) -> Vec<PathBuf> {
-    sorted_subdirs_desc(root)
-        .iter()
-        .flat_map(|y| sorted_subdirs_desc(y))
-        .flat_map(|m| sorted_subdirs_desc(&m))
-        .collect()
+/// Parse an unsigned-style number, rejecting a leading `+` that `parse` accepts.
+fn num<T: std::str::FromStr>(s: &str) -> Option<T> {
+    if s.starts_with('+') {
+        return None;
+    }
+    s.parse().ok()
 }
 
 /// `YYYY-MM-DDThh:mm:ss[.fff]Z` to epoch milliseconds.
@@ -183,11 +191,15 @@ fn parse_iso_utc_ms(s: &str) -> Option<u64> {
     let (date, time) = s.split_once('T')?;
     let mut d = date.split('-');
     let (y, mo, da) = (
-        d.next()?.parse::<i64>().ok()?,
-        d.next()?.parse::<u32>().ok()?,
-        d.next()?.parse::<u32>().ok()?,
+        num::<i64>(d.next()?)?,
+        num::<u32>(d.next()?)?,
+        num::<u32>(d.next()?)?,
     );
-    if d.next().is_some() || !(1..=12).contains(&mo) || !(1..=31).contains(&da) {
+    if d.next().is_some()
+        || !(1970..=9999).contains(&y)
+        || !(1..=12).contains(&mo)
+        || !(1..=31).contains(&da)
+    {
         return None;
     }
     let (hms, frac) = match time.split_once('.') {
@@ -196,9 +208,9 @@ fn parse_iso_utc_ms(s: &str) -> Option<u64> {
     };
     let mut t = hms.split(':');
     let (h, mi, se) = (
-        t.next()?.parse::<u64>().ok()?,
-        t.next()?.parse::<u64>().ok()?,
-        t.next()?.parse::<u64>().ok()?,
+        num::<u64>(t.next()?)?,
+        num::<u64>(t.next()?)?,
+        num::<u64>(t.next()?)?,
     );
     if t.next().is_some() || h > 23 || mi > 59 || se > 60 {
         return None;
@@ -210,7 +222,7 @@ fn parse_iso_utc_ms(s: &str) -> Option<u64> {
                 return None;
             }
             let three: String = f.chars().chain("000".chars()).take(3).collect();
-            three.parse::<u64>().ok()?
+            num::<u64>(&three)?
         }
     };
     let days = days_from_civil(y, mo, da);
@@ -302,6 +314,12 @@ mod tests {
             r#"{"type":"session_meta","payload":{"id":"a","timestamp":"yesterday","cwd":"/x"}}"#;
         assert!(parse_session_meta(bad_ts).is_none());
         assert!(parse_session_meta("not json").is_none());
+        for ts in ["999999999-01-01T00:00:00Z", "+2026-01-01T00:00:00Z"] {
+            let line = format!(
+                r#"{{"type":"session_meta","payload":{{"id":"a","timestamp":"{ts}","cwd":"/x"}}}}"#
+            );
+            assert!(parse_session_meta(&line).is_none(), "{ts}");
+        }
     }
 
     #[test]
