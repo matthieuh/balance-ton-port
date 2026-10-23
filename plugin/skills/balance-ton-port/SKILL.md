@@ -46,9 +46,9 @@ btp kill 4322            # kill the tracked server on port 4322
 btp kill --pid 12345     # kill a tracked server by pid
 btp sweep --dry-run      # show what the automatic rules would kill
 btp sweep                # apply them
-btp note 5173 --keep "preview for the user"   # spare it when the session quits
-btp note 5173 --done     # stop it when the session quits, once idle
+btp note 5173 --keep "preview for the user"   # no idle alert, not offered after /clear
+btp note 5173 --done     # once the session quit, stopped as soon as idle
 btp recent               # the last kills and why
 ```
 
-`recent_kills` entries carry a `reason` of `{"kind": "manual"}`, `{"kind": "worktree_deleted"}`, `{"kind": "dead_session_idle", "idle_ms": ...}` or `{"kind": "session_ended"}` (only in records written by older versions; a quit no longer stops anything).
+`recent_kills` entries carry a `reason` of `{"kind": "manual"}`, `{"kind": "worktree_deleted"}`, `{"kind": "dead_session_idle", "idle_ms": ...}`, or `{"kind": "other"}` for a kind written by a newer btp.

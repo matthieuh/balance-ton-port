@@ -519,6 +519,26 @@ fn note_from_outside_the_session_is_refused() {
 }
 
 #[test]
+fn kill_by_key_from_outside_the_session_is_refused() {
+    let sb = Sandbox::new();
+    let port = free_port();
+    let session = spawn_session(&sb, &perl_server(port, false), "--version");
+    let sh = session.0.id() as i32;
+    let server = wait_listener(sh, port);
+    sb.session_file(sh, "conv-1");
+    sb.btp().args(["list"]).assert().success();
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(sb.data.path().join("state.json")).unwrap())
+            .unwrap();
+    let key = &state["servers"][0]["key"];
+    let key = format!("{}:{}", key["pid"], key["start_time"]);
+    let out = sb.btp().args(["kill", "--key", &key]).assert().code(1);
+    let err = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(err.contains("not run from a Claude Code session"), "{err}");
+    assert!(MacOs.proc_info(server.pid).is_some(), "killed from outside");
+}
+
+#[test]
 fn stale_outside_a_session_exits_1() {
     let sb = Sandbox::new();
     sb.btp()

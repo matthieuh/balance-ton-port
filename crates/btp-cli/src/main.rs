@@ -6,11 +6,12 @@ use btp_core::config::{data_dir, effective_claude_dirs, read_config, save_config
 use btp_core::display::format_idle as ago;
 use btp_core::display::{format_idle, name_list, server_state as state_label, session_ended_body};
 use btp_core::labels::tool_label;
-use btp_core::model::{KillReason, KillTarget};
+use btp_core::model::{KillReason, KillTarget, ServerKey};
 use btp_core::platform::MacOs;
 use btp_core::state::{KillRecord, SessionEndedGroup};
 use btp_core::watcher::{
-    acquire_watch_lock, now_ms, NoteCmd, NoteOutcome, ServerView, TickReport, Watcher,
+    acquire_watch_lock, now_ms, NoteCmd, NoteOutcome, OwnKillOutcome, ServerView, TickReport,
+    Watcher,
 };
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
@@ -114,11 +115,27 @@ struct SessionEndArgs {
 #[derive(Args)]
 struct KillArgs {
     /// Port the server listens on
-    #[arg(required_unless_present = "pid", conflicts_with = "pid")]
+    #[arg(required_unless_present_any = ["pid", "key"], conflicts_with_all = ["pid", "key"])]
     port: Option<u16>,
     /// Process id of the server
-    #[arg(long)]
+    #[arg(long, conflicts_with = "key")]
     pid: Option<i32>,
+    /// Exactly this process, `<pid>:<start time>`, and only a server of the
+    /// caller's own session (what `btp stale` lists; for the plugin)
+    #[arg(long, hide = true, value_parser = parse_key)]
+    key: Option<ServerKey>,
+}
+
+fn parse_key(s: &str) -> Result<ServerKey, String> {
+    let (pid, start) = s
+        .split_once(':')
+        .ok_or_else(|| "expected <pid>:<start time>".to_string())?;
+    Ok(ServerKey {
+        pid: pid.parse().map_err(|_| format!("bad pid: {pid}"))?,
+        start_time: start
+            .parse()
+            .map_err(|_| format!("bad start time: {start}"))?,
+    })
 }
 
 #[derive(Subcommand)]
@@ -215,6 +232,28 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
                 print!("{}", render_list(&report.servers));
             }
             Ok(0)
+        }
+        Cmd::Kill(KillArgs { key: Some(key), .. }) => {
+            let mut w = Watcher::new(MacOs, dir);
+            let out = w.kill_own(std::process::id() as i32, key)?;
+            warn_config(w.config_error());
+            match out {
+                OwnKillOutcome::Killed(r) => {
+                    println!("killed {}", describe_kill(&r));
+                    Ok(0)
+                }
+                OwnKillOutcome::NoSession => Err(Failure::User(
+                    "not run from a Claude Code session: --key only applies to your own session's servers".into(),
+                )),
+                OwnKillOutcome::NotTracked => Err(Failure::User(format!(
+                    "no tracked server is process {}:{} (it exited or restarted): nothing stopped",
+                    key.pid, key.start_time
+                ))),
+                OwnKillOutcome::OtherSession => Err(Failure::User(format!(
+                    "process {} belongs to another Claude Code session: nothing stopped",
+                    key.pid
+                ))),
+            }
         }
         Cmd::Kill(a) => {
             let target = match (a.port, a.pid) {

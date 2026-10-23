@@ -29,6 +29,12 @@ debug_log() {
 if [ "${1:-}" = --run ]; then
   exec </dev/null >/dev/null
   claude_pid="${2:-}" reason="${3:-}" session_id="${4:-}"
+  # Only as the leader of its own process group (the setsid below worked):
+  # the watchdog's `kill 0` must never reach Claude Code's group.
+  [ "$(ps -o pgid= -p "$$" | tr -d ' ')" = "$$" ] || {
+    debug_log "not detached from Claude Code's process group: nothing done"
+    exit 0
+  }
   # A hung btp never lingers: the whole child's process group goes after
   # 15 s (`btp session-end` detaches its waiter into another session).
   (
@@ -87,7 +93,7 @@ esac
 # 2.1.308), so $PPID is the session's process.
 self="${BASH_SOURCE[0]}"
 if [ -x /usr/bin/perl ]; then
-  /usr/bin/perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV or exit 0' \
+  /usr/bin/perl -MPOSIX -e '(POSIX::setsid() // -1) > 0 or exit 0; exec @ARGV or exit 0' \
     /bin/bash "$self" --run "$PPID" "$reason" "$session_id" &
 else
   # No perl: at least its own process group, away from Claude Code's.

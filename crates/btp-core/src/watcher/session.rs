@@ -76,6 +76,18 @@ pub enum NoteOutcome {
     OtherSession,
 }
 
+/// What `kill_own` did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OwnKillOutcome {
+    Killed(KillRecord),
+    /// The caller does not descend from a live Claude Code session.
+    NoSession,
+    /// No tracked server is that exact process (it exited or restarted).
+    NotTracked,
+    /// The server belongs to another session process.
+    OtherSession,
+}
+
 /// A leftover of an earlier conversation (tier 3), as `btp stale` prints it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct StaleServer {
@@ -526,6 +538,44 @@ impl<P: Platform> Watcher<P> {
             }
             Some(out)
         })
+    }
+
+    /// Kills exactly the process `key` (pid and start time), only when it is
+    /// a tracked server of the caller's own live session process. Used for
+    /// the tier 3 "yes": whatever took the port since the offer is never
+    /// touched, nor is another session's server.
+    pub fn kill_own(&mut self, caller_pid: i32, key: ServerKey) -> io::Result<OwnKillOutcome> {
+        let now = now_ms();
+        let scan = self.scan();
+        let Some(caller) = self.caller_session(caller_pid, &scan).cloned() else {
+            return Ok(OwnKillOutcome::NoSession);
+        };
+        let listeners = self.platform.listeners();
+        let found = with_state(&self.data_dir, |state| {
+            let trees = self.refresh(state, &scan, &listeners, now);
+            state
+                .servers
+                .iter()
+                .zip(&trees)
+                .find(|(s, t)| s.key == key && !t.pids.is_empty())
+                .map(|(s, _)| s.clone())
+        })?;
+        let Some(server) = found else {
+            return Ok(OwnKillOutcome::NotTracked);
+        };
+        if server.session_pid != caller.pid || server.session_proc_start != caller.proc_start {
+            return Ok(OwnKillOutcome::OtherSession);
+        }
+        Ok(
+            match self
+                .execute(vec![(server, KillReason::Manual)], &scan.cfg, now)?
+                .0
+                .pop()
+            {
+                Some(r) => OwnKillOutcome::Killed(r),
+                None => OwnKillOutcome::NotTracked,
+            },
+        )
     }
 }
 
@@ -1091,6 +1141,63 @@ mod tests {
         cfg.exclude_commands.push("bun run".into());
         save_config(f.data.path(), &cfg).unwrap();
         assert!(f.w.stale(HOOK, "sess-b", T0).unwrap().unwrap().is_empty());
+    }
+
+    #[test]
+    fn kill_own_stops_the_offered_server() {
+        let mut f = fx();
+        hook(&f);
+        tracked(&mut f);
+        let out = f.w.kill_own(HOOK, key30()).unwrap();
+        assert!(matches!(out, OwnKillOutcome::Killed(_)), "{out:?}");
+        assert!(!f.p().is_alive(30));
+    }
+
+    #[test]
+    fn kill_own_never_touches_a_new_server_on_the_same_port() {
+        let mut f = fx();
+        hook(&f);
+        tracked(&mut f);
+        let offered = key30();
+        // The offered server exits; a new one of the session takes its port.
+        f.p().remove_proc(30);
+        f.p().remove_proc(31);
+        let web = f.wt.join("apps/web");
+        f.p().spawn(
+            30,
+            20,
+            START + 90 * SEC,
+            "bun run dev",
+            web.to_str().unwrap(),
+        );
+        f.p().add_listener(30, 3000);
+        f.w.tick(T0).unwrap();
+        assert_eq!(
+            f.w.kill_own(HOOK, offered).unwrap(),
+            OwnKillOutcome::NotTracked
+        );
+        assert!(f.p().is_alive(30));
+        assert!(f.p().signals().is_empty());
+    }
+
+    #[test]
+    fn kill_own_refuses_another_sessions_server() {
+        let mut f = fx();
+        tracked(&mut f);
+        f.p().spawn(50, 10, START + 50 * SEC, "claude", "/");
+        f.session(50, "sess-b", Path::new("/elsewhere"), START + 50 * SEC);
+        f.p().spawn(51, 50, START + 51 * SEC, "btp kill", "/");
+        assert_eq!(
+            f.w.kill_own(51, key30()).unwrap(),
+            OwnKillOutcome::OtherSession
+        );
+        f.p().spawn(52, 10, START + 52 * SEC, "btp kill", "/");
+        assert_eq!(
+            f.w.kill_own(52, key30()).unwrap(),
+            OwnKillOutcome::NoSession
+        );
+        assert!(f.p().is_alive(30));
+        assert!(f.p().signals().is_empty());
     }
 
     #[test]

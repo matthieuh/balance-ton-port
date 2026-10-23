@@ -22,7 +22,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 mod session;
-pub use session::{NoteCmd, NoteOutcome, SessionEndReport, StaleServer, SweepOutcome, WaiterEnd};
+pub use session::{
+    NoteCmd, NoteOutcome, OwnKillOutcome, SessionEndReport, StaleServer, SweepOutcome, WaiterEnd,
+};
 
 /// One tracked server as the UI and the CLI show it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
