@@ -55,6 +55,11 @@ btp sweep [--dry-run]    # apply triggers 1 and 2 once; --dry-run kills nothing
 btp watch                # watch in the foreground until Ctrl-C
 btp config get           # print the effective configuration
 btp config set <key> <n> # set a numeric key
+btp recent [--json]      # the last kills
+btp note <port> --keep [reason]  # agent intent: spare this server (no alerts), with a reason
+btp note <port> --done   # agent intent: stop it once idle after the session ends
+btp stale --conversation <id>    # servers of an earlier conversation idle over 5 min (JSON)
+btp session-end          # called by the plugin's SessionEnd hook, not by hand
 ```
 
 Only servers Balance ton port tracks can be killed; an unknown port or pid exits 1. `btp kill <port>` accepts any port of a server's process tree. `btp watch` refuses to start while the app is already watching, and prints each alert once instead of notifying. Without the app, `btp sweep` applies triggers 1 and 2 only (no alerts).
@@ -77,12 +82,25 @@ An exclusion matches the whole command line, paths included: a project path cont
 
 Values below their minimum are refused by `btp config set` and the Settings window, and raised to the minimum when read from the file (with a note on stderr, once per change of the file). If `config.toml` cannot be parsed (one mistyped value is enough), nothing falls back to the defaults silently: a running watcher keeps its last valid settings (a fresh start uses the defaults), the app shows the error in its menu, the CLI prints it, and `btp config get` / `set` refuse to touch the file until it is fixed. Saves are atomic. The app and `btp config set` both write the whole file: the last one to save wins.
 
+## Claude Code plugin
+
+In Claude Code:
+
+```
+/plugin marketplace add matthieuh/balance-ton-port
+/plugin install balance-ton-port@balance-ton-port
+```
+
+What the plugin does: it ships the agent skill, and when a session quits it records the dev servers that session left running. It never stops one at that moment. If you chose "Exit and stop tasks", Claude Code has already stopped its own tasks and there is nothing to record. If you chose "Move to background and exit", the servers were kept on purpose: you get one notification ("Session ended: 2 servers kept running: ... Stopped after 20 min unused, once no session works in that folder"). The background session keeps them while it runs; once it ends, each server is stopped after `dead_session_idle_s` unused, by the app, by `btp watch`, or by a small detached process when neither runs. `/clear` and `/resume` stop nothing: servers left by the earlier conversation and idle more than 5 minutes are offered once, in a single question from Claude.
+
+It needs the `btp` CLI. At the next session start, if `btp` is missing or too old, Claude asks whether to install it; on yes the plugin downloads the latest release, checks its sha256 and its Developer ID signature, and installs it to `~/.local/bin/btp` (never with sudo, and it only replaces a `btp` it installed itself). A "no" is remembered; `/balance-ton-port:install` installs it later. To see what the hook found, start Claude Code with `BTP_HOOK_DEBUG=1`: a trace is appended to `session-end.log` in the data dir.
+
 ## Agent skill
 
-Teaches agents to run `btp list --json` before starting a server, reuse or free ports with `btp`, and `btp sweep` at the end of a task, instead of `lsof | xargs kill`.
+Teaches agents to run `btp list --json` before starting a server, reuse or free ports with `btp`, note their intent (`btp note <port> --keep "<why>"` or `--done`), and `btp sweep` at the end of a task, instead of `lsof | xargs kill`. The plugin installs it; without the plugin:
 
 ```bash
-cp -r skills/balance-ton-port ~/.claude/skills/
+cp -r plugin/skills/balance-ton-port ~/.claude/skills/
 ```
 
 If you use a custom `CLAUDE_CONFIG_DIR`, copy it into that directory's `skills/` folder instead.
@@ -104,7 +122,8 @@ The idle alert (trigger 3) needs notifications allowed for Balance ton port. The
 ## Known limitations
 
 - A Claude Code process that has no session file in a watched config dir (for example a `CLAUDE_CONFIG_DIR` whose `sessions/` folder is shared with another dir, or an older Claude Code) is not watched: the servers it starts are not tracked and never killed. That is the safe direction: nothing is killed, but nothing is cleaned up for that session either.
-- A server started in the background (`cmd &`) inside one shell command is reparented to launchd before the first scan and is not tracked.
+- A server started in the background (`cmd &`, `nohup`) inside one shell command is reparented to launchd before the first scan and is not tracked.
+- Claude Code runs no hook when it crashes or is killed hard: nothing is recorded then, and the normal rules (the app or `btp watch`) apply.
 
 ## Releasing
 

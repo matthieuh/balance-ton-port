@@ -35,6 +35,12 @@ jobs:
             echo "::error::tag v$VERSION does not match btp-cli ($CLI_VERSION) and app ($APP_VERSION) versions"
             exit 1
           fi
+          # The Claude Code plugin refuses a btp older than its minimum.
+          MIN="$(sed -n 's/^BTP_MIN_VERSION="\(.*\)"$/\1/p' plugin/scripts/lib.sh)"
+          if [ "$(printf '%s\n%s\n' "$MIN" "${VERSION%%-*}" | sort -V | head -1)" != "$MIN" ]; then
+            echo "::error::v$VERSION is older than the plugin's BTP_MIN_VERSION ($MIN)"
+            exit 1
+          fi
           {
             echo "VERSION=$VERSION"
             echo "DIST=$RUNNER_TEMP/dist"

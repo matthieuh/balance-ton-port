@@ -1,6 +1,7 @@
 //! Labels shared by the CLI and the app (through the FFI), so both show a
 //! server's state and idle time the same way.
 
+use crate::state::SessionEndedGroup;
 use crate::watcher::ServerView;
 
 /// A server with no port activity for less than this counts as `active`.
@@ -39,6 +40,51 @@ pub fn started_label(started_ms: u64, now_ms: u64) -> String {
     } else {
         format!("started {} ago", format_idle(age))
     }
+}
+
+/// At most this many servers are named per list in a notification.
+pub const NAMED_MAX: usize = 4;
+
+/// `a, b, c, d and 2 more`: at most `NAMED_MAX` names.
+pub fn name_list(items: Vec<String>) -> String {
+    let more = items.len().saturating_sub(NAMED_MAX);
+    let shown = items
+        .into_iter()
+        .take(NAMED_MAX)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if more > 0 {
+        format!("{shown} and {more} more")
+    } else {
+        shown
+    }
+}
+
+/// `1 server`, `3 servers`.
+pub fn servers_word(n: usize) -> String {
+    if n == 1 {
+        "1 server".to_string()
+    } else {
+        format!("{n} servers")
+    }
+}
+
+/// The session-ended notification body, shared by the hook (posted with
+/// `osascript`) and the app: `Session ended: 2 servers kept running,
+/// stopped after 20 min unused: Vite :5173, Bun dev :3000.`. It names the
+/// group's `still_open` servers; `dead_idle_s` is the dead-session delay.
+pub fn session_ended_body(g: &SessionEndedGroup, dead_idle_s: u64) -> String {
+    let names = g
+        .still_open
+        .iter()
+        .map(|s| format!("{} :{}", s.tool_label, s.port))
+        .collect();
+    format!(
+        "Session ended: {} kept running: {}. Stopped after {} unused, once no session works in that folder.",
+        servers_word(g.still_open.len()),
+        name_list(names),
+        format_idle(dead_idle_s.saturating_mul(1000))
+    )
 }
 
 #[cfg(test)]
@@ -85,6 +131,34 @@ mod tests {
         assert_eq!(started_label(now - 2 * 86_400_000, now), "started 2 d ago");
         // A clock that went back never underflows.
         assert_eq!(started_label(now + 5_000, now), "started just now");
+    }
+
+    #[test]
+    fn session_ended_body_names_the_kept_servers() {
+        use crate::state::GroupServer;
+        let open = |label: &str, port| GroupServer {
+            key: ServerKey {
+                pid: 9,
+                start_time: 9,
+            },
+            port,
+            tool_label: label.into(),
+            in_use: false,
+        };
+        let g = SessionEndedGroup {
+            session_pid: 1,
+            session_proc_start: "x".into(),
+            conversation_id: String::new(),
+            session_name: "web".into(),
+            at_ms: 0,
+            stopped: Vec::new(),
+            still_open: vec![open("Vite", 5173), open("Bun dev", 3000)],
+            delivered: false,
+        };
+        assert_eq!(
+            session_ended_body(&g, 1200),
+            "Session ended: 2 servers kept running: Vite :5173, Bun dev :3000. Stopped after 20 min unused, once no session works in that folder."
+        );
     }
 
     #[test]

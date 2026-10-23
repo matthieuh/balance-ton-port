@@ -9,7 +9,7 @@
 use crate::config::{effective_claude_dirs_with, read_config, Config};
 use crate::decide::{decide, touch};
 use crate::labels::{location_label, session_display_name, tool_label};
-use crate::model::{Action, KillReason, KillTarget, Observation, ServerKey, TrackedServer};
+use crate::model::{Action, KillReason, KillTarget, Note, Observation, ServerKey, TrackedServer};
 use crate::platform::{ancestry, format_proc_start, Listener, Platform, ProcInfo};
 use crate::sessions::{default_config_dirs, read_sessions, session_idle_ms, ClaudeSession};
 use crate::state::{append_kill_log, with_state, KillRecord, State};
@@ -20,6 +20,11 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+mod session;
+pub use session::{
+    NoteCmd, NoteOutcome, OwnKillOutcome, SessionEndReport, StaleServer, SweepOutcome, WaiterEnd,
+};
 
 /// One tracked server as the UI and the CLI show it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -63,7 +68,25 @@ pub struct TickReport {
     pub config_error: Option<String>,
 }
 
-fn is_excluded(command: &str, cfg: &Config) -> bool {
+/// Two notes of rows folded into one server: the cautious side wins (keep
+/// if either keeps, done only if both are done).
+fn merge_notes(a: Option<Note>, b: Option<Note>) -> Option<Note> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(Note {
+            keep: a.keep || b.keep,
+            done: a.done && b.done,
+            reason: if b.keep && !a.keep {
+                b.reason
+            } else {
+                a.reason.or(b.reason)
+            },
+            set_at_ms: a.set_at_ms.max(b.set_at_ms),
+        }),
+        (a, b) => a.or(b),
+    }
+}
+
+pub(crate) fn is_excluded(command: &str, cfg: &Config) -> bool {
     let command = command.to_lowercase();
     cfg.exclude_commands
         .iter()
@@ -137,6 +160,8 @@ pub fn link(
         last_active_ms: now_ms,
         kept: false,
         alerted: false,
+        note: None,
+        asked_stale: false,
     })
 }
 
@@ -258,8 +283,20 @@ fn signal_checked(p: &dyn Platform, pid: i32, start_time: u64, sig: i32) -> bool
 /// reused pid is never hit. Returns `false`, sending nothing, when `key` is
 /// no longer the running process.
 pub fn kill_tree(p: &dyn Platform, key: ServerKey, grace: Duration, cfg: &Config) -> bool {
-    if !same_process(p, key.pid, key.start_time) {
+    let Some(targets) = term_tree(p, key, cfg) else {
         return false;
+    };
+    finish_kill(p, &targets, Instant::now() + grace);
+    true
+}
+
+/// The first stage of `kill_tree`: snapshots the tree as (pid, start time)
+/// and sends SIGTERM to each target, start time re-checked right before.
+/// `None`, sending nothing more, when `key` is no longer the running process
+/// or refused the signal.
+pub fn term_tree(p: &dyn Platform, key: ServerKey, cfg: &Config) -> Option<Vec<(i32, u64)>> {
+    if !same_process(p, key.pid, key.start_time) {
+        return None;
     }
     let mut targets = vec![(key.pid, key.start_time)];
     // A Claude Code process started from the server (and whatever it runs)
@@ -268,28 +305,44 @@ pub fn kill_tree(p: &dyn Platform, key: ServerKey, grace: Duration, cfg: &Config
     // nor anything they run.
     targets.extend(own_descendants(p, key.pid, &|c| is_excluded(c, cfg)));
     if !signal_checked(p, key.pid, key.start_time, libc::SIGTERM) {
-        return false;
+        return None;
     }
     for &(pid, start) in &targets[1..] {
         signal_checked(p, pid, start, libc::SIGTERM);
     }
-    let deadline = Instant::now() + grace;
-    let survivors = |targets: &[(i32, u64)]| -> Vec<(i32, u64)> {
-        targets
-            .iter()
-            .copied()
-            .filter(|&(pid, start)| same_process(p, pid, start))
-            .collect()
-    };
-    let mut left = survivors(&targets);
-    while !left.is_empty() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(100).min(grace));
-        left = survivors(&left);
+    Some(targets)
+}
+
+/// The targets that are still the very process snapshotted.
+fn survivors(p: &dyn Platform, targets: &[(i32, u64)]) -> Vec<(i32, u64)> {
+    targets
+        .iter()
+        .copied()
+        .filter(|&(pid, start)| same_process(p, pid, start))
+        .collect()
+}
+
+/// Polls every 100 ms until every target is gone or `deadline` passed;
+/// returns the survivors.
+pub fn wait_gone(p: &dyn Platform, targets: &[(i32, u64)], deadline: Instant) -> Vec<(i32, u64)> {
+    let mut left = survivors(p, targets);
+    loop {
+        let now = Instant::now();
+        if left.is_empty() || now >= deadline {
+            return left;
+        }
+        std::thread::sleep(Duration::from_millis(100).min(deadline - now));
+        left = survivors(p, &left);
     }
-    for (pid, start) in left {
+}
+
+/// The last stage of `kill_tree`: waits for the targets until `deadline`,
+/// then SIGKILL to each survivor whose start time still matches. Never
+/// pid <= 1 or ourselves.
+pub fn finish_kill(p: &dyn Platform, targets: &[(i32, u64)], deadline: Instant) {
+    for (pid, start) in wait_gone(p, targets, deadline) {
         signal_checked(p, pid, start, libc::SIGKILL);
     }
-    true
 }
 
 /// Exclusive ownership of the watch loop (the app or `btp watch`). Released
@@ -336,6 +389,45 @@ pub fn acquire_watch_lock(dir: &Path, owner: &str) -> io::Result<WatchLock> {
     }
 }
 
+/// `true` while another process (the app or `btp watch`) holds
+/// `watch.lock`. Probes with a try-lock released at once, never writes the
+/// owner name. `false` when the file cannot be opened.
+pub fn watch_lock_held(dir: &Path) -> bool {
+    let Ok(file) = File::open(dir.join("watch.lock")) else {
+        return false;
+    };
+    match FileExt::try_lock(&file) {
+        Ok(()) => {
+            let _ = FileExt::unlock(&file);
+            false
+        }
+        Err(TryLockError::WouldBlock) => true,
+        Err(TryLockError::Error(_)) => false,
+    }
+}
+
+/// Owner written into `watch.lock` while the macOS app holds it.
+pub const APP_OWNER: &str = "Balance ton port.app";
+
+/// The owner name in `watch.lock` while some process holds it, `None` when
+/// nobody does (or the file cannot be read). Empty while the holder has not
+/// written it yet.
+pub fn watch_lock_owner(dir: &Path) -> Option<String> {
+    if !watch_lock_held(dir) {
+        return None;
+    }
+    std::fs::read_to_string(dir.join("watch.lock"))
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+/// The lock owner is the app, which notifies session-ended groups itself.
+/// `btp watch`, an unknown or not yet written owner, or no holder at all:
+/// the hook posts.
+pub fn app_owns_watch(owner: Option<&str>) -> bool {
+    owner == Some(APP_OWNER)
+}
+
 /// Milliseconds since the Unix epoch, from the system clock.
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -356,6 +448,7 @@ enum Mode {
 }
 
 /// A live Claude Code session (its process verified) and its worktree.
+#[derive(Clone)]
 struct LiveSession {
     session: ClaudeSession,
     root: PathBuf,
@@ -607,6 +700,8 @@ impl<P: Platform> Watcher<P> {
             let o = &mut state.servers[owner];
             o.last_active_ms = o.last_active_ms.max(c.last_active_ms);
             o.kept |= c.kept;
+            o.asked_stale |= c.asked_stale;
+            o.note = merge_notes(o.note.take(), c.note);
         }
     }
 
@@ -871,49 +966,49 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    const MIN: u64 = 60_000;
+    pub(super) const MIN: u64 = 60_000;
     /// Fake wall clock, milliseconds.
-    const T0: u64 = 1_800_000_000_000;
+    pub(super) const T0: u64 = 1_800_000_000_000;
     /// Base process start time, microseconds.
-    const START: u64 = 1_790_000_000_000_000;
+    pub(super) const START: u64 = 1_790_000_000_000_000;
     /// One second in microseconds: `procStart` has a one-second resolution.
-    const SEC: u64 = 1_000_000;
-    const TERM: i32 = libc::SIGTERM;
-    const KILL: i32 = libc::SIGKILL;
+    pub(super) const SEC: u64 = 1_000_000;
+    pub(super) const TERM: i32 = libc::SIGTERM;
+    pub(super) const KILL: i32 = libc::SIGKILL;
 
     /// launchd(1) > zsh(10) > claude(20, session "sess-a") > `bun run dev`
     /// (30, listens on 3000) > workerd (31). The server runs in
     /// `<repo>/wt/apps/web`, `<repo>/wt` being a linked worktree.
-    struct Fx {
-        data: TempDir,
-        claude: TempDir,
-        repo: TempDir,
-        wt: PathBuf,
-        w: Watcher<FakePlatform>,
+    pub(super) struct Fx {
+        pub(super) data: TempDir,
+        pub(super) claude: TempDir,
+        pub(super) repo: TempDir,
+        pub(super) wt: PathBuf,
+        pub(super) w: Watcher<FakePlatform>,
     }
 
     impl Fx {
-        fn p(&self) -> &FakePlatform {
+        pub(super) fn p(&self) -> &FakePlatform {
             self.w.platform()
         }
 
-        fn session(&self, pid: i32, id: &str, cwd: &Path, start: u64) {
+        pub(super) fn session(&self, pid: i32, id: &str, cwd: &Path, start: u64) {
             write_session(self.claude.path(), pid, id, cwd, start);
         }
 
-        fn cfg(&self) -> Config {
+        pub(super) fn cfg(&self) -> Config {
             crate::config::read_config(self.data.path()).unwrap()
         }
 
-        fn state_servers(&self) -> Vec<TrackedServer> {
+        pub(super) fn state_servers(&self) -> Vec<TrackedServer> {
             with_state(self.data.path(), |s| s.servers.clone()).unwrap()
         }
 
-        fn state_kills(&self) -> Vec<KillRecord> {
+        pub(super) fn state_kills(&self) -> Vec<KillRecord> {
             with_state(self.data.path(), |s| s.recent_kills.clone()).unwrap()
         }
 
-        fn kill_log(&self) -> Vec<KillRecord> {
+        pub(super) fn kill_log(&self) -> Vec<KillRecord> {
             let Ok(text) = fs::read_to_string(self.data.path().join("kills.log")) else {
                 return Vec::new();
             };
@@ -923,7 +1018,7 @@ mod tests {
         }
     }
 
-    fn write_session(claude: &Path, pid: i32, id: &str, cwd: &Path, start: u64) {
+    pub(super) fn write_session(claude: &Path, pid: i32, id: &str, cwd: &Path, start: u64) {
         let dir = claude.join("sessions");
         fs::create_dir_all(&dir).unwrap();
         let v = serde_json::json!({
@@ -937,7 +1032,7 @@ mod tests {
         fs::write(dir.join(format!("{pid}.json")), v.to_string()).unwrap();
     }
 
-    fn fx() -> Fx {
+    pub(super) fn fx() -> Fx {
         let data = tempfile::tempdir().unwrap();
         let claude = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
@@ -983,7 +1078,7 @@ mod tests {
         }
     }
 
-    fn key30() -> ServerKey {
+    pub(super) fn key30() -> ServerKey {
         ServerKey {
             pid: 30,
             start_time: START + 30 * SEC,
@@ -1018,6 +1113,8 @@ mod tests {
                 last_active_ms: T0,
                 kept: false,
                 alerted: false,
+                note: None,
+                asked_stale: false,
             }
         );
 
@@ -1523,6 +1620,8 @@ mod tests {
                 last_active_ms: 0,
                 kept: true,
                 alerted: false,
+                note: None,
+                asked_stale: false,
             })
         })
         .unwrap();
@@ -1584,6 +1683,28 @@ mod tests {
         f.p().remove_proc(20);
         assert!(f.w.tick(T0 + 20 * MIN).unwrap().killed.is_empty());
         assert!(f.p().is_alive(30));
+    }
+
+    #[test]
+    fn folded_notes_keep_the_cautious_side() {
+        let n = |keep, done, r: &str| {
+            Some(Note {
+                keep,
+                done,
+                reason: Some(r.into()),
+                set_at_ms: 1,
+            })
+        };
+        assert_eq!(merge_notes(None, None), None);
+        assert_eq!(merge_notes(None, n(false, true, "b")), n(false, true, "b"));
+        assert_eq!(
+            merge_notes(n(false, true, "a"), n(true, false, "b")),
+            n(true, false, "b")
+        );
+        assert_eq!(
+            merge_notes(n(false, true, "a"), n(false, true, "b")),
+            n(false, true, "a")
+        );
     }
 
     #[test]

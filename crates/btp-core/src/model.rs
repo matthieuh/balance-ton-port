@@ -13,6 +13,10 @@ pub struct TrackedServer {
     pub port: u16,
     pub command: String,
     pub worktree: PathBuf,
+    /// The conversation id (`sessionId` in the session file) at link time.
+    /// One Claude Code process can hold several conversations in a row
+    /// (`/clear`, `/resume`); `session_pid` and `session_proc_start` identify
+    /// the process, this field the conversation the server was started in.
     pub session_id: String,
     pub session_pid: i32,
     /// The session process start time as Claude Code writes it (`procStart`),
@@ -28,6 +32,40 @@ pub struct TrackedServer {
     pub last_active_ms: u64,
     pub kept: bool,
     pub alerted: bool,
+    /// The agent's intent for this server (`btp note`). Lives with this
+    /// process: a restart is a new row, so the note is gone.
+    #[serde(default)]
+    pub note: Option<Note>,
+    /// Already offered once as a leftover of an earlier conversation of the
+    /// same process (tier 3): never offered again.
+    #[serde(default)]
+    pub asked_stale: bool,
+}
+
+impl TrackedServer {
+    /// Kept by the user (Keep) or by the agent (`btp note --keep`).
+    pub fn is_kept(&self) -> bool {
+        self.kept || self.note.as_ref().is_some_and(|n| n.keep)
+    }
+
+    /// The agent said it is done with this server (`btp note --done`).
+    pub fn is_done(&self) -> bool {
+        self.note.as_ref().is_some_and(|n| n.done)
+    }
+}
+
+/// An agent intent note. It can only make the rules more cautious (`keep`)
+/// or speed up a kill they already allow (`done`), never more.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Note {
+    #[serde(default)]
+    pub keep: bool,
+    #[serde(default)]
+    pub done: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub set_at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,8 +83,15 @@ pub struct Observation {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum KillReason {
     WorktreeDeleted,
-    DeadSessionIdle { idle_ms: u64 },
+    DeadSessionIdle {
+        idle_ms: u64,
+    },
     Manual,
+    /// Killed when its Claude Code session process quit (SessionEnd hook).
+    SessionEnded,
+    /// Any kind this version does not know (written by a newer version).
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

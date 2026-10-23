@@ -64,6 +64,13 @@ jobs:
       - name: cargo test
         run: cargo test --locked
 
+      # Hooks and install script of the Claude Code plugin (fixtures, no
+      # network, temp HOME).
+      - name: Plugin tests
+        run: |
+          command -v shellcheck >/dev/null || brew install shellcheck
+          scripts/test-plugin.sh
+
       - name: Build xcframework
         run: scripts/build-xcframework.sh
 

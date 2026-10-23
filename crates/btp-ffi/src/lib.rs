@@ -5,19 +5,19 @@
 uniffi::setup_scaffolding!();
 
 use btp_core::config::{data_dir, read_config, save_config, Config};
-use btp_core::display::{format_idle, server_state, started_label};
+use btp_core::display::{format_idle, server_state, session_ended_body, started_label};
 use btp_core::labels::tool_label;
 use btp_core::model::{KillReason, KillTarget, ServerKey};
 use btp_core::platform::MacOs;
 use btp_core::sessions::default_config_dirs;
-use btp_core::state::{with_state, KillRecord};
+use btp_core::state::{with_state, KillRecord, SessionEndedGroup};
 use btp_core::watcher::{acquire_watch_lock, now_ms, ServerView, TickReport, WatchLock, Watcher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 /// Owner written into `watch.lock` while the app holds it.
-pub const APP_OWNER: &str = "Balance ton port.app";
+pub use btp_core::watcher::APP_OWNER;
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum BtpError {
@@ -98,6 +98,55 @@ pub struct ConfigFfi {
     pub exclude_ports: Vec<u16>,
 }
 
+/// One server a session end left running.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GroupServerFfi {
+    pub pid: i32,
+    pub start_time: u64,
+    pub port: u16,
+    pub tool_label: String,
+    /// A connection kept it open (a browser tab).
+    pub in_use: bool,
+}
+
+/// One ended Claude Code session whose kept servers are not notified yet.
+/// `session_pid`, `session_proc_start` and `at_ms` identify it.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SessionEndedFfi {
+    pub session_pid: i32,
+    pub session_proc_start: String,
+    pub at_ms: u64,
+    pub session_name: String,
+    /// The kept servers still tracked.
+    pub servers: Vec<GroupServerFfi>,
+    /// The notification body, the same text the hook posts.
+    pub body: String,
+}
+
+impl SessionEndedFfi {
+    /// `g` as the app notifies it; `dead_idle_s` is the dead-session delay.
+    pub fn at(g: &SessionEndedGroup, dead_idle_s: u64) -> Self {
+        SessionEndedFfi {
+            session_pid: g.session_pid,
+            session_proc_start: g.session_proc_start.clone(),
+            at_ms: g.at_ms,
+            session_name: g.session_name.clone(),
+            servers: g
+                .still_open
+                .iter()
+                .map(|s| GroupServerFfi {
+                    pid: s.key.pid,
+                    start_time: s.key.start_time,
+                    port: s.port,
+                    tool_label: s.tool_label.clone(),
+                    in_use: s.in_use,
+                })
+                .collect(),
+            body: session_ended_body(g, dead_idle_s),
+        }
+    }
+}
+
 /// The reason as the app shows it.
 pub fn reason_label(r: &KillReason) -> String {
     match r {
@@ -106,6 +155,8 @@ pub fn reason_label(r: &KillReason) -> String {
             format!("dead session + idle {}", format_idle(*idle_ms))
         }
         KillReason::Manual => "manual".to_string(),
+        KillReason::SessionEnded => "session ended".to_string(),
+        KillReason::Other => "other".to_string(),
     }
 }
 
@@ -241,6 +292,22 @@ impl Core {
     fn kill(&self, target: KillTarget) -> Result<Option<KillRecordFfi>, BtpError> {
         Ok(lock(&self.watcher).kill(target)?.as_ref().map(Into::into))
     }
+
+    /// The kept servers recorded for this ended session, marking it
+    /// delivered (its buttons were pressed, so it was seen).
+    fn take_group(
+        &self,
+        session_pid: i32,
+        session_proc_start: &str,
+        at_ms: u64,
+    ) -> Result<Vec<ServerKey>, BtpError> {
+        Ok(with_state(&self.dir, |s| {
+            s.mark_session_ended_delivered(session_pid, session_proc_start, at_ms);
+            s.session_ended_group(session_pid, session_proc_start, at_ms)
+                .map(|g| g.still_open.iter().map(|o| o.key).collect())
+                .unwrap_or_default()
+        })?)
+    }
 }
 
 impl Default for Core {
@@ -324,6 +391,69 @@ impl Core {
         let c: Config = c.into();
         c.validate().map_err(|message| BtpError::Io { message })?;
         Ok(save_config(&self.dir, &c)?)
+    }
+
+    /// Claims the ended sessions whose kept servers are not notified yet
+    /// (oldest first, each listing only its servers still tracked): they are
+    /// marked delivered under the state lock before this returns, so neither
+    /// the hook nor a later pass posts them too. Call it only when the
+    /// notification can be posted; hand back any whose `center.add` failed
+    /// with `unclaim_session_ended`. The body uses the dead-session delay of
+    /// the saved config.
+    pub fn claim_session_ended(&self) -> Result<Vec<SessionEndedFfi>, BtpError> {
+        let dead_idle_s = read_config(&self.dir)
+            .unwrap_or_else(|_| lock(&self.watcher).config())
+            .dead_session_idle_s;
+        let groups = with_state(&self.dir, |s| s.claim_session_ended())?;
+        Ok(groups
+            .iter()
+            .map(|g| SessionEndedFfi::at(g, dead_idle_s))
+            .collect())
+    }
+
+    /// Hands back a claimed group whose notification could not be added:
+    /// the next pass claims it again.
+    pub fn unclaim_session_ended(
+        &self,
+        session_pid: i32,
+        session_proc_start: String,
+        at_ms: u64,
+    ) -> Result<(), BtpError> {
+        Ok(with_state(&self.dir, |s| {
+            s.unmark_session_ended_delivered(session_pid, &session_proc_start, at_ms)
+        })?)
+    }
+
+    /// "Stop now": stops every kept server of this ended session through
+    /// `kill_server` (exact pid and start time; a server gone or restarted
+    /// is skipped). Returns the kills made. Blocking.
+    pub fn stop_session_ended(
+        &self,
+        session_pid: i32,
+        session_proc_start: String,
+        at_ms: u64,
+    ) -> Result<Vec<KillRecordFfi>, BtpError> {
+        let keys = self.take_group(session_pid, &session_proc_start, at_ms)?;
+        let mut kills = Vec::new();
+        for key in keys {
+            if let Some(r) = self.kill_server(key.pid, key.start_time)? {
+                kills.push(r);
+            }
+        }
+        Ok(kills)
+    }
+
+    /// "Keep": Keep on every kept server of this ended session.
+    pub fn keep_session_ended(
+        &self,
+        session_pid: i32,
+        session_proc_start: String,
+        at_ms: u64,
+    ) -> Result<(), BtpError> {
+        for key in self.take_group(session_pid, &session_proc_start, at_ms)? {
+            self.keep(key.pid, key.start_time)?;
+        }
+        Ok(())
     }
 
     /// The last kills, newest first.
@@ -490,6 +620,198 @@ mod tests {
         assert_eq!(core.kill_server(me, 1).unwrap(), None);
         core.mark_alerted(me, 1).unwrap();
         assert!(core.observe().unwrap().servers.is_empty());
+    }
+
+    /// A state with one tracked server (pid not running) and one undelivered
+    /// group naming it and a server no longer tracked.
+    fn seed_group(dir: &Path) -> (i32, String, u64) {
+        use btp_core::model::TrackedServer;
+        use btp_core::state::GroupServer;
+        let dead_pid = 999_999;
+        let start = "Thu Oct 22 10:00:00 2026".to_string();
+        with_state(dir, |s| {
+            s.servers.push(TrackedServer {
+                key: ServerKey {
+                    pid: dead_pid,
+                    start_time: 1,
+                },
+                port: 5173,
+                command: "node vite".into(),
+                worktree: "/tmp/w".into(),
+                session_id: "c".into(),
+                session_pid: 50,
+                session_proc_start: start.clone(),
+                session_name: "web".into(),
+                first_seen_ms: 0,
+                last_active_ms: 0,
+                kept: false,
+                alerted: false,
+                note: None,
+                asked_stale: false,
+            });
+            let open = |pid, port| GroupServer {
+                key: ServerKey { pid, start_time: 1 },
+                port,
+                tool_label: "Vite".into(),
+                in_use: false,
+            };
+            s.record_session_ended(SessionEndedGroup {
+                session_pid: 50,
+                session_proc_start: start.clone(),
+                conversation_id: String::new(),
+                session_name: "web".into(),
+                at_ms: 7,
+                stopped: Vec::new(),
+                still_open: vec![open(dead_pid, 5173), open(dead_pid + 1, 3000)],
+                delivered: false,
+            });
+        })
+        .unwrap();
+        (50, start, 7)
+    }
+
+    #[test]
+    fn claim_session_ended_lists_tracked_servers_with_the_hook_text() {
+        let d = tempfile::tempdir().unwrap();
+        let core = Core::at(d.path().to_path_buf(), Vec::new);
+        assert!(core.claim_session_ended().unwrap().is_empty());
+        let (pid, start, at) = seed_group(d.path());
+        let mut c = core.config().unwrap();
+        c.dead_session_idle_s = 1800;
+        core.set_config(c).unwrap();
+        let pending = core.claim_session_ended().unwrap();
+        assert_eq!(pending.len(), 1);
+        let g = &pending[0];
+        assert_eq!(
+            (g.session_pid, g.session_proc_start.as_str(), g.at_ms),
+            (pid, start.as_str(), at)
+        );
+        assert_eq!(g.session_name, "web");
+        assert_eq!(g.servers.len(), 1);
+        assert_eq!((g.servers[0].pid, g.servers[0].port), (999_999, 5173));
+        assert_eq!(
+            g.body,
+            "Session ended: 1 server kept running: Vite :5173. Stopped after 30 min unused, once no session works in that folder."
+        );
+        // Claimed: not handed out twice, until given back.
+        assert!(core.claim_session_ended().unwrap().is_empty());
+        core.unclaim_session_ended(pid, start, at).unwrap();
+        assert_eq!(core.claim_session_ended().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn keep_session_ended_keeps_each_server_and_marks_delivered() {
+        let d = tempfile::tempdir().unwrap();
+        let core = Core::at(d.path().to_path_buf(), Vec::new);
+        let (pid, start, at) = seed_group(d.path());
+        core.keep_session_ended(pid, start, at).unwrap();
+        let (kept, delivered) = with_state(d.path(), |s| {
+            (s.servers[0].kept, s.session_ended[0].delivered)
+        })
+        .unwrap();
+        assert!(kept && delivered);
+    }
+
+    #[test]
+    fn stop_session_ended_never_touches_a_server_not_running() {
+        let d = tempfile::tempdir().unwrap();
+        let core = Core::at(d.path().to_path_buf(), Vec::new);
+        let (pid, start, at) = seed_group(d.path());
+        assert!(core
+            .stop_session_ended(pid, start.clone(), at)
+            .unwrap()
+            .is_empty());
+        assert!(core.claim_session_ended().unwrap().is_empty());
+        // An unknown group stops nothing.
+        assert!(core
+            .stop_session_ended(pid, start, at + 1)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn stop_session_ended_kills_only_the_exact_process() {
+        use btp_core::model::TrackedServer;
+        use btp_core::platform::Platform;
+        use btp_core::state::GroupServer;
+        let d = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let core = Core::at(d.path().to_path_buf(), Vec::new);
+        let mut c = core.config().unwrap();
+        c.claude_config_dirs = vec![sessions.path().display().to_string()];
+        c.kill_grace_s = 2;
+        core.set_config(c).unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let start_time = MacOs.proc_info(pid).unwrap().start_time;
+        let me = std::process::id() as i32;
+        let session = "Thu Oct 22 10:00:00 2026".to_string();
+        with_state(d.path(), |s| {
+            s.servers.push(TrackedServer {
+                key: ServerKey { pid, start_time },
+                port: 5173,
+                command: "sleep 30".into(),
+                worktree: "/tmp/w".into(),
+                session_id: "c".into(),
+                // The test process: no ancestor of the child between them.
+                session_pid: me,
+                session_proc_start: session.clone(),
+                session_name: "web".into(),
+                first_seen_ms: 0,
+                last_active_ms: 0,
+                kept: false,
+                alerted: false,
+                note: None,
+                asked_stale: false,
+            });
+            for (at_ms, start) in [(7, start_time + 1), (8, start_time)] {
+                s.record_session_ended(SessionEndedGroup {
+                    session_pid: me,
+                    session_proc_start: session.clone(),
+                    conversation_id: String::new(),
+                    session_name: "web".into(),
+                    at_ms,
+                    stopped: Vec::new(),
+                    still_open: vec![GroupServer {
+                        key: ServerKey {
+                            pid,
+                            start_time: start,
+                        },
+                        port: 5173,
+                        tool_label: "sleep".into(),
+                        in_use: false,
+                    }],
+                    delivered: false,
+                });
+            }
+        })
+        .unwrap();
+        // A wrong start time: another process for all we know, spared.
+        let none = core.stop_session_ended(me, session.clone(), 7).unwrap();
+        assert!(none.is_empty());
+        assert!(child.try_wait().unwrap().is_none(), "spared");
+        // The exact process: stopped and reported.
+        let kills = core.stop_session_ended(me, session, 8).unwrap();
+        assert_eq!(kills.len(), 1);
+        assert_eq!(kills[0].port, 5173);
+        assert_eq!(kills[0].reason, "manual");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut gone = false;
+        while std::time::Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if !gone {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(gone, "the sleep child was stopped");
     }
 
     #[test]

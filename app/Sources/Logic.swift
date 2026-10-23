@@ -118,6 +118,98 @@ func serverID(fromUserInfo info: [AnyHashable: Any]) -> ServerID? {
     return ServerID(pid: pid, startTime: start)
 }
 
+// MARK: - Session ended
+
+/// An ended Claude Code session's group: the process (pid and start time)
+/// and when it ended.
+struct SessionEndedID: Hashable, Sendable {
+    let sessionPid: Int32
+    let sessionProcStart: String
+    let atMs: UInt64
+}
+
+extension SessionEndedFfi {
+    var id: SessionEndedID {
+        SessionEndedID(sessionPid: sessionPid, sessionProcStart: sessionProcStart, atMs: atMs)
+    }
+}
+
+/// The notification identifier: a repeat replaces the earlier one.
+func sessionEndedRequestID(_ id: SessionEndedID) -> String {
+    "session-ended-\(id.sessionPid)-\(id.atMs)"
+}
+
+/// What a session-ended notification carries to find its group again. Times
+/// are strings: property lists have no unsigned 64-bit integer.
+func sessionEndedUserInfo(_ id: SessionEndedID) -> [String: Any] {
+    [
+        "sessionEnded": true,
+        "sessionPid": Int(id.sessionPid),
+        "sessionProcStart": id.sessionProcStart,
+        "atMs": String(id.atMs),
+    ]
+}
+
+func sessionEndedID(fromUserInfo info: [AnyHashable: Any]) -> SessionEndedID? {
+    guard info["sessionEnded"] as? Bool == true,
+          let pid = (info["sessionPid"] as? NSNumber)?.int32Value,
+          let start = info["sessionProcStart"] as? String, !start.isEmpty,
+          let atText = info["atMs"] as? String,
+          let at = UInt64(atText)
+    else { return nil }
+    return SessionEndedID(sessionPid: pid, sessionProcStart: start, atMs: at)
+}
+
+// MARK: - Notification buttons
+
+/// The idle-server notification's buttons.
+enum NotificationAction: Sendable, Equatable {
+    case kill
+    case keep
+}
+
+/// The session-ended notification's buttons.
+enum SessionEndedAction: Sendable, Equatable {
+    /// Stop every kept server of the session now.
+    case stopNow
+    /// Keep on each of them.
+    case keep
+}
+
+/// Category and action identifiers registered with Notification Center.
+enum NotificationIDs {
+    static let idleCategory = "IDLE_SERVER"
+    static let sessionEndedCategory = "SESSION_ENDED"
+    static let kill = "KILL"
+    static let keep = "KEEP"
+    static let stopNow = "STOP_NOW"
+}
+
+/// Where a pressed notification button goes.
+enum NotificationRoute: Equatable, Sendable {
+    case server(NotificationAction, ServerID)
+    case sessionEnded(SessionEndedAction, SessionEndedID)
+}
+
+/// The route for a button press; `nil` for a tap on the body, a dismiss, the
+/// test notification, or a userInfo that names nothing.
+func notificationRoute(actionIdentifier: String, userInfo info: [AnyHashable: Any]) -> NotificationRoute? {
+    if isSampleNotification(info) { return nil }
+    if let group = sessionEndedID(fromUserInfo: info) {
+        switch actionIdentifier {
+        case NotificationIDs.stopNow: return .sessionEnded(.stopNow, group)
+        case NotificationIDs.keep: return .sessionEnded(.keep, group)
+        default: return nil
+        }
+    }
+    guard let id = serverID(fromUserInfo: info) else { return nil }
+    switch actionIdentifier {
+    case NotificationIDs.kill: return .server(.kill, id)
+    case NotificationIDs.keep: return .server(.keep, id)
+    default: return nil
+    }
+}
+
 // MARK: - Notification permission
 
 /// What macOS lets the app do with notifications, as the Settings section
@@ -178,7 +270,7 @@ func notificationSetup(_ permission: NotificationPermission) -> NotificationSetu
     switch permission {
     case .notAsked:
         return NotificationSetup(
-            message: "Get a notification when a server sits idle, with Kill and Keep buttons.",
+            message: "Get a notification for servers that sit idle and for sessions that end with servers still running, with buttons to stop or keep them.",
             isOn: false, hint: nil, button: .turnOn, canSendTest: false
         )
     case .allowed(let bannersOff):

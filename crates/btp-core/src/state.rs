@@ -1,4 +1,4 @@
-use crate::model::{KillReason, TrackedServer};
+use crate::model::{KillReason, ServerKey, TrackedServer};
 use fs4::FileExt;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -6,6 +6,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 const MAX_RECENT_KILLS: usize = 5;
+/// Session-ended groups kept in the state (oldest dropped first).
+const MAX_SESSION_ENDED: usize = 20;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KillRecord {
@@ -22,6 +24,54 @@ pub struct State {
     pub servers: Vec<TrackedServer>,
     #[serde(default)]
     pub recent_kills: Vec<KillRecord>,
+    /// What each session end did, for one grouped notification per ended
+    /// session (oldest first).
+    #[serde(default)]
+    pub session_ended: Vec<SessionEndedGroup>,
+}
+
+/// One server named in a session-ended group.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupServer {
+    pub key: ServerKey,
+    pub port: u16,
+    pub tool_label: String,
+    /// Still open only: `true` when a connection kept it (a browser tab),
+    /// `false` when it was kept on purpose (Keep or a keep note).
+    #[serde(default)]
+    pub in_use: bool,
+}
+
+/// What `btp session-end` did for one Claude Code process that quit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionEndedGroup {
+    pub session_pid: i32,
+    pub session_proc_start: String,
+    /// The conversation id the hook passed, empty when it passed none.
+    #[serde(default)]
+    pub conversation_id: String,
+    #[serde(default)]
+    pub session_name: String,
+    pub at_ms: u64,
+    /// Servers sent SIGTERM.
+    #[serde(default)]
+    pub stopped: Vec<GroupServer>,
+    /// Servers of that session left running.
+    #[serde(default)]
+    pub still_open: Vec<GroupServer>,
+    /// The notification went out (posted by the hook itself when no app
+    /// held the watch lock, else set by the app once delivered).
+    #[serde(default)]
+    pub delivered: bool,
+}
+
+impl SessionEndedGroup {
+    /// This group's identity: the ended process and when it ended.
+    pub fn is(&self, session_pid: i32, session_proc_start: &str, at_ms: u64) -> bool {
+        self.session_pid == session_pid
+            && self.session_proc_start == session_proc_start
+            && self.at_ms == at_ms
+    }
 }
 
 impl State {
@@ -29,6 +79,87 @@ impl State {
     pub fn record_kill(&mut self, r: KillRecord) {
         self.recent_kills.insert(0, r);
         self.recent_kills.truncate(MAX_RECENT_KILLS);
+    }
+
+    /// The groups not notified yet (oldest first), each narrowed to its kept
+    /// servers still tracked. A group with none left is marked delivered
+    /// here: there is nothing to tell any more.
+    pub fn pending_session_ended(&mut self) -> Vec<SessionEndedGroup> {
+        let tracked: Vec<ServerKey> = self.servers.iter().map(|s| s.key).collect();
+        let mut pending = Vec::new();
+        for g in self.session_ended.iter_mut().filter(|g| !g.delivered) {
+            let mut left = g.clone();
+            left.still_open.retain(|s| tracked.contains(&s.key));
+            if left.still_open.is_empty() {
+                g.delivered = true;
+            } else {
+                pending.push(left);
+            }
+        }
+        pending
+    }
+
+    /// `pending_session_ended`, each returned group marked delivered in the
+    /// same state-lock section: whoever claims a group is the only one to
+    /// post it. A failed post calls `unmark_session_ended_delivered`.
+    pub fn claim_session_ended(&mut self) -> Vec<SessionEndedGroup> {
+        let claimed = self.pending_session_ended();
+        for g in &claimed {
+            self.mark_session_ended_delivered(g.session_pid, &g.session_proc_start, g.at_ms);
+        }
+        claimed
+    }
+
+    /// Hands a claimed group back (its notification could not be added), so
+    /// the next pass tries again.
+    pub fn unmark_session_ended_delivered(
+        &mut self,
+        session_pid: i32,
+        session_proc_start: &str,
+        at_ms: u64,
+    ) {
+        for g in self
+            .session_ended
+            .iter_mut()
+            .filter(|g| g.is(session_pid, session_proc_start, at_ms))
+        {
+            g.delivered = false;
+        }
+    }
+
+    /// The group with this identity, if still recorded.
+    pub fn session_ended_group(
+        &self,
+        session_pid: i32,
+        session_proc_start: &str,
+        at_ms: u64,
+    ) -> Option<&SessionEndedGroup> {
+        self.session_ended
+            .iter()
+            .find(|g| g.is(session_pid, session_proc_start, at_ms))
+    }
+
+    /// Records that this group's notification went out.
+    pub fn mark_session_ended_delivered(
+        &mut self,
+        session_pid: i32,
+        session_proc_start: &str,
+        at_ms: u64,
+    ) {
+        for g in self
+            .session_ended
+            .iter_mut()
+            .filter(|g| g.is(session_pid, session_proc_start, at_ms))
+        {
+            g.delivered = true;
+        }
+    }
+
+    /// Appends a group and keeps the 20 newest.
+    pub fn record_session_ended(&mut self, g: SessionEndedGroup) {
+        self.session_ended.push(g);
+        let extra = self.session_ended.len().saturating_sub(MAX_SESSION_ENDED);
+        self.session_ended.drain(..extra);
     }
 }
 
@@ -126,6 +257,8 @@ mod tests {
             last_active_ms: 0,
             kept: false,
             alerted: false,
+            note: None,
+            asked_stale: false,
         }
     }
 
@@ -214,6 +347,150 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(with_state(&dir, |s| s.servers.len()).unwrap(), 200);
+    }
+
+    #[test]
+    fn session_ended_reason_is_kind_session_ended() {
+        let json = serde_json::to_value(KillReason::SessionEnded).unwrap();
+        assert_eq!(json, serde_json::json!({"kind": "session_ended"}));
+        let back: KillReason = serde_json::from_value(json).unwrap();
+        assert_eq!(back, KillReason::SessionEnded);
+    }
+
+    #[test]
+    fn unknown_reason_kind_decodes_as_other() {
+        let r: KillReason =
+            serde_json::from_str(r#"{"kind": "made_up_later", "extra": 3}"#).unwrap();
+        assert_eq!(r, KillReason::Other);
+        let r: KillRecord = serde_json::from_str(
+            r#"{"port": 1, "command": "c", "worktree": "/w", "reason": {"kind": "nope"}, "at_ms": 2}"#,
+        )
+        .unwrap();
+        assert_eq!(r.reason, KillReason::Other);
+        let known: KillReason =
+            serde_json::from_str(r#"{"kind": "dead_session_idle", "idle_ms": 5}"#).unwrap();
+        assert_eq!(known, KillReason::DeadSessionIdle { idle_ms: 5 });
+    }
+
+    #[test]
+    fn legacy_state_without_new_fields_loads() {
+        let d = tempfile::tempdir().unwrap();
+        let legacy = r#"{
+          "servers": [{
+            "key": {"pid": 7, "start_time": 1},
+            "port": 3000, "command": "node", "worktree": "/tmp/w",
+            "session_id": "s", "session_pid": 1,
+            "session_proc_start": "x", "session_name": "x",
+            "first_seen_ms": 0, "last_active_ms": 0,
+            "kept": true, "alerted": false
+          }],
+          "recent_kills": [{"port": 3000, "command": "node", "worktree": "/tmp/w",
+                            "reason": {"kind": "manual"}, "at_ms": 1}]
+        }"#;
+        fs::write(d.path().join("state.json"), legacy).unwrap();
+        let (servers, kills) =
+            with_state(d.path(), |s| (s.servers.clone(), s.recent_kills.clone())).unwrap();
+        assert!(!d.path().join("state.json.corrupt").exists());
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].note, None);
+        assert!(!servers[0].asked_stale);
+        assert!(servers[0].kept);
+        assert_eq!(kills[0].reason, KillReason::Manual);
+    }
+
+    #[test]
+    fn note_and_asked_stale_round_trip() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = server(7);
+        s.note = Some(crate::model::Note {
+            keep: true,
+            done: false,
+            reason: Some("testing the form".into()),
+            set_at_ms: 42,
+        });
+        s.asked_stale = true;
+        let saved = s.clone();
+        with_state(d.path(), |st| st.servers.push(s)).unwrap();
+        let back = with_state(d.path(), |st| st.servers.clone()).unwrap();
+        assert_eq!(back, vec![saved]);
+    }
+
+    fn group(at_ms: u64, pids: &[i32]) -> SessionEndedGroup {
+        SessionEndedGroup {
+            session_pid: 50,
+            session_proc_start: "Thu Oct 22 10:00:00 2026".into(),
+            conversation_id: String::new(),
+            session_name: "web".into(),
+            at_ms,
+            stopped: Vec::new(),
+            still_open: pids
+                .iter()
+                .map(|&pid| GroupServer {
+                    key: ServerKey { pid, start_time: 1 },
+                    port: 3000,
+                    tool_label: "Vite".into(),
+                    in_use: false,
+                })
+                .collect(),
+            delivered: false,
+        }
+    }
+
+    #[test]
+    fn pending_groups_list_only_servers_still_tracked() {
+        let mut s = State::default();
+        s.servers.push(server(1));
+        s.record_session_ended(group(10, &[1, 2]));
+        let pending = s.pending_session_ended();
+        assert_eq!(pending.len(), 1);
+        let pids: Vec<i32> = pending[0].still_open.iter().map(|g| g.key.pid).collect();
+        assert_eq!(pids, vec![1]);
+        // The stored group is left whole and undelivered.
+        assert_eq!(s.session_ended[0].still_open.len(), 2);
+        assert!(!s.session_ended[0].delivered);
+    }
+
+    #[test]
+    fn a_group_with_nothing_left_is_marked_delivered_and_not_listed() {
+        let mut s = State::default();
+        s.record_session_ended(group(10, &[1]));
+        assert!(s.pending_session_ended().is_empty());
+        assert!(s.session_ended[0].delivered);
+    }
+
+    #[test]
+    fn delivered_groups_are_not_pending_and_marking_targets_one_group() {
+        let mut s = State::default();
+        s.servers.push(server(1));
+        s.record_session_ended(group(10, &[1]));
+        s.record_session_ended(group(20, &[1]));
+        s.mark_session_ended_delivered(50, "Thu Oct 22 10:00:00 2026", 10);
+        let pending = s.pending_session_ended();
+        assert_eq!(
+            pending.iter().map(|g| g.at_ms).collect::<Vec<_>>(),
+            vec![20]
+        );
+        // Another start time is another process: untouched.
+        s.mark_session_ended_delivered(50, "other", 20);
+        assert_eq!(s.pending_session_ended().len(), 1);
+        assert!(s
+            .session_ended_group(50, "Thu Oct 22 10:00:00 2026", 20)
+            .is_some());
+        assert!(s
+            .session_ended_group(50, "Thu Oct 22 10:00:00 2026", 30)
+            .is_none());
+    }
+
+    #[test]
+    fn a_claimed_group_is_claimed_once_until_handed_back() {
+        let mut s = State::default();
+        s.servers.push(server(1));
+        s.record_session_ended(group(10, &[1]));
+        assert_eq!(s.claim_session_ended().len(), 1);
+        assert!(s.session_ended[0].delivered);
+        assert!(s.claim_session_ended().is_empty());
+        s.unmark_session_ended_delivered(50, "Thu Oct 22 10:00:00 2026", 10);
+        assert_eq!(s.claim_session_ended().len(), 1);
     }
 
     #[test]

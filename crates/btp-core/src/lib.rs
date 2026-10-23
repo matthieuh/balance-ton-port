@@ -4,6 +4,7 @@ pub mod display;
 pub mod labels;
 pub mod model;
 pub mod platform;
+pub mod session_end;
 pub mod sessions;
 pub mod state;
 pub mod watcher;

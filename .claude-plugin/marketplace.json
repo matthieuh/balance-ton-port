@@ -1,0 +1,14 @@
+{
+  "name": "balance-ton-port",
+  "description": "Balance ton port: dev server cleanup for Claude Code sessions on macOS",
+  "owner": {
+    "name": "Matthieu Hostache"
+  },
+  "plugins": [
+    {
+      "name": "balance-ton-port",
+      "source": "./plugin",
+      "description": "Stops the idle dev servers of a Claude Code session when it quits, and ships the btp agent skill"
+    }
+  ]
+}

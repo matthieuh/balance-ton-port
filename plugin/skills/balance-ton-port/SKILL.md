@@ -17,6 +17,15 @@ Run `btp list --json` and read the `servers` array. Each entry has `port` (its m
 - The port is held by another live session's server (`session_alive` is `true`, other worktree): never touch it. Pick another port.
 - The port is not in the list but is taken: it was not started from a Claude Code session, so `btp` does not manage it. Do not kill it, pick another port.
 
+## Tell btp your intent
+
+When the session quits, btp stops nothing at once: the servers still running were kept on purpose, and each is stopped once unused for 20 minutes (the dead-session rule). Tell it what you meant a server for, right after you start it or once you are done with it:
+
+- `btp note <port> --keep "<why>"` when you start a server for the user to look at (a preview, a demo): it gets no idle alert and is never offered for cleanup in a later conversation. Give a short reason the user will recognise, for example `btp note 5173 --keep "preview of the new pricing page"`.
+- `btp note <port> --done` when the check you started it for is finished: once the session has quit, it is stopped as soon as it is idle, without waiting the 20 minutes and without asking.
+
+A note only applies to a server of your own session (exit 1 otherwise: leave it alone). It never stops a server that is in use, excluded, or shared with another live session.
+
 ## When you finish a task
 
 Run `btp sweep`. It kills only the servers whose worktree was deleted, or whose session is dead and idle. Add `--dry-run` to see what it would kill first.
@@ -37,6 +46,9 @@ btp kill 4322            # kill the tracked server on port 4322
 btp kill --pid 12345     # kill a tracked server by pid
 btp sweep --dry-run      # show what the automatic rules would kill
 btp sweep                # apply them
+btp note 5173 --keep "preview for the user"   # no idle alert, not offered after /clear
+btp note 5173 --done     # once the session quit, stopped as soon as idle
+btp recent               # the last kills and why
 ```
 
-`recent_kills` entries carry a `reason` of `{"kind": "manual"}`, `{"kind": "worktree_deleted"}` or `{"kind": "dead_session_idle", "idle_ms": ...}`.
+`recent_kills` entries carry a `reason` of `{"kind": "manual"}`, `{"kind": "worktree_deleted"}`, `{"kind": "dead_session_idle", "idle_ms": ...}`, or `{"kind": "other"}` for a kind written by a newer btp.

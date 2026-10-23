@@ -38,11 +38,13 @@ final class CoreModel: ObservableObject {
     private let notifier = Notifier()
 
     init() {
-        notifier.onAction = { [weak self] action, id in
+        notifier.onAction = { [weak self] route in
             guard let self else { return }
-            switch action {
-            case .kill: self.kill(id, fromNotification: true)
-            case .keep: self.keep(id)
+            switch route {
+            case .server(.kill, let id): self.kill(id, fromNotification: true)
+            case .server(.keep, let id): self.keep(id)
+            case .sessionEnded(.stopNow, let id): self.stopSessionEnded(id)
+            case .sessionEnded(.keep, let id): self.keepSessionEnded(id)
             }
         }
         scheduleNextPass(after: 0)
@@ -128,6 +130,40 @@ final class CoreModel: ObservableObject {
         }
     }
 
+    /// A session-ended notification's Stop now: stops each kept server of
+    /// that session (exact pid and start time; one gone or restarted is
+    /// skipped).
+    func stopSessionEnded(_ id: SessionEndedID) {
+        Task {
+            do {
+                recentKills = try await onCore { core in
+                    _ = try core.stopSessionEnded(
+                        sessionPid: id.sessionPid, sessionProcStart: id.sessionProcStart, atMs: id.atMs
+                    )
+                    return try core.recentKills()
+                }
+            } catch {
+                lastError = error.localizedDescription
+            }
+        }
+    }
+
+    /// A session-ended notification's Keep: Keep on each kept server of that
+    /// session.
+    func keepSessionEnded(_ id: SessionEndedID) {
+        Task {
+            do {
+                try await onCore { core in
+                    try core.keepSessionEnded(
+                        sessionPid: id.sessionPid, sessionProcStart: id.sessionProcStart, atMs: id.atMs
+                    )
+                }
+            } catch {
+                lastError = error.localizedDescription
+            }
+        }
+    }
+
     /// The config as saved on disk (defaults when there is no file), whose
     /// `claudeConfigDirs` are the extras, plus the dirs found automatically.
     /// Throws when `config.toml` cannot be parsed: the form must not show (and
@@ -203,10 +239,46 @@ final class CoreModel: ObservableObject {
             await refreshNotificationPermission()
             interval = TimeInterval(max(1, result.scanIntervalS))
             lastError = result.configError
+            await deliverSessionEnded()
         } catch {
             lastError = error.localizedDescription
         }
         scheduleNextPass(after: interval)
+    }
+
+    /// One notification per ended session that kept servers running. The
+    /// hook leaves a group to the app only when the app holds the watch lock,
+    /// and the app posts it whether or not it still does. Claim, then post:
+    /// claiming marks a group delivered under the state lock, so nobody
+    /// posts it twice; one whose `center.add` failed is handed back for the
+    /// next pass. With notifications off nothing is claimed (the menu's
+    /// notifications line says so).
+    private func deliverSessionEnded() async {
+        guard await notifier.canPost() else { return }
+        let claimed: [SessionEndedFfi]
+        do {
+            claimed = try await onCore { core in try core.claimSessionEnded() }
+        } catch {
+            lastError = error.localizedDescription
+            return
+        }
+        guard !claimed.isEmpty else { return }
+        let delivered = Set(await notifier.postSessionEnded(claimed))
+        let failed = claimed.map(\.id).filter { !delivered.contains($0) }
+        guard !failed.isEmpty else { return }
+        // Its own catch: a failed hand-back leaves the group marked, so it
+        // is not posted again rather than posted on every pass.
+        do {
+            try await onCore { core in
+                for id in failed {
+                    try core.unclaimSessionEnded(
+                        sessionPid: id.sessionPid, sessionProcStart: id.sessionProcStart, atMs: id.atMs
+                    )
+                }
+            }
+        } catch {
+            lastError = error.localizedDescription
+        }
     }
 
     private func scheduleNextPass(after interval: TimeInterval) {

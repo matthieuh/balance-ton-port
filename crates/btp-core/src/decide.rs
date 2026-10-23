@@ -31,7 +31,10 @@ pub fn decide(
         }
         let port_idle = now_ms.saturating_sub(s.last_active_ms);
         if !o.session_alive {
-            if port_idle >= dead_idle_ms {
+            // `btp note --done` (and no Keep): eligible as soon as idle,
+            // never while a connection is open.
+            let done_and_idle = s.is_done() && !s.is_kept() && o.established == 0;
+            if port_idle >= dead_idle_ms || done_and_idle {
                 actions.push(Action::Kill {
                     key,
                     reason: KillReason::DeadSessionIdle { idle_ms: port_idle },
@@ -39,7 +42,7 @@ pub fn decide(
             }
             continue;
         }
-        if !s.kept && !s.alerted {
+        if !s.is_kept() && !s.alerted {
             let idle = port_idle.max(o.session_idle_ms.unwrap_or(0));
             if idle >= alert_ms {
                 actions.push(Action::Alert { key, idle_ms: idle });
@@ -81,6 +84,8 @@ mod tests {
             last_active_ms: 0,
             kept: false,
             alerted: false,
+            note: None,
+            asked_stale: false,
         }
     }
 
@@ -211,6 +216,57 @@ mod tests {
         let mut s = server(1);
         s.kept = true;
         assert!(run(&s, &obs(1), 500 * MIN).is_empty());
+    }
+
+    #[test]
+    fn keep_note_never_alerts() {
+        let mut s = server(1);
+        s.note = Some(crate::model::Note {
+            keep: true,
+            done: false,
+            reason: None,
+            set_at_ms: 0,
+        });
+        assert!(run(&s, &obs(1), 500 * MIN).is_empty());
+    }
+
+    #[test]
+    fn keep_notes_never_change_the_dead_session_rule() {
+        let mut o = obs(1);
+        o.session_alive = false;
+        let mut s = server(1);
+        s.note = Some(crate::model::Note {
+            keep: true,
+            done: false,
+            reason: None,
+            set_at_ms: 0,
+        });
+        assert!(run(&s, &o, 19 * MIN).is_empty());
+        assert_eq!(run(&s, &o, 20 * MIN).len(), 1);
+    }
+
+    #[test]
+    fn a_done_note_is_eligible_as_soon_as_idle_once_the_session_is_dead() {
+        let mut o = obs(1);
+        o.session_alive = false;
+        let mut s = server(1);
+        s.note = Some(crate::model::Note {
+            keep: false,
+            done: true,
+            reason: None,
+            set_at_ms: 0,
+        });
+        assert_eq!(run(&s, &o, MIN).len(), 1);
+        // Never with a connection open, never while the session lives,
+        // never over the user's Keep.
+        o.established = 1;
+        assert!(run(&s, &o, MIN).is_empty());
+        o.established = 0;
+        o.session_alive = true;
+        assert!(run(&s, &o, MIN).is_empty());
+        o.session_alive = false;
+        s.kept = true;
+        assert!(run(&s, &o, MIN).is_empty());
     }
 
     #[test]
