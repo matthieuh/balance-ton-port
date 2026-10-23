@@ -18,6 +18,10 @@ use crate::model::{Action, KillReason, KillTarget, Note, Observation, ServerKey,
 use crate::observed::{observed_servers_cached, ObservedServer, SystemCache};
 use crate::platform::{ancestry, format_proc_start, Listener, Platform, ProcInfo, ProcResources};
 use crate::probe::{PageMeta, ProbeCache, ProbeOutcome};
+use crate::restart::{
+    log_path, pending_for, plan_restart, relinked, wait_port_free, CommandSpawner, PendingRestart,
+    RestartBlocked, Spawner, RESTART_LINK_MS,
+};
 use crate::session_end::session_ended_open;
 use crate::sessions::default_config_dirs;
 use crate::state::{append_kill_log, with_state, KillRecord, State};
@@ -215,6 +219,7 @@ pub fn link(
         asked_stale: false,
         agent: session.agent,
         postponed_until_ms: None,
+        restarted_from: None,
     })
 }
 
@@ -237,6 +242,8 @@ struct Feed {
     established: u32,
     /// Always `true` for an observed server, which has no session.
     session_alive: bool,
+    /// When it was restarted by the app (`Restart`), for its first event.
+    restarted_at: Option<u64>,
 }
 
 /// A tracked server's process tree as seen in one pass: the server and its
@@ -574,6 +581,11 @@ pub struct Watcher<P: Platform> {
     idle_ignored: HashSet<ServerKey>,
     /// The cards of the last `tick` or `observe`, for `ignore_alert`.
     last_cards: HashMap<ServerKey, NeedsYou>,
+    /// Starts a restart's process.
+    spawner: Box<dyn Spawner>,
+    /// How long a restart waits for the port to be free, and how often it
+    /// looks.
+    restart_wait: (Duration, Duration),
 }
 
 impl<P: Platform> Watcher<P> {
@@ -596,7 +608,22 @@ impl<P: Platform> Watcher<P> {
             leaks: LeakAlerts::default(),
             idle_ignored: HashSet::new(),
             last_cards: HashMap::new(),
+            spawner: Box::new(CommandSpawner),
+            restart_wait: (Duration::from_secs(5), Duration::from_millis(100)),
         }
+    }
+
+    /// Replaces the process spawner of `restart` (tests never run a real
+    /// program).
+    pub fn with_spawner(mut self, spawner: Box<dyn Spawner>) -> Self {
+        self.spawner = spawner;
+        self
+    }
+
+    /// Replaces how long `restart` waits for the port (5 s, every 100 ms).
+    pub fn with_restart_wait(mut self, limit: Duration, interval: Duration) -> Self {
+        self.restart_wait = (limit, interval);
+        self
     }
 
     /// Memory, CPU and events of every server seen by the passes so far.
@@ -774,20 +801,116 @@ impl<P: Platform> Watcher<P> {
         else {
             return Ok(None);
         };
-        let grace = Duration::from_secs(scan.cfg.kill_grace_s);
-        if !kill_tree(&self.platform, key, grace, &scan.cfg) {
+        self.stop_observed_now(&o, &scan.cfg, now)
+    }
+
+    /// Kills an observed server's tree and records a manual kill; `None`
+    /// when the kill sent nothing.
+    fn stop_observed_now(
+        &self,
+        o: &ObservedServer,
+        cfg: &Config,
+        now_ms: u64,
+    ) -> io::Result<Option<KillRecord>> {
+        let grace = Duration::from_secs(cfg.kill_grace_s);
+        if !kill_tree(&self.platform, o.key, grace, cfg) {
             return Ok(None);
         }
         let r = KillRecord {
             port: o.port,
-            command: o.command,
+            command: o.command.clone(),
             worktree: o.cwd.as_deref().map(worktree_root).unwrap_or_default(),
             reason: KillReason::Manual,
-            at_ms: now,
+            at_ms: now_ms,
         };
         with_state(&self.data_dir, |state| state.record_kill(r.clone()))?;
         append_kill_log(&self.data_dir, &r)?;
         Ok(Some(r))
+    }
+
+    /// Restarts a server (the app only): stops it and starts its command
+    /// again in its folder with its environment, both read from the live
+    /// process now. A tracked server keeps its row (session, note, Keep,
+    /// Postpone) once its new process listens; an observed one stays
+    /// observed. The stop is a manual kill; nothing starts while the port is
+    /// still taken. `Gone` unless `key` is a live tracked server or exactly
+    /// a current, non-excluded observed one.
+    pub fn restart(&mut self, key: ServerKey) -> io::Result<Result<(), RestartBlocked>> {
+        self.restart_at(key, now_ms())
+    }
+
+    /// `restart` at `now_ms`.
+    pub fn restart_at(
+        &mut self,
+        key: ServerKey,
+        now_ms: u64,
+    ) -> io::Result<Result<(), RestartBlocked>> {
+        let scan = self.scan();
+        let listeners = self.platform.listeners();
+        let (owner, tracked) = with_state(&self.data_dir, |state| {
+            let trees = self.refresh(state, &scan, &listeners, now_ms);
+            let owner = state
+                .servers
+                .iter()
+                .zip(&trees)
+                .find(|(s, t)| s.key == key && !t.pids.is_empty())
+                .map(|(s, _)| s.clone());
+            (owner, tracked_pids(&trees))
+        })?;
+        let observed = match owner {
+            Some(_) => None,
+            None => match self
+                .observed(&listeners, &tracked, &scan.cfg)
+                .into_iter()
+                .find(|o| o.key == key && !o.excluded)
+            {
+                Some(o) => Some(o),
+                None => return Ok(Err(RestartBlocked::Gone)),
+            },
+        };
+        let port = owner
+            .as_ref()
+            .map(|s| s.port)
+            .or(observed.as_ref().map(|o| o.port))
+            .unwrap_or_default();
+        let plan = match plan_restart(&self.platform, key, port) {
+            Ok(plan) => plan,
+            Err(blocked) => return Ok(Err(blocked)),
+        };
+        let stopped = match (&owner, &observed) {
+            (Some(s), _) => !self
+                .execute(vec![(s.clone(), KillReason::Manual)], &scan.cfg, now_ms)?
+                .0
+                .is_empty(),
+            (None, Some(o)) => self.stop_observed_now(o, &scan.cfg, now_ms)?.is_some(),
+            (None, None) => false,
+        };
+        // A refused signal leaves it running: no point waiting for the port.
+        if !stopped && same_process(&self.platform, key.pid, key.start_time) {
+            return Ok(Err(RestartBlocked::PortStillTaken));
+        }
+        let (limit, interval) = self.restart_wait;
+        if !wait_port_free(&self.platform, port, limit, interval) {
+            return Ok(Err(RestartBlocked::PortStillTaken));
+        }
+        let log = log_path(&self.data_dir, port, now_ms);
+        let spawned = log
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| self.spawner.spawn(&plan, &log));
+        let Ok((child_pid, child_start)) = spawned else {
+            return Ok(Err(RestartBlocked::SpawnFailed));
+        };
+        with_state(&self.data_dir, |state| {
+            state.pending_restarts.push(PendingRestart {
+                child_pid,
+                child_start,
+                from: key,
+                owner,
+                at_ms: now_ms,
+            })
+        })?;
+        Ok(Ok(()))
     }
 
     /// The observed servers among `listeners`, outside the `tracked` trees.
@@ -806,7 +929,9 @@ impl<P: Platform> Watcher<P> {
 
     /// What this pass learned about an observed server: its whole tree (an
     /// agent CLI subtree left out) and the connections on its ports.
-    fn observed_feed(&self, o: &ObservedServer) -> Feed {
+    /// `pending` are the restarts of observed servers: a server started by
+    /// one of them gets a `Restarted` event.
+    fn observed_feed(&self, o: &ObservedServer, pending: &[PendingRestart], now_ms: u64) -> Feed {
         let mut procs = vec![(o.key.pid, o.key.start_time)];
         procs.extend(own_descendants(&self.platform, o.key.pid, &|_| false));
         let established = procs
@@ -823,6 +948,9 @@ impl<P: Platform> Watcher<P> {
             procs,
             established,
             session_alive: true,
+            restarted_at: (!pending.is_empty()
+                && pending_for(pending, &ancestry(&self.platform, o.key.pid)).is_some())
+            .then_some(now_ms),
         }
     }
 
@@ -949,6 +1077,9 @@ impl<P: Platform> Watcher<P> {
     ///   relinked below if their session still lives);
     /// - forgets servers that now match an exclusion (command, port, or an
     ///   ancestor below the session), so a later exclusion still protects;
+    /// - links a listener started by a pending restart to the stopped
+    ///   server's row (an observed server's restart links to nothing), and
+    ///   drops pending restarts older than `RESTART_LINK_MS`;
     /// - links new listeners, except those inside a tracked server's tree
     ///   (a server is a process tree: its children's ports are its ports);
     /// - folds a tracked server into a tracked ancestor (a child that started
@@ -961,6 +1092,9 @@ impl<P: Platform> Watcher<P> {
         now_ms: u64,
     ) -> Vec<Tree> {
         state.servers.retain(|s| !s.session_proc_start.is_empty());
+        state
+            .pending_restarts
+            .retain(|r| now_ms.saturating_sub(r.at_ms) < RESTART_LINK_MS);
         let sessions = scan.sessions();
         for l in listeners {
             // A tracked pid (same process, or a reused pid that this pass
@@ -969,6 +1103,17 @@ impl<P: Platform> Watcher<P> {
                 continue;
             }
             let chain = ancestry(&self.platform, l.pid);
+            if let Some((i, server)) = pending_for(&state.pending_restarts, &chain) {
+                // An observed server's restart stays pending (and observed)
+                // until it expires.
+                let r = &state.pending_restarts[i];
+                if let Some(owner) = &r.owner {
+                    let new = relinked(owner, r.from, server, l, now_ms);
+                    state.pending_restarts.remove(i);
+                    state.servers.push(new);
+                }
+                continue;
+            }
             let Some(new) = link(
                 l,
                 &chain,
@@ -1089,6 +1234,8 @@ impl<P: Platform> Watcher<P> {
     fn run(&mut self, now_ms: u64, mode: Mode) -> io::Result<TickReport> {
         let scan = self.scan();
         let listeners = self.platform.listeners();
+        // The restarts of observed servers, for their `Restarted` event.
+        let mut pending_observed: Vec<PendingRestart> = Vec::new();
         let (mut report, to_kill, feeds, tracked, idle_over, ended_open, idle_holds) =
             with_state(&self.data_dir, |state| {
                 let trees = self.refresh(state, &scan, &listeners, now_ms);
@@ -1171,7 +1318,14 @@ impl<P: Platform> Watcher<P> {
                         procs: t.procs.clone(),
                         established: o.established,
                         session_alive: o.session_alive,
+                        restarted_at: s.restarted_from.map(|_| s.first_seen_ms),
                     })
+                    .collect();
+                pending_observed = state
+                    .pending_restarts
+                    .iter()
+                    .filter(|r| r.owner.is_none())
+                    .cloned()
                     .collect();
                 (
                     report,
@@ -1187,7 +1341,12 @@ impl<P: Platform> Watcher<P> {
         if mode != Mode::Sweep {
             report.observed = self.observed(&listeners, &tracked, &scan.cfg);
             self.last_observed = report.observed.clone();
-            feeds.extend(report.observed.iter().map(|o| self.observed_feed(o)));
+            feeds.extend(
+                report
+                    .observed
+                    .iter()
+                    .map(|o| self.observed_feed(o, &pending_observed, now_ms)),
+            );
         }
         for key in idle_over {
             self.history.reset_alert(key, AlertKind::Idle);
@@ -1268,6 +1427,15 @@ impl<P: Platform> Watcher<P> {
                         kind: EventKind::Started { agent: f.agent },
                     },
                 );
+                if let Some(at_ms) = f.restarted_at {
+                    self.history.push_event(
+                        f.key,
+                        ServerEvent {
+                            at_ms,
+                            kind: EventKind::Restarted,
+                        },
+                    );
+                }
             }
             if !f.procs.is_empty() {
                 let tree: Vec<(ProcId, ProcResources)> = f
@@ -1924,6 +2092,7 @@ mod tests {
                 asked_stale: false,
                 agent: crate::agents::AgentKind::ClaudeCode,
                 postponed_until_ms: None,
+                restarted_from: None,
             }
         );
 
@@ -2255,6 +2424,7 @@ mod tests {
             procs: Vec::new(),
             established: 0,
             session_alive: false,
+            restarted_at: None,
         };
         let report = TickReport {
             servers: vec![],
@@ -2536,6 +2706,7 @@ mod tests {
                 asked_stale: false,
                 agent: crate::agents::AgentKind::ClaudeCode,
                 postponed_until_ms: None,
+                restarted_from: None,
             })
         })
         .unwrap();
@@ -3480,5 +3651,319 @@ mod tests {
         f.p().set_resources(30, 3000 * MB, 0);
         let r = f.w.sweep(T0).unwrap();
         assert!(r.leaks.is_empty() && r.needs_you.is_empty());
+    }
+
+    type Calls = std::sync::Arc<std::sync::Mutex<Vec<(Vec<String>, PathBuf, PathBuf)>>>;
+
+    /// The restarted process's pid and start time.
+    const CHILD: i32 = 900;
+    const CHILD_START: u64 = START + 900 * SEC;
+
+    /// Records each plan and writes its command line to the log; runs
+    /// nothing.
+    struct FakeSpawner {
+        calls: Calls,
+    }
+
+    impl Spawner for FakeSpawner {
+        fn spawn(&self, plan: &crate::restart::RestartPlan, log: &Path) -> io::Result<(i32, u64)> {
+            fs::write(
+                log,
+                format!("{} in {}\n", plan.argv.join(" "), plan.cwd.display()),
+            )?;
+            self.calls.lock().unwrap().push((
+                plan.argv.clone(),
+                plan.cwd.clone(),
+                log.to_path_buf(),
+            ));
+            Ok((CHILD, CHILD_START))
+        }
+    }
+
+    fn child_key() -> ServerKey {
+        ServerKey {
+            pid: CHILD,
+            start_time: CHILD_START,
+        }
+    }
+
+    /// The fixture with a fake spawner, a short port wait, `bun` and `next`
+    /// in `<repo>/bin`, and an environment for the server (30).
+    fn restart_fx() -> (Fx, Calls) {
+        use std::os::unix::fs::PermissionsExt;
+        let f = fx();
+        let bin = f.repo.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        for name in ["bun", "next"] {
+            fs::write(bin.join(name), "#!/bin/sh\n").unwrap();
+            fs::set_permissions(bin.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        f.p().set_env(
+            30,
+            &[("PATH", bin.to_str().unwrap()), ("SECRET_TOKEN", "abc")],
+        );
+        let calls = Calls::default();
+        let Fx {
+            data,
+            claude,
+            repo,
+            wt,
+            w,
+        } = f;
+        let w = w
+            .with_spawner(Box::new(FakeSpawner {
+                calls: calls.clone(),
+            }))
+            .with_restart_wait(Duration::from_millis(50), Duration::from_millis(5));
+        (
+            Fx {
+                data,
+                claude,
+                repo,
+                wt,
+                w,
+            },
+            calls,
+        )
+    }
+
+    /// The restarted process starts listening (a child of `ppid`).
+    fn child_listens(f: &Fx, ppid: i32, command: &str, cwd: &Path, port: u16) {
+        f.p()
+            .spawn(CHILD, ppid, CHILD_START, command, cwd.to_str().unwrap());
+        f.p().set_exe(CHILD, NODE);
+        f.p().add_listener(CHILD, port);
+    }
+
+    fn pending(f: &Fx) -> Vec<PendingRestart> {
+        with_state(f.data.path(), |s| s.pending_restarts.clone()).unwrap()
+    }
+
+    #[test]
+    fn restart_keeps_session_note_keep_and_postpone() {
+        let (mut f, calls) = restart_fx();
+        let web = f.wt.join("apps/web");
+        f.w.tick(T0).unwrap();
+        f.w.keep(key30()).unwrap();
+        f.w.postpone_at(key30(), T0).unwrap();
+        let note = Note {
+            keep: false,
+            done: false,
+            reason: Some("e2e".into()),
+            set_at_ms: T0,
+        };
+        with_state(f.data.path(), |s| s.servers[0].note = Some(note.clone())).unwrap();
+        let before = f.state_servers()[0].clone();
+
+        assert_eq!(f.w.restart_at(key30(), T0 + MIN).unwrap(), Ok(()));
+        assert!(!f.p().is_alive(30) && !f.p().is_alive(31));
+        let calls = calls.lock().unwrap().clone();
+        let bun = f.repo.path().join("bin/bun");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, [bun.to_str().unwrap(), "run", "dev"]);
+        assert_eq!(calls[0].1, web);
+        assert_eq!(
+            calls[0].2,
+            f.data.path().join(format!("logs/3000-{}.log", T0 + MIN))
+        );
+        // The stop is a manual kill, in the recent kills and kills.log.
+        assert_eq!(f.state_kills()[0].reason, KillReason::Manual);
+        assert_eq!(f.kill_log().len(), 1);
+        assert!(f.state_servers().is_empty());
+        assert_eq!(pending(&f).len(), 1);
+
+        // Started outside the session's tree (by the app), it still links.
+        child_listens(&f, 1, "bun run dev", &web, 3000);
+        let r = f.w.tick(T0 + MIN).unwrap();
+        assert_eq!(r.servers.len(), 1);
+        let s = server_of(&f, CHILD).expect("relinked");
+        assert_eq!(s.key, child_key());
+        assert_eq!(s.port, 3000);
+        assert_eq!(s.agent, before.agent);
+        assert_eq!(s.session_id, before.session_id);
+        assert_eq!(s.session_pid, before.session_pid);
+        assert_eq!(s.session_proc_start, before.session_proc_start);
+        assert_eq!(s.note, Some(note));
+        assert!(s.kept);
+        assert_eq!(s.postponed_until_ms, before.postponed_until_ms);
+        assert_eq!(s.restarted_from, Some(key30()));
+        assert_eq!((s.first_seen_ms, s.last_active_ms), (T0 + MIN, T0 + MIN));
+        assert!(pending(&f).is_empty());
+        assert_eq!(count_events(&f, child_key(), &EventKind::Restarted), 1);
+        f.w.tick(T0 + 2 * MIN).unwrap();
+        assert_eq!(count_events(&f, child_key(), &EventKind::Restarted), 1);
+    }
+
+    #[test]
+    fn restart_refuses_when_port_still_taken() {
+        let (mut f, calls) = restart_fx();
+        f.w.tick(T0).unwrap();
+        // The old tree ignores SIGTERM and SIGKILL fails (EPERM).
+        f.p().ignore_sigterm(30);
+        f.p().fail_signals(30);
+        assert_eq!(
+            f.w.restart_at(key30(), T0).unwrap(),
+            Err(RestartBlocked::PortStillTaken)
+        );
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(f.p().is_alive(30));
+        assert_eq!(f.state_servers().len(), 1, "still tracked");
+        assert!(pending(&f).is_empty());
+        assert!(f.state_kills().is_empty());
+
+        // Stopped, but another process holds the port: nothing starts.
+        let (mut f, calls) = restart_fx();
+        f.w.tick(T0).unwrap();
+        f.p().spawn(99, 1, START + 99 * SEC, "other", "/");
+        f.p().add_listener(99, 3000);
+        assert_eq!(
+            f.w.restart_at(key30(), T0).unwrap(),
+            Err(RestartBlocked::PortStillTaken)
+        );
+        assert!(!f.p().is_alive(30));
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(pending(&f).is_empty());
+    }
+
+    #[test]
+    fn restart_refuses_an_unknown_server() {
+        let (mut f, calls) = restart_fx();
+        f.w.tick(T0).unwrap();
+        let reused = ServerKey {
+            pid: 30,
+            start_time: 1,
+        };
+        assert_eq!(
+            f.w.restart_at(reused, T0).unwrap(),
+            Err(RestartBlocked::Gone)
+        );
+        assert!(f.p().signals().is_empty());
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn restarted_server_stays_under_dead_session_rule() {
+        let (mut f, _) = restart_fx();
+        let web = f.wt.join("apps/web");
+        f.w.tick(T0).unwrap();
+        assert_eq!(f.w.restart_at(key30(), T0).unwrap(), Ok(()));
+        child_listens(&f, 1, "bun run dev", &web, 3000);
+        f.w.tick(T0).unwrap();
+        f.p().remove_proc(20); // the session exits
+        assert!(f.w.tick(T0 + 19 * MIN).unwrap().killed.is_empty());
+        let r = f.w.tick(T0 + 20 * MIN).unwrap();
+        assert_eq!(r.killed.len(), 1);
+        assert_eq!(
+            r.killed[0].reason,
+            KillReason::DeadSessionIdle { idle_ms: 20 * MIN }
+        );
+        assert!(!f.p().is_alive(CHILD));
+    }
+
+    #[test]
+    fn pending_restart_expires_after_two_minutes() {
+        let (mut f, _) = restart_fx();
+        let web = f.wt.join("apps/web");
+        f.w.tick(T0).unwrap();
+        assert_eq!(f.w.restart_at(key30(), T0).unwrap(), Ok(()));
+        f.w.tick(T0 + 2 * MIN - 1).unwrap();
+        assert_eq!(pending(&f).len(), 1);
+        child_listens(&f, 1, "bun run dev", &web, 3000);
+        let r = f.w.tick(T0 + 2 * MIN).unwrap();
+        assert!(pending(&f).is_empty());
+        assert!(f.state_servers().is_empty());
+        assert!(r.observed.iter().any(|o| o.key == child_key()));
+    }
+
+    #[test]
+    fn observed_restart_stays_observed() {
+        let (mut f, calls) = restart_fx();
+        let dir = f.repo.path().join("site");
+        fs::create_dir_all(&dir).unwrap();
+        let bin = f.repo.path().join("bin");
+        f.p()
+            .spawn(60, 10, START + 60 * SEC, "next dev", dir.to_str().unwrap());
+        f.p().set_exe(60, NODE);
+        f.p().add_listener(60, 4100);
+        f.p().set_env(60, &[("PATH", bin.to_str().unwrap())]);
+        let key60 = ServerKey {
+            pid: 60,
+            start_time: START + 60 * SEC,
+        };
+        assert!(f
+            .w
+            .tick(T0)
+            .unwrap()
+            .observed
+            .iter()
+            .any(|o| o.key == key60));
+        assert_eq!(f.w.restart_at(key60, T0).unwrap(), Ok(()));
+        assert!(!f.p().is_alive(60));
+        assert_eq!(calls.lock().unwrap()[0].1, dir);
+        let kill = &f.state_kills()[0];
+        assert_eq!((kill.port, kill.reason.clone()), (4100, KillReason::Manual));
+        // Even under a live session's process, it is not linked.
+        child_listens(&f, 20, "next dev", &dir, 4100);
+        let r = f.w.tick(T0 + MIN).unwrap();
+        assert!(r.observed.iter().any(|o| o.key == child_key()));
+        assert!(r.servers.iter().all(|v| v.key != child_key()));
+        assert!(server_of(&f, CHILD).is_none());
+        assert_eq!(count_events(&f, child_key(), &EventKind::Restarted), 1);
+        f.w.tick(T0 + 2 * MIN - 1).unwrap();
+        assert_eq!(count_events(&f, child_key(), &EventKind::Restarted), 1);
+    }
+
+    #[test]
+    fn a_restarted_wrapper_is_the_server() {
+        let (mut f, _) = restart_fx();
+        let web = f.wt.join("apps/web");
+        f.w.tick(T0).unwrap();
+        assert_eq!(f.w.restart_at(key30(), T0).unwrap(), Ok(()));
+        // `bun run dev` (the restarted process) > node, which listens.
+        f.p()
+            .spawn(CHILD, 1, CHILD_START, "bun run dev", web.to_str().unwrap());
+        f.p().spawn(
+            901,
+            CHILD,
+            START + 901 * SEC,
+            "node vite",
+            web.to_str().unwrap(),
+        );
+        f.p().add_listener(901, 3000);
+        f.p().add_listener(901, 24678);
+        let r = f.w.tick(T0).unwrap();
+        assert_eq!(r.servers.len(), 1);
+        assert_eq!(r.servers[0].key, child_key());
+        assert_eq!(r.servers[0].command, "bun run dev");
+        assert_eq!(r.servers[0].ports, [3000, 24678]);
+        assert_eq!(f.state_servers().len(), 1);
+    }
+
+    #[test]
+    fn env_never_written() {
+        let (mut f, _) = restart_fx();
+        let web = f.wt.join("apps/web");
+        f.w.tick(T0).unwrap();
+        assert_eq!(f.w.restart_at(key30(), T0).unwrap(), Ok(()));
+        child_listens(&f, 1, "bun run dev", &web, 3000);
+        f.w.tick(T0).unwrap();
+        let mut files = vec![
+            f.data.path().join("state.json"),
+            f.data.path().join("kills.log"),
+        ];
+        files.extend(
+            fs::read_dir(f.data.path().join("logs"))
+                .unwrap()
+                .map(|e| e.unwrap().path()),
+        );
+        assert_eq!(files.len(), 3);
+        for file in files {
+            let text = fs::read_to_string(&file).unwrap();
+            assert!(
+                !text.contains("abc") && !text.contains("SECRET_TOKEN"),
+                "{}",
+                file.display()
+            );
+        }
     }
 }

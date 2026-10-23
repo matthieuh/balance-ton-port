@@ -104,6 +104,7 @@ mod tests {
             asked_stale: false,
             agent: crate::agents::AgentKind::ClaudeCode,
             postponed_until_ms: None,
+            restarted_from: None,
         }
     }
 
