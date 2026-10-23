@@ -285,10 +285,7 @@ fn session_end_kills_nothing_and_starts_one_waiter() {
     assert!(!wait_gone(server.pid, Duration::from_millis(500)), "killed");
     let n = sb.notified();
     assert!(n.starts_with("Balance ton port|"), "{n}");
-    assert!(
-        n.contains("|Session ended: 1 server kept running, stopped after 20 min unused: "),
-        "{n}"
-    );
+    assert!(n.contains("|Session ended: 1 server kept running: "), "{n}");
     assert!(n.contains(&format!(":{port}.")), "{n}");
     assert!(sb
         .btp()

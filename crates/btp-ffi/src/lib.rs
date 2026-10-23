@@ -691,7 +691,7 @@ mod tests {
         assert_eq!((g.servers[0].pid, g.servers[0].port), (999_999, 5173));
         assert_eq!(
             g.body,
-            "Session ended: 1 server kept running, stopped after 30 min unused: Vite :5173."
+            "Session ended: 1 server kept running: Vite :5173. Stopped after 30 min unused, once no session works in that folder."
         );
         // Claimed: not handed out twice, until given back.
         assert!(core.claim_session_ended().unwrap().is_empty());

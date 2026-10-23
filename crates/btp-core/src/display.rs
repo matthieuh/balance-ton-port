@@ -80,10 +80,10 @@ pub fn session_ended_body(g: &SessionEndedGroup, dead_idle_s: u64) -> String {
         .map(|s| format!("{} :{}", s.tool_label, s.port))
         .collect();
     format!(
-        "Session ended: {} kept running, stopped after {} unused: {}.",
+        "Session ended: {} kept running: {}. Stopped after {} unused, once no session works in that folder.",
         servers_word(g.still_open.len()),
-        format_idle(dead_idle_s.saturating_mul(1000)),
-        name_list(names)
+        name_list(names),
+        format_idle(dead_idle_s.saturating_mul(1000))
     )
 }
 
@@ -157,7 +157,7 @@ mod tests {
         };
         assert_eq!(
             session_ended_body(&g, 1200),
-            "Session ended: 2 servers kept running, stopped after 20 min unused: Vite :5173, Bun dev :3000."
+            "Session ended: 2 servers kept running: Vite :5173, Bun dev :3000. Stopped after 20 min unused, once no session works in that folder."
         );
     }
 

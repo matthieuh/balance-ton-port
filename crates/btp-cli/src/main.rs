@@ -762,7 +762,7 @@ fn describe_kill(r: &KillRecord) -> String {
     format!(
         ":{} {} ({}) [{reason}]",
         r.port,
-        r.command,
+        tool_label(&r.command),
         r.worktree
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -938,12 +938,12 @@ mod tests {
         assert_eq!(sub, "web-app");
         assert_eq!(
             body,
-            "Session ended: 2 servers kept running, stopped after 20 min unused: Expo (Metro) :8081, Bun dev :3000."
+            "Session ended: 2 servers kept running: Expo (Metro) :8081, Bun dev :3000. Stopped after 20 min unused, once no session works in that folder."
         );
         let (_, body) = notification_text(&group(&[], &[("Vite", 5173, false)]), 3600);
         assert_eq!(
             body,
-            "Session ended: 1 server kept running, stopped after 1 h unused: Vite :5173."
+            "Session ended: 1 server kept running: Vite :5173. Stopped after 1 h unused, once no session works in that folder."
         );
     }
 
@@ -952,7 +952,7 @@ mod tests {
         let many: Vec<(&str, u16, bool)> = (0..6).map(|i| ("Vite", 5000 + i, false)).collect();
         let (_, body) = notification_text(&group(&[], &many), 1200);
         assert!(
-            body.ends_with(": Vite :5000, Vite :5001, Vite :5002, Vite :5003 and 2 more."),
+            body.contains(": Vite :5000, Vite :5001, Vite :5002, Vite :5003 and 2 more. Stopped"),
             "{body}"
         );
     }
@@ -991,7 +991,7 @@ mod tests {
         );
         assert_eq!(
             text,
-            "12 min ago  :5173 vite (app) [session ended]\n2 h ago  :3000 vite (app) [manual]\n"
+            "12 min ago  :5173 Vite (app) [session ended]\n2 h ago  :3000 Vite (app) [manual]\n"
         );
         assert_eq!(render_recent(&[], now), "no kills yet\n");
     }
