@@ -926,6 +926,8 @@ impl<P: Platform> Watcher<P> {
             (report, to_kill, feeds)
         })?;
         self.feed_history(&feeds, &report, now_ms);
+        let live: HashSet<ServerKey> = report.servers.iter().map(|v| v.key).collect();
+        self.history.retain(&live, now_ms);
 
         if mode == Mode::Observe {
             report.killed = to_kill
@@ -955,41 +957,22 @@ impl<P: Platform> Watcher<P> {
                     },
                 );
             }
-            if f.procs.is_empty() {
-                continue;
+            if !f.procs.is_empty() {
+                let tree: Vec<(ProcId, ProcResources)> = f
+                    .procs
+                    .iter()
+                    .filter_map(|&id| Some((id, self.platform.proc_resources(id.0)?)))
+                    .collect();
+                self.history.record(f.key, now_ms, &tree);
             }
-            let tree: Vec<(ProcId, ProcResources)> = f
-                .procs
-                .iter()
-                .filter_map(|&id| Some((id, self.platform.proc_resources(id.0)?)))
-                .collect();
-            self.history.record(f.key, now_ms, &tree);
             self.history.note_connections(f.key, now_ms, f.established);
             if !f.session_alive {
                 self.history.note_session_ended(f.key, now_ms);
             }
         }
         for a in &report.alerts {
-            let seen = self.history.events(a.key).iter().any(|e| {
-                e.kind
-                    == EventKind::Alert {
-                        alert: AlertKind::Idle,
-                    }
-            });
-            if !seen {
-                self.history.push_event(
-                    a.key,
-                    ServerEvent {
-                        at_ms: now_ms,
-                        kind: EventKind::Alert {
-                            alert: AlertKind::Idle,
-                        },
-                    },
-                );
-            }
+            self.history.note_alert(a.key, now_ms, AlertKind::Idle);
         }
-        let live: HashSet<ServerKey> = report.servers.iter().map(|v| v.key).collect();
-        self.history.retain(&live, now_ms);
     }
 
     /// Kills each server's tree outside the state lock (the grace period can
@@ -1933,6 +1916,32 @@ mod tests {
                 .filter(|e| e.kind == EventKind::SessionEnded)
                 .count();
         assert_eq!(ended, 1);
+    }
+
+    #[test]
+    fn session_end_recorded_when_the_tree_is_already_empty() {
+        // A dead server is normally forgotten in the same pass; the history
+        // must not depend on that, so feed it an empty tree directly.
+        let mut f = fx();
+        let feed = Feed {
+            key: key30(),
+            agent: AgentKind::ClaudeCode,
+            procs: Vec::new(),
+            established: 0,
+            session_alive: false,
+        };
+        let report = TickReport {
+            servers: vec![],
+            ..TickReport::default()
+        };
+        f.w.feed_history(&[feed], &report, T0);
+        let kinds: Vec<_> =
+            f.w.history()
+                .events(key30())
+                .iter()
+                .map(|e| e.kind.clone())
+                .collect();
+        assert!(kinds.contains(&EventKind::SessionEnded), "{kinds:?}");
     }
 
     #[test]
