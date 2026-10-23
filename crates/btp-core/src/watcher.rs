@@ -523,6 +523,8 @@ pub struct Watcher<P: Platform> {
     history: History,
     meta: MetaCache,
     probes: ProbeCache,
+    /// The servers of the last pass, as (key, port): the probe candidates.
+    probe_targets: Vec<(ServerKey, u16)>,
     /// Pids whose connections to a server never count as use (the app's
     /// own process, which probes and previews).
     ignored_peers: Vec<i32>,
@@ -541,6 +543,7 @@ impl<P: Platform> Watcher<P> {
             history: History::default(),
             meta: MetaCache::default(),
             probes: ProbeCache::default(),
+            probe_targets: Vec::new(),
             ignored_peers: Vec::new(),
         }
     }
@@ -572,12 +575,22 @@ impl<P: Platform> Watcher<P> {
         self
     }
 
-    /// Probes the title and favicon of the `(server, port)` pairs that have
-    /// no fresh answer, two at most per call. Call it with no lock held on
-    /// the state: it blocks up to 800 ms per probe.
-    pub fn probe_pending(&mut self, servers: &[(ServerKey, u16)], now_ms: u64) {
-        self.probes
-            .refresh(servers, now_ms, crate::probe::fetch_page_meta);
+    /// The `(server, port)` pairs of the last pass that need a title and
+    /// favicon probe (two at most). Take them under the lock, release it,
+    /// fetch with `probe::fetch_page_meta`, then hand the answers to
+    /// `store_probes`: no network I/O happens while the watcher is borrowed.
+    pub fn due_probes(&self, now_ms: u64) -> Vec<(ServerKey, u16)> {
+        self.probes.due(&self.probe_targets, now_ms)
+    }
+
+    /// Records the answers of probes taken with `due_probes`.
+    pub fn store_probes(
+        &mut self,
+        results: Vec<((ServerKey, u16), Option<PageMeta>)>,
+        now_ms: u64,
+    ) {
+        self.probes.store(results, now_ms);
+        self.probes.retain(&self.probe_targets);
     }
 
     /// The cached page title and favicon of a server's port.
@@ -975,6 +988,7 @@ impl<P: Platform> Watcher<P> {
         self.feed_history(&feeds, &report, now_ms);
         let live: HashSet<ServerKey> = report.servers.iter().map(|v| v.key).collect();
         self.history.retain(&live, now_ms);
+        self.probe_targets = report.servers.iter().map(|v| (v.key, v.port)).collect();
 
         if mode == Mode::Observe {
             report.killed = to_kill
@@ -2306,6 +2320,22 @@ mod tests {
         assert!(tick_minutes(&mut f, T0, T0 + 25 * MIN).is_empty());
         assert!(f.p().is_alive(30));
         assert!(f.p().is_alive(31));
+    }
+
+    #[test]
+    fn due_probes_follow_the_last_pass_and_store_caches() {
+        let mut f = fx();
+        assert!(f.w.due_probes(T0).is_empty());
+        f.w.tick(T0).unwrap();
+        let due = f.w.due_probes(T0);
+        assert_eq!(due, vec![(key30(), 3000)]);
+        let meta = PageMeta {
+            title: Some("t".into()),
+            icon: None,
+        };
+        f.w.store_probes(vec![(due[0], Some(meta.clone()))], T0);
+        assert!(f.w.due_probes(T0 + 1000).is_empty());
+        assert_eq!(f.w.page_meta(key30(), 3000), Some(&meta));
     }
 
     #[test]
