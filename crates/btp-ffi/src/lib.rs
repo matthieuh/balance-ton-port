@@ -297,7 +297,9 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Core {
     fn at(dir: PathBuf, discover: fn() -> Vec<PathBuf>) -> Self {
-        let watcher = Watcher::new(MacOs, dir.clone()).with_discovery(discover);
+        let watcher = Watcher::new(MacOs, dir.clone())
+            .with_discovery(discover)
+            .with_ignored_peers(vec![std::process::id() as i32]);
         // Tests run on the real platform: a live Codex of the machine must not
         // show up in them.
         #[cfg(test)]

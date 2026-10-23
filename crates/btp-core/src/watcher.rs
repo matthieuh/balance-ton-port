@@ -15,6 +15,7 @@ use crate::history::{AlertKind, EventKind, History, ProcId, ServerEvent};
 use crate::labels::{location_label, session_display_name, tool_label};
 use crate::model::{Action, KillReason, KillTarget, Note, Observation, ServerKey, TrackedServer};
 use crate::platform::{ancestry, format_proc_start, Listener, Platform, ProcInfo, ProcResources};
+use crate::probe::{PageMeta, ProbeCache};
 use crate::sessions::default_config_dirs;
 use crate::state::{append_kill_log, with_state, KillRecord, State};
 use crate::worktree::{worktree_root, MetaCache};
@@ -521,6 +522,10 @@ pub struct Watcher<P: Platform> {
     config_error: Option<String>,
     history: History,
     meta: MetaCache,
+    probes: ProbeCache,
+    /// Pids whose connections to a server never count as use (the app's
+    /// own process, which probes and previews).
+    ignored_peers: Vec<i32>,
 }
 
 impl<P: Platform> Watcher<P> {
@@ -535,6 +540,8 @@ impl<P: Platform> Watcher<P> {
             config_error: None,
             history: History::default(),
             meta: MetaCache::default(),
+            probes: ProbeCache::default(),
+            ignored_peers: Vec::new(),
         }
     }
 
@@ -555,6 +562,27 @@ impl<P: Platform> Watcher<P> {
         now_ms: u64,
     ) -> (Option<String>, Option<String>, Option<String>) {
         self.meta.get(key, command, cwd, worktree, now_ms)
+    }
+
+    /// Connections from these pids' sockets (loopback) are not use: set by
+    /// the app to its own pid so its probes and previews never keep a server
+    /// alive.
+    pub fn with_ignored_peers(mut self, peers: Vec<i32>) -> Self {
+        self.ignored_peers = peers;
+        self
+    }
+
+    /// Probes the title and favicon of the `(server, port)` pairs that have
+    /// no fresh answer, two at most per call. Call it with no lock held on
+    /// the state: it blocks up to 800 ms per probe.
+    pub fn probe_pending(&mut self, servers: &[(ServerKey, u16)], now_ms: u64) {
+        self.probes
+            .refresh(servers, now_ms, crate::probe::fetch_page_meta);
+    }
+
+    /// The cached page title and favicon of a server's port.
+    pub fn page_meta(&self, key: ServerKey, port: u16) -> Option<&PageMeta> {
+        self.probes.get(key, port)
     }
 
     /// Replaces the automatic discovery of Claude config dirs (tests pass
@@ -856,7 +884,10 @@ impl<P: Platform> Watcher<P> {
             established: tree
                 .activity
                 .iter()
-                .map(|&(pid, port)| self.platform.established(pid, port))
+                .map(|&(pid, port)| {
+                    self.platform
+                        .established_excluding(pid, port, &self.ignored_peers)
+                })
                 .sum(),
             // Only a definite "does not exist" counts; an unreadable path
             // (permissions, unmounted volume) must not trigger a kill.
@@ -2275,6 +2306,25 @@ mod tests {
         assert!(tick_minutes(&mut f, T0, T0 + 25 * MIN).is_empty());
         assert!(f.p().is_alive(30));
         assert!(f.p().is_alive(31));
+    }
+
+    #[test]
+    fn probe_does_not_count_as_use() {
+        let mut f = fx();
+        f.w.ignored_peers = vec![99];
+        f.p().set_established(30, 3000, 1);
+        f.p().set_established_from(30, 3000, 99, 1);
+        f.w.tick(T0).unwrap();
+        f.p().remove_proc(20);
+        let killed = tick_minutes(&mut f, T0, T0 + 25 * MIN);
+        assert_eq!(killed.len(), 1, "only the app's own connection: idle");
+        // Control: without the ignored peer the same connection is use.
+        let mut g = fx();
+        g.p().set_established(30, 3000, 1);
+        g.p().set_established_from(30, 3000, 99, 1);
+        g.w.tick(T0).unwrap();
+        g.p().remove_proc(20);
+        assert!(tick_minutes(&mut g, T0, T0 + 25 * MIN).is_empty());
     }
 
     #[test]

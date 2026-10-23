@@ -6,6 +6,7 @@ pub mod history;
 pub mod labels;
 pub mod model;
 pub mod platform;
+pub mod probe;
 pub mod session_end;
 pub mod sessions;
 pub mod state;
