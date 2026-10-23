@@ -4,17 +4,21 @@ This document describes how Balance ton port works today (v0.1). It is for contr
 
 ## 1. Intent
 
-Claude Code sessions start dev servers (Astro, wrangler, Metro, Vite, `serve`...) and leave them running. The session ends or crashes, the worktree is deleted, and the ports stay taken; children such as wrangler's `workerd` linger, and so do the resources they hold (database connections, file watchers).
+Coding-agent sessions (Claude Code, Codex CLI) start dev servers (Astro, wrangler, Metro, Vite, `serve`...) and leave them running. The session ends or crashes, the worktree is deleted, and the ports stay taken; children such as wrangler's `workerd` linger, and so do the resources they hold (database connections, file watchers).
 
 Balance ton port cleans up automatically and asks only when it cannot be sure. Its rules, in order of importance:
 
 - Never kill a server someone is still using.
-- Never touch anything that was not started from a Claude Code session: a Metro started in a plain terminal, Postgres, Docker, system services.
+- Never touch anything that was not started from a supported agent session: a Metro started in a plain terminal, Postgres, Docker, system services.
 - Cost next to nothing while idle: no subprocesses, no `lsof` loop, only direct system calls once per scan.
 
 It ships as a macOS menu bar app and a `btp` CLI, both built on one Rust core, plus an agent skill that teaches coding agents to use `btp` instead of `lsof | xargs kill`.
 
 ## 2. Sessions
+
+Two agents are supported. Every session carries an `agent` (`claude_code` or `codex`, shown as `agent` in `btp list --json`; a state file from before Codex support loads as `claude_code`).
+
+### Claude Code
 
 A Claude Code session is known through its session file: `<config dir>/sessions/<pid>.json`, written by Claude Code itself. The core reads `pid`, `sessionId`, `cwd`, `status` (`idle` or `busy`), `statusUpdatedAt`, `procStart` and the optional `name`. A file missing a required key, or that does not parse, is skipped.
 
@@ -30,16 +34,30 @@ A session is live only if a process with that pid is running and its start time,
 
 The Claude Code CLI is recognised by its command line: argv[0] named `claude`, a runtime (`node`, `bun`, `deno`) running a script named `claude`, or the `@anthropic-ai/claude-code` npm package.
 
+### Codex CLI
+
+A Codex session is the native `codex` binary (argv[0] path ending in `/codex`) running interactively. Codex is usually started through a shell wrapper that stays its parent; the wrapper is recognised as a wrapper and is never a session. `codex exec` and the like are non-interactive roles, `codex app-server` (the Codex desktop app) is never a session.
+
+Codex has no session file. A session is the native process that holds a lock `<CODEX_HOME>/thread-writer-locks/<uuid>.lock` (`CODEX_HOME` is read from the process environment, default `~/.codex`); the uuid is the thread id, used as the conversation id. Liveness uses the same rule as for Claude Code: pid plus process start time.
+
+From the thread's rollout file (`<CODEX_HOME>/sessions/.../rollout-*-<uuid>.jsonl`) only line 1, the `session_meta` record, is read, for the thread id, the start timestamp, the cwd and the parent thread of a sub-thread. Nothing else of a rollout is read, parsed, stored or logged. When there is no lock yet, the newest rollout of the process's cwd stands in. The display name is the basename of the session cwd.
+
+Codex writes its transcript only at the end of a turn, so a running turn cannot be told from an idle session: the status of a Codex session is always unknown, and it never gets the idle alert (trigger 3). It is still covered by the dead-session rule and the worktree-deleted rule.
+
 ## 3. What a server is
 
-A server is a process listening on a TCP port whose ancestry, when it is first seen, leads to a live Claude Code session. Linking happens at first sight because the link is lost later: when the session process dies, its children are reparented to launchd.
+A server is a process listening on a TCP port whose ancestry, when it is first seen, leads to a live agent session (Claude Code or Codex CLI). Linking happens at first sight because the link is lost later: when the session process dies, its children are reparented to launchd.
 
 On each scan, for every listening socket not already tracked, the core walks the listener's ancestry and takes the first ancestor that matches a live session (pid and start time). The listener is not linked when:
 
 - it is a session process itself;
-- it or any process between it and the session is a Claude Code CLI (a nested session owns its own servers) or matches an excluded command;
+- it or any process between it and the session is an agent CLI (a nested Claude Code session owns its own servers; a nested `codex exec` stays with the outer session) or matches an excluded command;
 - its port is excluded;
 - its working directory cannot be read.
+
+Ancestry comes first. A server that was reparented to launchd before it was seen (a daemonized dev server) has no ancestry left; for those only, the `CODEX_THREAD_ID` of its environment (read for the current user's processes only, and only that one value is kept) links it to a Codex session, and only when exactly one live Codex session holds that thread. Environments are not read when no Codex session is live.
+
+An agent CLI (Claude Code or Codex) is never tracked as a server, and is spared, with its whole subtree, in a kill tree.
 
 The link records the server's (pid, start time) as its identity, its port and command line, its session (id, pid, start time, display name) and its worktree: the nearest ancestor of the server's working directory holding a `.git` entry (a directory for a main checkout, a file for a linked worktree), or the working directory itself outside a repository.
 
@@ -137,7 +155,13 @@ The plugin (`plugin/`) has two hooks, an install command and the agent skill.
 ## 11. Known limitations
 
 - A Claude Code process with no session file in a watched dir (a `CLAUDE_CONFIG_DIR` whose `sessions/` folder is shared with another dir, an older Claude Code) is ignored: its servers are never tracked, so never killed, and never cleaned up either.
-- A server started in the background (`cmd &`) inside one shell command is reparented to launchd before the first scan and is not tracked. More generally, anything started and orphaned between two scans is missed.
+- A server started in the background (`cmd &`) inside one shell command is reparented to launchd before the first scan and is not tracked by ancestry; a Codex server is still linked by its `CODEX_THREAD_ID` when that thread is held by exactly one live session. More generally, anything started and orphaned between two scans is missed.
+- Codex desktop app is not supported: its `codex` processes are never sessions, so its servers are never tracked.
+- Codex sessions never get the idle alert (their status is unknown, see section 2); session-end cleanup, the offer after `/clear` and the grouped notification are Claude Code only.
+- A Codex session without a lock or a rollout yet has an empty conversation id.
+- The native Codex binary must be named `codex`; a vendor-triple name is not recognised.
+- A resumed Codex thread keeps the cwd recorded in its transcript, not the one it was resumed from.
+- Inside the default Codex sandbox a server cannot listen on a port and btp's data dir is read-only (see the agent snippet `plugin/skills/balance-ton-port/AGENTS.md`).
 - Command exclusions are substrings of the whole command line, paths included: a project path containing `mcp` excludes its servers. That errs on the safe side.
 - Port activity is sampled once per pass. A short request that opens and closes between two passes is not seen, so a server used only by brief, rare requests can look idle.
 - The shared-worktree rule compares worktree roots only (see section 5).
@@ -154,7 +178,7 @@ app/              SwiftUI menu bar app (XcodeGen project)
 plugin/           the Claude Code plugin: hooks, install script, the agent skill (plugin/skills/)
 ```
 
-- `btp-core`: `platform` (a `Platform` trait; the macOS implementation uses libproc and sysctl for listening sockets, process info, ancestry, descendants and per-socket TCP states, plus `kill(2)`), `sessions` (session files and config dir discovery), `worktree`, `decide` (pure decision logic, unit-tested with fake clocks and fake process tables), `watcher` (link, refresh, observe, execute, the watch lock), `state`, `config`, and `labels`/`display` for readable names (`Expo (Metro)`, `repo › worktree`).
+- `btp-core`: `platform` (a `Platform` trait; the macOS implementation uses libproc and sysctl for listening sockets, process info, ancestry, descendants and per-socket TCP states, plus `kill(2)`), `sessions` (session files and config dir discovery), `agents` (one module per agent: process recognition, live sessions and metadata for `claude` and `codex`, the rollout line 1 reader), `worktree`, `decide` (pure decision logic, unit-tested with fake clocks and fake process tables), `watcher` (link, refresh, observe, execute, the watch lock), `state`, `config`, and `labels`/`display` for readable names (`Expo (Metro)`, `repo › worktree`).
 - `btp-ffi`: a `Core` object exposing `tick`, `observe`, `kill_port`, `kill_server(pid, start_time)`, `mark_alerted`, `keep`, `config`/`set_config`, `recent_kills` and `acquire_watch`. `scripts/build-xcframework.sh` builds a universal static library, packs it as `BtpCore.xcframework` and generates the Swift bindings.
 - The app: `MenuBarExtra` in window style, `LSUIElement` (no Dock icon), launch at login through `SMAppService`, notifications with actions through `UNUserNotificationCenter`. It runs one pass at a time on a background queue and schedules the next one `scan_interval_s` after the previous one finished. One process, no daemon to install. macOS 14 or later.
 

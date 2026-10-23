@@ -5,17 +5,17 @@ description: Use before starting or after finishing a local dev server, or when 
 
 # Balance ton port
 
-`btp` tracks the dev servers started from Claude Code sessions (Astro, wrangler, Metro, Vite, `serve`...) and kills the leftovers. Use it instead of improvising with `lsof`.
+`btp` tracks the dev servers started from coding-agent sessions (Claude Code, Codex CLI: Astro, wrangler, Metro, Vite, `serve`...) and kills the leftovers. Use it instead of improvising with `lsof`.
 
 ## Before starting a dev server
 
-Run `btp list --json` and read the `servers` array. Each entry has `port` (its main port), `ports` (every port its process tree listens on), `command`, `worktree_name`, `session_alive`, `idle_ms`, `kill_in_ms` and `state` (`active`, `idle` or `session dead`).
+Run `btp list --json` and read the `servers` array. Each entry has `port` (its main port), `ports` (every port its process tree listens on), `command`, `worktree_name`, `agent` (`claude_code` or `codex`), `session_alive`, `idle_ms`, `kill_in_ms` and `state` (`active`, `idle` or `session dead`).
 
 - A server of your own worktree already serves what you need: reuse its port, do not start a second one.
 - The port is held by a leftover whose `state` is `session dead` AND whose `idle_ms` is at least 600000 (10 min without any connection): free it with `btp kill <port>`, then start yours.
 - The port is held by a `session dead` server that is still in use (`idle_ms` under 600000): the user is probably still using it (a browser tab). Leave it alone and pick another port; the app kills it once it has been idle long enough.
 - The port is held by another live session's server (`session_alive` is `true`, other worktree): never touch it. Pick another port.
-- The port is not in the list but is taken: it was not started from a Claude Code session, so `btp` does not manage it. Do not kill it, pick another port.
+- The port is not in the list but is taken: it was not started from a coding-agent session, so `btp` does not manage it. Do not kill it, pick another port.
 
 ## Tell btp your intent
 
@@ -51,4 +51,4 @@ btp note 5173 --done     # once the session quit, stopped as soon as idle
 btp recent               # the last kills and why
 ```
 
-`recent_kills` entries carry a `reason` of `{"kind": "manual"}`, `{"kind": "worktree_deleted"}`, `{"kind": "dead_session_idle", "idle_ms": ...}`, or `{"kind": "other"}` for a kind written by a newer btp.
+`recent_kills` entries carry a `reason` of `{"kind": "manual"}`, `{"kind": "worktree_deleted"}`, `{"kind": "dead_session_idle", "idle_ms": ...}`, `{"kind": "session_ended"}`, or `{"kind": "other"}` for a kind written by a newer btp.

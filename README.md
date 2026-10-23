@@ -2,7 +2,7 @@
 
 Claude Code sessions start dev servers (Astro, wrangler, Metro, Vite, `serve`...) and leave them behind. The session ends or crashes, the worktree is deleted, and the ports stay taken. Balance ton port cleans up automatically and asks only when it cannot be sure.
 
-It is a macOS menu bar app plus a `btp` CLI, both on one Rust core, and an agent skill.
+It is a macOS menu bar app plus a `btp` CLI, both on one Rust core, and an agent skill. Codex CLI sessions are supported too (no idle alert, no session-end cleanup); Codex users paste `plugin/skills/balance-ton-port/AGENTS.md` into their repo's `AGENTS.md`.
 
 ## What it does
 
