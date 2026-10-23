@@ -732,3 +732,126 @@ final class MenuLayoutTests: XCTestCase {
         XCTAssertEqual(iconTile(menuServer(title: "@scope/app")).letter, "S")
     }
 }
+
+final class MenuActionTests: XCTestCase {
+    func testConfirmationOnlyForObserved() {
+        XCTAssertFalse(needsConfirmation(menuServer()), "an agent server stops without asking")
+        XCTAssertTrue(needsConfirmation(menuServer(managed: false, agent: "")))
+    }
+
+    func testConfirmationCopy() {
+        let s = menuServer(port: 3000, managed: false, agent: "", title: "client-portal")
+        let stop = confirmationText(s, action: .stop)
+        XCTAssertEqual(stop.title, "Stop client-portal :3000?")
+        XCTAssertEqual(stop.message, "No agent started it. Balance ton port never stops it on its own.")
+        XCTAssertEqual(stop.button, "Stop")
+        let restart = confirmationText(menuServer(port: 10_443, managed: false, agent: "", title: "api"), action: .restart)
+        XCTAssertEqual(restart.title, "Restart api :10443?", "no digit grouping")
+        XCTAssertEqual(restart.message, stop.message)
+        XCTAssertEqual(restart.button, "Restart")
+    }
+
+    func testLeakNotificationBody() {
+        var big = menuServer(port: 3010, title: "Revva web")
+        big.rssBytes = UInt64(2.3 * 1024 * 1_048_576)
+        big.card = CardFfi(kind: "leak", reason: "Using 2.3 GB", action: "restart")
+        XCTAssertEqual(leakNotificationBody(big), "Revva web :3010 is using 2.3 GB")
+        var growing = menuServer(port: 5173, title: "Vite")
+        growing.growthBytes = 600 * 1_048_576
+        growing.card = CardFfi(kind: "leak", reason: "Growing fast: +600 MB in 10 min", action: "restart")
+        XCTAssertEqual(leakNotificationBody(growing), "Vite :5173 grew 600 MB in 10 min")
+    }
+
+    func testMoreMenuItemsOrderAndDisabledStates() {
+        var s = menuServer(card: "idle_alert")
+        s.canRestart = true
+        let items = moreMenuItems(s)
+        XCTAssertEqual(
+            items.map(\.title),
+            ["\u{2197} Open in browser", "\u{27F3} Restart", "\u{23F8} Keep (no alerts)", "\u{2298} Ignore this alert",
+             "\u{24D8} Details\u{2026}", "", "\u{25A0} Stop"]
+        )
+        XCTAssertEqual(items.map(\.kind), [.open, .restart, .keep, .ignoreAlert, .details, .separator, .stop])
+        XCTAssertEqual(items.filter(\.enabled).map(\.kind), [.open, .restart, .keep, .ignoreAlert, .stop])
+
+        func enabled(_ s: ServerViewFfi) -> [MenuItemKind] { moreMenuItems(s).filter(\.enabled).map(\.kind) }
+        XCTAssertEqual(enabled(menuServer()), [.open, .keep, .stop], "no Restart when it cannot, no Ignore without a card")
+        XCTAssertEqual(enabled(menuServer(managed: false, agent: "")), [.open, .stop], "no Keep for an observed server")
+        var excluded = menuServer(managed: false, agent: "")
+        excluded.excluded = true
+        XCTAssertEqual(enabled(excluded), [.open], "no Stop for an excluded server")
+        XCTAssertEqual(enabled(menuServer(card: "leak", action: "restart")), [.open, .keep, .ignoreAlert, .stop])
+        XCTAssertEqual(
+            enabled(menuServer(card: "about_to_stop", action: "postpone")), [.open, .keep, .stop],
+            "an about-to-stop card is not an alert"
+        )
+    }
+
+    func testCapsuleHasNoRestart() {
+        XCTAssertEqual(capsuleButtons(menuServer()), [.open, .stop, .more])
+        var excluded = menuServer(managed: false, agent: "")
+        excluded.excluded = true
+        XCTAssertEqual(capsuleButtons(excluded), [.open, .more])
+    }
+
+    func testCardPillEnabled() {
+        var s = menuServer(card: "leak", action: "restart")
+        XCTAssertFalse(cardActionEnabled(s.card!, s), "no Restart when it cannot")
+        s.canRestart = true
+        XCTAssertTrue(cardActionEnabled(s.card!, s))
+        let observed = menuServer(managed: false, agent: "", card: "session_ended_open", action: "stop")
+        XCTAssertTrue(cardActionEnabled(observed.card!, observed), "Stop with a confirmation")
+        let postpone = menuServer(card: "about_to_stop", action: "postpone")
+        XCTAssertTrue(cardActionEnabled(postpone.card!, postpone))
+    }
+
+    func testOpenURL() {
+        XCTAssertEqual(openURL(menuServer(port: 10_443)).absoluteString, "http://localhost:10443/")
+    }
+
+    func testOptimisticViews() {
+        let soon = menuServer(card: "about_to_stop", action: "postpone")
+        let p = postponedView(soon)
+        XCTAssertNil(p.card)
+        XCTAssertEqual(p.statusText, "stops in 60 min")
+        XCTAssertEqual(p.killInMs, 3_600_000)
+        XCTAssertTrue(p.postponed)
+        XCTAssertNotNil(postponedView(menuServer(card: "leak", action: "restart")).card, "a leak stays")
+
+        let k = keptView(menuServer(card: "idle_alert"))
+        XCTAssertNil(k.card)
+        XCTAssertEqual(k.statusText, "kept by you")
+        XCTAssertNil(k.killInMs)
+        XCTAssertNotNil(keptView(menuServer(card: "session_ended_open")).card)
+        XCTAssertNotNil(keptView(menuServer(card: "leak")).card)
+
+        XCTAssertNil(alertIgnoredView(menuServer(card: "leak")).card)
+        XCTAssertNotNil(alertIgnoredView(menuServer(card: "about_to_stop")).card, "not an alert: unchanged")
+    }
+
+    func testRowNoteText() {
+        XCTAssertEqual(rowNoteText(.restarting), "restarting\u{2026}")
+        XCTAssertEqual(rowNoteText(.blocked("The port is still taken")), "The port is still taken")
+        XCTAssertEqual(blockedNoteDuration, 4)
+    }
+
+    func testLeakRoutes() {
+        let id = ServerID(pid: 7, startTime: 99)
+        let i = notificationUserInfo(id) as [AnyHashable: Any]
+        XCTAssertEqual(notificationRoute(actionIdentifier: NotificationIDs.restart, userInfo: i), .server(.restart, id))
+        XCTAssertEqual(notificationRoute(actionIdentifier: NotificationIDs.ignore, userInfo: i), .server(.ignoreAlert, id))
+        XCTAssertEqual(leakRequestID(id), "leak-7-99")
+    }
+
+    func testActionCopyHasNoEmDash() {
+        let s = menuServer(managed: false, agent: "", card: "leak")
+        var copy = moreMenuItems(s).map(\.title) + [leakNotificationBody(s), rowNoteText(.restarting)]
+        for a in [ConfirmAction.stop, .restart] {
+            let t = confirmationText(s, action: a)
+            copy += [t.title, t.message, t.button]
+        }
+        for text in copy {
+            XCTAssertFalse(text.contains("\u{2014}"), text)
+        }
+    }
+}

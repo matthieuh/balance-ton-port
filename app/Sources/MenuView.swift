@@ -63,7 +63,7 @@ struct MenuView: View {
                         if let card = server.card {
                             NeedsYouCard(
                                 server: server, card: card, favicon: model.icons[server.id],
-                                onKeep: keepAction(server), onStop: stopAction(server)
+                                note: model.rowNotes[server.id]
                             )
                         }
                     }
@@ -79,7 +79,7 @@ struct MenuView: View {
                     ServerRowView(
                         server: server, favicon: model.icons[server.id],
                         notificationsOff: model.unnotified.contains(server.id),
-                        onKeep: keepAction(server), onStop: stopAction(server)
+                        note: model.rowNotes[server.id]
                     )
                 }
                 if sections.hiddenCount > 0 {
@@ -104,16 +104,6 @@ struct MenuView: View {
         Text(verbatim: title)
             .font(.system(size: 11, weight: .semibold))
             .foregroundStyle(color)
-    }
-
-    /// Keep and Stop exist for agent servers only; observed ones get theirs
-    /// (with a confirmation) later.
-    private func keepAction(_ server: ServerViewFfi) -> (() -> Void)? {
-        server.managed ? { model.keep(server.id) } : nil
-    }
-
-    private func stopAction(_ server: ServerViewFfi) -> (() -> Void)? {
-        server.managed && !server.excluded ? { model.kill(server) } : nil
     }
 
     /// Notifications off, another watcher, errors, the last manual kill.

@@ -27,6 +27,9 @@ final class CoreModel: ObservableObject {
     /// A short note about the last manual kill ("already gone"), shown in the
     /// menu for `killedHoldTime`.
     @Published private(set) var killNotice: String?
+    /// "restarting…" while a Restart runs, then a refused Restart's reason
+    /// for `blockedNoteDuration`, in place of the row's status.
+    @Published private(set) var rowNotes: [ServerID: RowNote] = [:]
     private var killNoticeAt: Date?
     /// The last Settings save error, cleared by the next successful save.
     @Published private(set) var settingsError: String?
@@ -42,6 +45,12 @@ final class CoreModel: ObservableObject {
     private var killedByHand: [ServerID: Date] = [:]
     /// Every server the last pass reported, hidden ones included.
     private var lastPassServers: [ServerViewFfi] = []
+    /// Rows changed at once by Postpone, Keep or Ignore this alert, applied
+    /// over every pass enqueued before the action reached the core (`since`
+    /// is `passCount` at the click), dropped by the first pass after it.
+    private var optimistic: [ServerID: (since: Int, apply: (ServerViewFfi) -> ServerViewFfi)] = [:]
+    /// Passes enqueued so far.
+    private var passCount = 0
     private let killedHoldTime: TimeInterval = 30
     private let notifier = Notifier()
 
@@ -51,6 +60,8 @@ final class CoreModel: ObservableObject {
             switch route {
             case .server(.kill, let id): self.kill(id, fromNotification: true)
             case .server(.keep, let id): self.keep(id)
+            case .server(.restart, let id): self.restartFromNotification(id)
+            case .server(.ignoreAlert, let id): self.ignoreAlert(id)
             case .sessionEnded(.stopNow, let id): self.stopSessionEnded(id)
             case .sessionEnded(.keep, let id): self.keepSessionEnded(id)
             }
@@ -102,7 +113,7 @@ final class CoreModel: ObservableObject {
     /// hidden, and the menu says why (`missedKillNotice`).
     func kill(_ id: ServerID, fromNotification: Bool = false) {
         killedByHand[id] = Date()
-        servers.removeAll { $0.id == id }
+        publish()
         Task {
             do {
                 let (record, kills) = try await onCore { core in
@@ -126,16 +137,183 @@ final class CoreModel: ObservableObject {
         }
     }
 
-    /// A notification's Keep button: no more alerts for this server until it
-    /// restarts.
+    /// Opens the server in the default browser.
+    func open(_ server: ServerViewFfi) {
+        NSWorkspace.shared.open(openURL(server))
+    }
+
+    /// Stop from the menu: an agent server at once (`kill`), a server no
+    /// agent started after the confirmation. Never an excluded one.
+    func stop(_ server: ServerViewFfi) {
+        guard !server.excluded else { return }
+        guard needsConfirmation(server) else {
+            kill(server.id)
+            return
+        }
+        confirm(server, .stop) { [weak self] in self?.stopObserved(server.id) }
+    }
+
+    /// Stops a server no agent started (already confirmed). The row leaves
+    /// at once, like a kill.
+    private func stopObserved(_ id: ServerID) {
+        killedByHand[id] = Date()
+        publish()
+        Task {
+            do {
+                let (record, kills) = try await onCore { core in
+                    let record = try core.stopObserved(pid: id.pid, startTime: id.startTime)
+                    return (record, try core.recentKills())
+                }
+                recentKills = kills
+                if record == nil {
+                    killedByHand[id] = nil
+                    killNotice = missedKillNotice(id, tracked: [], fromNotification: false)
+                    killNoticeAt = Date()
+                    publish()
+                } else {
+                    killNotice = nil
+                }
+            } catch {
+                killedByHand[id] = nil
+                publish()
+                lastError = error.localizedDescription
+            }
+        }
+    }
+
+    /// Restart: stops the server and starts it again the same way (a server
+    /// no agent started after the confirmation). The row says
+    /// "restarting…" at once; the core call blocks for the kill grace plus
+    /// up to 5 s, on the core queue. A refused Restart shows its reason in
+    /// the row for `blockedNoteDuration`; a done one leaves the note until
+    /// the next pass, which lists the new process instead.
+    func restart(_ server: ServerViewFfi) {
+        guard server.canRestart, rowNotes[server.id] != .restarting else { return }
+        guard needsConfirmation(server) else {
+            runRestart(server.id)
+            return
+        }
+        confirm(server, .restart) { [weak self] in self?.runRestart(server.id) }
+    }
+
+    /// A leak notification's Restart: the app is brought forward, so the
+    /// confirmation of a server no agent started shows on top.
+    private func restartFromNotification(_ id: ServerID) {
+        guard let server = lastPassServers.first(where: { $0.id == id }) else {
+            killNotice = missedRestartNotice
+            killNoticeAt = Date()
+            return
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        restart(server)
+    }
+
+    private func runRestart(_ id: ServerID) {
+        rowNotes[id] = .restarting
+        Task {
+            do {
+                let blocked = try await onCore { core in try core.restart(pid: id.pid, startTime: id.startTime) }
+                if let blocked { showBlocked(blocked, for: id) }
+            } catch {
+                rowNotes[id] = nil
+                lastError = error.localizedDescription
+            }
+        }
+    }
+
+    private func showBlocked(_ copy: String, for id: ServerID) {
+        let note = RowNote.blocked(copy)
+        rowNotes[id] = note
+        Task {
+            try? await Task.sleep(for: .seconds(blockedNoteDuration))
+            if rowNotes[id] == note { rowNotes[id] = nil }
+        }
+    }
+
+    /// Postpone 1 h: the row says `stops in 60 min` at once.
+    func postpone(_ server: ServerViewFfi) {
+        let id = server.id
+        applyOptimistic(id, postponedView)
+        Task {
+            do {
+                let found = try await onCore { core in try core.postpone(pid: id.pid, startTime: id.startTime) }
+                if !found { dropOptimistic(id) }
+            } catch {
+                dropOptimistic(id)
+                lastError = error.localizedDescription
+            }
+        }
+    }
+
+    func keep(_ server: ServerViewFfi) {
+        keep(server.id)
+    }
+
+    /// Keep, from the menu or a notification: no more alerts for this
+    /// server until it restarts.
     func keep(_ id: ServerID) {
+        applyOptimistic(id, keptView)
         Task {
             do {
                 try await onCore { core in try core.keep(pid: id.pid, startTime: id.startTime) }
             } catch {
+                dropOptimistic(id)
                 lastError = error.localizedDescription
             }
         }
+    }
+
+    func ignoreAlert(_ server: ServerViewFfi) {
+        ignoreAlert(server.id)
+    }
+
+    /// "Ignore this alert", from the menu or a leak notification: the alert
+    /// card goes at once. The core refuses a card that is not an alert.
+    func ignoreAlert(_ id: ServerID) {
+        applyOptimistic(id, alertIgnoredView)
+        Task {
+            let ignored = try? await onCore { core in core.ignoreAlert(pid: id.pid, startTime: id.startTime) }
+            if ignored != true { dropOptimistic(id) }
+        }
+    }
+
+    /// Shows the confirmation for a server no agent started, then runs
+    /// `action` when the user agrees. Run from the main run loop, outside
+    /// any main-queue job, so passes keep landing while the alert is up.
+    private func confirm(_ server: ServerViewFfi, _ action: ConfirmAction, then run: @escaping @MainActor () -> Void) {
+        let text = confirmationText(server, action: action)
+        RunLoop.main.perform(inModes: [.common]) {
+            MainActor.assumeIsolated {
+                NSApp.activate(ignoringOtherApps: true)
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = text.title
+                alert.informativeText = text.message
+                let button = alert.addButton(withTitle: text.button)
+                button.hasDestructiveAction = action == .stop
+                alert.addButton(withTitle: "Cancel")
+                if alert.runModal() == .alertFirstButtonReturn { run() }
+            }
+        }
+    }
+
+    private func applyOptimistic(_ id: ServerID, _ change: @escaping (ServerViewFfi) -> ServerViewFfi) {
+        let earlier = optimistic[id]?.apply
+        optimistic[id] = (passCount, { change(earlier?($0) ?? $0) })
+        publish()
+    }
+
+    private func dropOptimistic(_ id: ServerID) {
+        optimistic[id] = nil
+        publish()
+    }
+
+    /// The rows the menu shows: the last pass, without the servers stopped
+    /// by hand, with the changes the core has not confirmed yet.
+    private func publish() {
+        servers = lastPassServers
+            .filter { killedByHand[$0.id] == nil }
+            .map { optimistic[$0.id]?.apply($0) ?? $0 }
     }
 
     /// A session-ended notification's Stop now: stops each kept server of
@@ -202,6 +380,8 @@ final class CoreModel: ObservableObject {
     /// scheduled once this one has finished.
     private func pass() async {
         var interval: TimeInterval = 5
+        passCount += 1
+        let generation = passCount
         do {
             let result = try await onCore { core in
                 // Retried every pass, so the app takes over when `btp watch` stops.
@@ -215,7 +395,7 @@ final class CoreModel: ObservableObject {
                 return PassResult(
                     owner: owner, servers: report.servers, alerts: report.alerts,
                     kills: kills, scanIntervalS: scan, configError: report.configError,
-                    memory: report.memory
+                    memory: report.memory, leaks: report.leaks
                 )
             }
             watchedElsewhere = !result.owner
@@ -226,7 +406,11 @@ final class CoreModel: ObservableObject {
                 killNoticeAt = nil
             }
             lastPassServers = result.servers
-            servers = result.servers.filter { killedByHand[$0.id] == nil }
+            // This pass was enqueued after those actions: it shows them.
+            optimistic = optimistic.filter { $0.value.since >= generation }
+            let live = Set(result.servers.map(\.id))
+            rowNotes = rowNotes.filter { live.contains($0.key) }
+            publish()
             memory = result.memory
             recentKills = result.kills
             loadIcons(for: result.servers)
@@ -246,6 +430,18 @@ final class CoreModel: ObservableObject {
                 unnotified = Set(result.alerts.map(\.id)).subtracting(delivered)
             } else {
                 unnotified = []
+            }
+            // Leaks are this app's own (no other watcher notifies them), so
+            // they are posted read-only too; marked once added, like alerts.
+            if !result.leaks.isEmpty {
+                let delivered = await notifier.postLeaks(result.leaks)
+                if !delivered.isEmpty {
+                    try await onCore { core in
+                        for id in delivered {
+                            core.markLeakNotified(pid: id.pid, startTime: id.startTime)
+                        }
+                    }
+                }
             }
             await refreshNotificationPermission()
             interval = TimeInterval(max(1, result.scanIntervalS))
@@ -351,4 +547,5 @@ private struct PassResult: Sendable {
     let scanIntervalS: UInt64
     let configError: String?
     let memory: MemoryBarFfi
+    let leaks: [ServerViewFfi]
 }
