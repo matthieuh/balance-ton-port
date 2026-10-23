@@ -17,7 +17,7 @@ use crate::model::{Action, KillReason, KillTarget, Note, Observation, ServerKey,
 use crate::platform::{ancestry, format_proc_start, Listener, Platform, ProcInfo, ProcResources};
 use crate::sessions::default_config_dirs;
 use crate::state::{append_kill_log, with_state, KillRecord, State};
-use crate::worktree::worktree_root;
+use crate::worktree::{worktree_root, MetaCache};
 use fs4::{FileExt, TryLockError};
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
@@ -520,6 +520,7 @@ pub struct Watcher<P: Platform> {
     /// Why the last read of `config.toml` failed, cleared once it parses.
     config_error: Option<String>,
     history: History,
+    meta: MetaCache,
 }
 
 impl<P: Platform> Watcher<P> {
@@ -533,12 +534,27 @@ impl<P: Platform> Watcher<P> {
             last_good: None,
             config_error: None,
             history: History::default(),
+            meta: MetaCache::default(),
         }
     }
 
     /// Memory, CPU and events of every server seen by the passes so far.
     pub fn history(&self) -> &History {
         &self.history
+    }
+
+    /// `(framework, package name, git branch)` of a server for its menu row
+    /// and detail chips. Framework and package name are read once per server
+    /// key, the branch again after 30 s. No subprocess.
+    pub fn server_meta(
+        &mut self,
+        key: &ServerKey,
+        command: &str,
+        cwd: &Path,
+        worktree: &Path,
+        now_ms: u64,
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        self.meta.get(key, command, cwd, worktree, now_ms)
     }
 
     /// Replaces the automatic discovery of Claude config dirs (tests pass

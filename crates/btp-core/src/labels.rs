@@ -47,6 +47,87 @@ pub fn tool_label(command: &str) -> String {
     }
 }
 
+/// Frameworks a `package.json` dependency can name, in priority order, with
+/// the dependency names that stand for each.
+const DEPENDENCY_FRAMEWORKS: &[(&str, &[&str])] = &[
+    ("Vite", &["vite"]),
+    ("Next.js", &["next"]),
+    ("Astro", &["astro"]),
+    ("Expo", &["expo"]),
+    ("wrangler", &["wrangler"]),
+    ("Remix", &["@remix-run/dev", "@remix-run/serve", "remix"]),
+    ("Nuxt", &["nuxt"]),
+    ("SvelteKit", &["@sveltejs/kit"]),
+    ("Storybook", &["storybook", "@storybook/react"]),
+];
+
+/// The framework a server runs: from its command when that names a known
+/// tool, else, for a package-manager script (`npm run dev`, `bun dev`), from
+/// the script's text and then from the dependencies of `package_json`.
+pub fn framework(command: &str, package_json: Option<&str>) -> Option<String> {
+    if let Some(f) = framework_of_command(command) {
+        return Some(f);
+    }
+    let script = package_script(command)?;
+    let pkg: serde_json::Value = serde_json::from_str(package_json?).ok()?;
+    if let Some(text) = pkg["scripts"][&script].as_str() {
+        if let Some(f) = framework_of_command(text) {
+            return Some(f);
+        }
+    }
+    DEPENDENCY_FRAMEWORKS.iter().find_map(|(name, deps)| {
+        let has = |section: &str| deps.iter().any(|d| pkg[section].get(*d).is_some());
+        (has("dependencies") || has("devDependencies")).then(|| name.to_string())
+    })
+}
+
+/// The framework a command line names on its own.
+fn framework_of_command(command: &str) -> Option<String> {
+    let label = tool_label(command);
+    let known = match label.as_str() {
+        "Vite" | "Astro" | "Next.js" | "Remix" | "Nuxt" | "Storybook" | "Django" | "Rails" => {
+            Some(label.as_str())
+        }
+        "Expo (Metro)" => Some("Expo"),
+        "serve" | "Python http.server" => Some("static"),
+        l if l.starts_with("wrangler") => Some("wrangler"),
+        _ => None,
+    };
+    if let Some(k) = known {
+        return Some(k.to_string());
+    }
+    command
+        .split_whitespace()
+        .filter(|w| !is_flag(w))
+        .find_map(|w| match program_name(w).as_str() {
+            "svelte-kit" => Some("SvelteKit"),
+            "flask" => Some("Flask"),
+            "http-server" => Some("static"),
+            _ => None,
+        })
+        .map(str::to_string)
+}
+
+/// The script name of a package-manager command (`npm run dev`, `bun dev`,
+/// `pnpm dev`, `yarn dev`), if it is one.
+fn package_script(command: &str) -> Option<String> {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let i = words
+        .iter()
+        .position(|w| matches!(program_name(w).as_str(), "npm" | "bun" | "pnpm" | "yarn"))?;
+    words[i + 1..]
+        .iter()
+        .find(|w| !is_flag(w) && !matches!(**w, "run" | "run-script"))
+        .map(|w| w.to_string())
+}
+
+/// The `name` of a `package.json`, if it has one.
+pub fn package_name(package_json: &str) -> Option<String> {
+    let pkg: serde_json::Value = serde_json::from_str(package_json).ok()?;
+    let name = pkg["name"].as_str()?.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 /// The label for a word that names a known dev server, `rest` being the
 /// words after it.
 fn known_tool(name: &str, rest: &[&str]) -> Option<String> {
@@ -220,7 +301,7 @@ pub fn session_display_name(name: Option<&str>, cwd: &Path) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
@@ -358,12 +439,65 @@ mod tests {
         assert_eq!(tool_label("caddy --config=/etc/vite"), "caddy");
     }
 
-    fn linked_worktree(root: &Path, repo: &str, wt: &str, gitdir: &str) -> PathBuf {
+    pub(crate) fn linked_worktree(root: &Path, repo: &str, wt: &str, gitdir: &str) -> PathBuf {
         fs::create_dir_all(root.join(repo).join(".git/worktrees").join(wt)).unwrap();
         let dir = root.join("trees").join(wt);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(".git"), format!("gitdir: {gitdir}\n")).unwrap();
         dir
+    }
+
+    #[test]
+    fn framework_from_command() {
+        let f = |c| framework(c, None);
+        assert_eq!(
+            f("node /r/node_modules/vite/bin/vite.js").as_deref(),
+            Some("Vite")
+        );
+        assert_eq!(f("next dev").as_deref(), Some("Next.js"));
+        assert_eq!(f("wrangler dev --port=3010").as_deref(), Some("wrangler"));
+        assert_eq!(f("python3 -m http.server 8000").as_deref(), Some("static"));
+        assert_eq!(f("npx expo start").as_deref(), Some("Expo"));
+        assert_eq!(f("flask run").as_deref(), Some("Flask"));
+    }
+
+    #[test]
+    fn framework_from_package_script() {
+        let pkg = r#"{"scripts":{"dev":"astro dev"}}"#;
+        assert_eq!(
+            framework("npm run dev", Some(pkg)).as_deref(),
+            Some("Astro")
+        );
+        assert_eq!(framework("pnpm dev", Some(pkg)).as_deref(), Some("Astro"));
+    }
+
+    #[test]
+    fn framework_from_dependencies() {
+        let pkg = r#"{"scripts":{"dev":"node server.js"},"dependencies":{"next":"15"}}"#;
+        assert_eq!(framework("bun dev", Some(pkg)).as_deref(), Some("Next.js"));
+    }
+
+    #[test]
+    fn framework_none_for_unknown() {
+        assert_eq!(framework("node server.js", None), None);
+        let pkg = r#"{"scripts":{"dev":"node server.js"}}"#;
+        assert_eq!(framework("npm run dev", Some(pkg)), None);
+        // Dependencies only count behind a package-manager script.
+        let deps = r#"{"dependencies":{"next":"15"}}"#;
+        assert_eq!(framework("node server.js", Some(deps)), None);
+    }
+
+    #[test]
+    fn bad_package_json_is_ignored() {
+        assert_eq!(framework("npm run dev", Some("{not json")), None);
+        assert_eq!(package_name("{not json"), None);
+    }
+
+    #[test]
+    fn package_name_reads_name() {
+        assert_eq!(package_name(r#"{"name":"web"}"#).as_deref(), Some("web"));
+        assert_eq!(package_name(r#"{"name":" "}"#), None);
+        assert_eq!(package_name("{}"), None);
     }
 
     #[test]
