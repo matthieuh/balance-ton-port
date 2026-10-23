@@ -367,3 +367,77 @@ fn bench_full_scan() {
         total / runs
     );
 }
+
+#[test]
+fn proc_resources_of_self_is_nonzero() {
+    let r = MacOs
+        .proc_resources(std::process::id() as i32)
+        .expect("own process is inspectable");
+    assert!(r.rss_bytes > 0 && r.cpu_time_ns > 0, "{r:?}");
+    assert_eq!(MacOs.proc_resources(999_999), None);
+}
+
+#[test]
+fn cpu_time_grows_with_work() {
+    let pid = std::process::id() as i32;
+    let first = MacOs.proc_resources(pid).unwrap().cpu_time_ns;
+    let start = Instant::now();
+    let mut x = 0u64;
+    while start.elapsed() < Duration::from_millis(50) {
+        x = std::hint::black_box(x.wrapping_add(1));
+    }
+    let second = MacOs.proc_resources(pid).unwrap().cpu_time_ns;
+    assert!(second > first, "{first} -> {second}");
+}
+
+#[test]
+fn machine_memory_is_sane() {
+    let m = MacOs.machine_memory().expect("memory readable");
+    assert!(m.used_bytes > 0 && m.used_bytes <= m.total_bytes, "{m:?}");
+    let mut value: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"hw.memsize".as_ptr(),
+            (&mut value as *mut u64).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    assert_eq!(rc, 0);
+    assert_eq!(m.total_bytes, value);
+}
+
+#[test]
+fn proc_argv_matches_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = spawn_helper("listen", dir.path());
+    let argv = MacOs.proc_argv(h.pid()).expect("own child is inspectable");
+    assert!(argv.iter().any(|a| a == "zz_helper"), "{argv:?}");
+    assert_eq!(argv.join(" "), MacOs.proc_info(h.pid()).unwrap().command);
+    assert_eq!(MacOs.proc_argv(999_999), None);
+}
+
+#[test]
+fn exe_path_of_helper() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = spawn_helper("listen", dir.path());
+    let path = MacOs.exe_path(h.pid()).expect("own child is inspectable");
+    let me = std::env::current_exe().unwrap();
+    assert_eq!(path.file_name(), me.file_name());
+    assert_eq!(MacOs.exe_path(999_999), None);
+}
+
+#[test]
+fn established_excluding_ignores_connections_from_listed_pid() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = spawn_helper("listen", dir.path());
+    let _c1 = TcpStream::connect(("127.0.0.1", h.port)).unwrap();
+    let _c2 = TcpStream::connect(("127.0.0.1", h.port)).unwrap();
+    assert!(wait_until(|| MacOs.established(h.pid(), h.port) == 2));
+    let me = std::process::id() as i32;
+    assert_eq!(MacOs.established_excluding(h.pid(), h.port, &[me]), 0);
+    assert_eq!(MacOs.established_excluding(h.pid(), h.port, &[999_999]), 2);
+    assert_eq!(MacOs.established_excluding(h.pid(), h.port, &[]), 2);
+}

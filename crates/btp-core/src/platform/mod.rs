@@ -28,6 +28,23 @@ pub struct ProcInfo {
     pub command: String,
 }
 
+/// Resident memory and accumulated CPU time of one process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProcResources {
+    pub rss_bytes: u64,
+    /// User + system CPU time since the process started, nanoseconds.
+    pub cpu_time_ns: u64,
+}
+
+/// Machine-wide memory, in bytes. Free is `total_bytes - used_bytes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MachineMemory {
+    pub total_bytes: u64,
+    /// As Activity Monitor's "Memory Used": app memory (internal minus
+    /// purgeable) + wired + compressed.
+    pub used_bytes: u64,
+}
+
 pub trait Platform {
     /// TCP listeners of every inspectable process, one entry per pid + port.
     fn listeners(&self) -> Vec<Listener>;
@@ -48,6 +65,21 @@ pub trait Platform {
     fn open_paths(&self, pid: i32) -> Vec<PathBuf>;
     /// Current-user pids whose process name equals `name`.
     fn pids_named(&self, name: &str) -> Vec<i32>;
+    /// Resident memory and CPU time of `pid`, `None` when gone or not ours.
+    fn proc_resources(&self, pid: i32) -> Option<ProcResources>;
+    /// Total and used memory of the machine.
+    fn machine_memory(&self) -> Option<MachineMemory>;
+    /// The argv vector of `pid` (what `ProcInfo::command` joins).
+    fn proc_argv(&self, pid: i32) -> Option<Vec<String>>;
+    /// Path of the executable `pid` runs.
+    fn exe_path(&self, pid: i32) -> Option<PathBuf>;
+    /// Like `established`, but a connection whose remote end is a loopback
+    /// socket owned by one of `peer_pids` does not count. Only those pids
+    /// are scanned.
+    fn established_excluding(&self, pid: i32, port: u16, peer_pids: &[i32]) -> u32 {
+        let _ = peer_pids;
+        self.established(pid, port)
+    }
 }
 
 const MAX_ANCESTRY: usize = 64;
@@ -109,7 +141,7 @@ pub use fake::FakePlatform;
 
 #[cfg(any(test, feature = "fake"))]
 mod fake {
-    use super::{format_proc_start, Listener, Platform, ProcInfo};
+    use super::{format_proc_start, Listener, MachineMemory, Platform, ProcInfo, ProcResources};
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -124,6 +156,11 @@ mod fake {
         signals: Vec<(i32, i32)>,
         env: HashMap<i32, Vec<(String, String)>>,
         open_paths: HashMap<i32, Vec<PathBuf>>,
+        resources: HashMap<i32, ProcResources>,
+        machine_memory: Option<MachineMemory>,
+        exe: HashMap<i32, PathBuf>,
+        /// `(pid, port)` -> `(peer pid, connections from it)`.
+        established_from: Vec<(i32, u16, i32, u32)>,
     }
 
     /// In-memory platform for tests. SIGTERM and SIGKILL remove a process
@@ -197,6 +234,37 @@ mod fake {
         pub fn set_open_paths(&self, pid: i32, paths: &[&str]) {
             let paths = paths.iter().map(PathBuf::from).collect();
             self.st().open_paths.insert(pid, paths);
+        }
+
+        pub fn set_resources(&self, pid: i32, rss: u64, cpu_ns: u64) {
+            self.st().resources.insert(
+                pid,
+                ProcResources {
+                    rss_bytes: rss,
+                    cpu_time_ns: cpu_ns,
+                },
+            );
+        }
+
+        pub fn set_machine_memory(&self, total: u64, used: u64) {
+            self.st().machine_memory = Some(MachineMemory {
+                total_bytes: total,
+                used_bytes: used,
+            });
+        }
+
+        pub fn set_exe(&self, pid: i32, path: &str) {
+            self.st().exe.insert(pid, PathBuf::from(path));
+        }
+
+        /// `n` of the connections counted by `established(pid, port)` come
+        /// from `peer_pid`: `established_excluding` drops them when that pid
+        /// is listed.
+        pub fn set_established_from(&self, pid: i32, port: u16, peer_pid: i32, n: u32) {
+            let mut st = self.st();
+            st.established_from
+                .retain(|e| (e.0, e.1, e.2) != (pid, port, peer_pid));
+            st.established_from.push((pid, port, peer_pid, n));
         }
 
         /// Every `(pid, sig)` sent so far, in order.
@@ -281,6 +349,44 @@ mod fake {
                 return Vec::new();
             }
             st.open_paths.get(&pid).cloned().unwrap_or_default()
+        }
+
+        fn proc_resources(&self, pid: i32) -> Option<ProcResources> {
+            let st = self.st();
+            if !st.procs.contains_key(&pid) {
+                return None;
+            }
+            st.resources.get(&pid).copied()
+        }
+
+        fn machine_memory(&self) -> Option<MachineMemory> {
+            self.st().machine_memory
+        }
+
+        fn proc_argv(&self, pid: i32) -> Option<Vec<String>> {
+            let st = self.st();
+            let p = st.procs.get(&pid)?;
+            Some(p.command.split(' ').map(str::to_string).collect())
+        }
+
+        fn exe_path(&self, pid: i32) -> Option<PathBuf> {
+            let st = self.st();
+            if !st.procs.contains_key(&pid) {
+                return None;
+            }
+            st.exe.get(&pid).cloned()
+        }
+
+        fn established_excluding(&self, pid: i32, port: u16, peer_pids: &[i32]) -> u32 {
+            let total = self.established(pid, port);
+            let st = self.st();
+            let from_peers: u32 = st
+                .established_from
+                .iter()
+                .filter(|e| e.0 == pid && e.1 == port && peer_pids.contains(&e.2))
+                .map(|e| e.3)
+                .sum();
+            total.saturating_sub(from_peers)
         }
 
         fn pids_named(&self, name: &str) -> Vec<i32> {
@@ -389,6 +495,55 @@ mod tests {
         let f = chain_platform();
         assert!(f.descendants(0).is_empty());
         assert!(f.descendants(-1).is_empty());
+    }
+
+    #[test]
+    fn fake_resources_memory_argv_and_exe() {
+        let f = chain_platform();
+        f.spawn(60, 1, 8, "node vite --port 5173", "/w");
+        assert_eq!(f.proc_resources(60), None);
+        f.set_resources(60, 4096, 7);
+        assert_eq!(
+            f.proc_resources(60),
+            Some(ProcResources {
+                rss_bytes: 4096,
+                cpu_time_ns: 7
+            })
+        );
+        f.remove_proc(60);
+        assert_eq!(f.proc_resources(60), None);
+        assert_eq!(f.machine_memory(), None);
+        f.set_machine_memory(100, 40);
+        assert_eq!(
+            f.machine_memory(),
+            Some(MachineMemory {
+                total_bytes: 100,
+                used_bytes: 40
+            })
+        );
+        assert_eq!(
+            f.proc_argv(30),
+            Some(vec!["bun".to_string(), "dev".to_string()])
+        );
+        assert_eq!(f.proc_argv(999), None);
+        assert_eq!(f.exe_path(30), None);
+        f.set_exe(30, "/usr/bin/bun");
+        assert_eq!(f.exe_path(30), Some(PathBuf::from("/usr/bin/bun")));
+    }
+
+    #[test]
+    fn fake_established_excluding_drops_listed_peers_only() {
+        let f = chain_platform();
+        f.set_established(30, 3000, 5);
+        f.set_established_from(30, 3000, 20, 2);
+        f.set_established_from(30, 3000, 21, 1);
+        assert_eq!(f.established_excluding(30, 3000, &[]), 5);
+        assert_eq!(f.established_excluding(30, 3000, &[20]), 3);
+        assert_eq!(f.established_excluding(30, 3000, &[20, 21]), 2);
+        assert_eq!(f.established_excluding(30, 3000, &[99]), 5);
+        // Replacing a pair does not stack.
+        f.set_established_from(30, 3000, 20, 1);
+        assert_eq!(f.established_excluding(30, 3000, &[20]), 4);
     }
 
     #[test]
