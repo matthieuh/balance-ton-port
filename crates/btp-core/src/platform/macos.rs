@@ -12,8 +12,9 @@ use libproc::net_info::{SocketFDInfo, SocketInfoKind, TcpSIState, TcpSockInfo};
 use libproc::proc_pid::{listpidinfo, pidinfo};
 use libproc::processes::{pids_by_type, ProcFilter};
 use std::collections::HashSet;
-use std::ffi::CStr;
+use std::ffi::{CStr, OsStr};
 use std::os::raw::{c_char, c_int, c_void};
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -136,6 +137,11 @@ fn arg_max() -> usize {
 /// 8-byte boundary of the string area (which begins right after argc), then
 /// `argc` NUL-terminated arguments, then the environment.
 fn command_line(pid: i32) -> Option<String> {
+    parse_procargs2(&procargs2(pid)?)
+}
+
+/// Raw `sysctl(KERN_PROCARGS2)` buffer, `None` when unreadable.
+fn procargs2(pid: i32) -> Option<Vec<u8>> {
     let mut buf = vec![0u8; arg_max()];
     let mut len = buf.len();
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
@@ -154,10 +160,13 @@ fn command_line(pid: i32) -> Option<String> {
     if rc != 0 {
         return None;
     }
-    parse_procargs2(&buf[..len])
+    buf.truncate(len);
+    Some(buf)
 }
 
-fn parse_procargs2(data: &[u8]) -> Option<String> {
+/// Walks the KERN_PROCARGS2 layout: the `argc` arguments, and the bytes
+/// after them (the environment area).
+fn split_procargs2(data: &[u8]) -> Option<(Vec<&[u8]>, &[u8])> {
     const ALIGN: usize = 8;
     let argc = i32::from_ne_bytes(data.get(..4)?.try_into().ok()?);
     if argc <= 0 {
@@ -175,12 +184,116 @@ fn parse_procargs2(data: &[u8]) -> Option<String> {
     if padding.iter().any(|&b| b != 0) {
         return None;
     }
-    let args: Vec<String> = strings[args_start..]
-        .split(|&b| b == 0)
-        .take(argc as usize)
+    let mut rest = &strings[args_start..];
+    let mut args = Vec::new();
+    while args.len() < argc as usize {
+        let Some(end) = rest.iter().position(|&b| b == 0) else {
+            // Last argument without a terminator: nothing follows it.
+            args.push(rest);
+            rest = &[];
+            break;
+        };
+        args.push(&rest[..end]);
+        rest = &rest[end + 1..];
+    }
+    Some((args, rest))
+}
+
+fn parse_procargs2(data: &[u8]) -> Option<String> {
+    let (args, _) = split_procargs2(data)?;
+    let args: Vec<String> = args
+        .into_iter()
         .map(|a| String::from_utf8_lossy(a).into_owned())
         .collect();
     (!args.is_empty()).then(|| args.join(" "))
+}
+
+/// The `NAME=value` strings after the arguments. Entries without `=` are
+/// skipped; the list ends at the first empty entry (the kernel's padding).
+fn parse_procargs2_env(data: &[u8]) -> Option<Vec<(String, String)>> {
+    let (args, env) = split_procargs2(data)?;
+    if args.is_empty() {
+        return None;
+    }
+    Some(
+        env.split(|&b| b == 0)
+            .take_while(|e| !e.is_empty())
+            .filter_map(|e| {
+                let eq = e.iter().position(|&b| b == b'=')?;
+                Some((
+                    String::from_utf8_lossy(&e[..eq]).into_owned(),
+                    String::from_utf8_lossy(&e[eq + 1..]).into_owned(),
+                ))
+            })
+            .collect(),
+    )
+}
+
+/// `PROC_PIDFDVNODEPATHINFO` (sys/proc_info.h), not exported by libc.
+const PROC_PIDFDVNODEPATHINFO: c_int = 2;
+
+/// `struct vnode_fdinfowithpath`: `proc_fileinfo` (24 bytes) followed by the
+/// vnode info and path.
+#[repr(C)]
+struct VnodeFdInfoWithPath {
+    _pfi: [u8; 24],
+    pvip: libc::vnode_info_path,
+}
+
+// `PROC_PIDFDVNODEPATHINFO_SIZE`: a layout drift would make every call fail
+// the size check and `open_paths` silently return nothing.
+const _: () = assert!(std::mem::size_of::<VnodeFdInfoWithPath>() == 1200);
+
+/// Paths of the vnode (file or directory) descriptors `pid` holds.
+fn vnode_paths(pid: i32) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if pid <= 0 {
+        return out;
+    }
+    // SAFETY: a null buffer with size 0 only asks for the size needed.
+    let bytes =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+    if bytes <= 0 {
+        return out;
+    }
+    let max = bytes as usize / std::mem::size_of::<libproc::file_info::ProcFDInfo>();
+    let Ok(fds) = listpidinfo::<ListFDs>(pid, max) else {
+        return out;
+    };
+    let size = std::mem::size_of::<VnodeFdInfoWithPath>() as c_int;
+    for fd in fds {
+        if !matches!(ProcFDType::from(fd.proc_fdtype), ProcFDType::VNode) {
+            continue;
+        }
+        // SAFETY: plain old data (integers and char arrays); all-zero is valid.
+        let mut info: VnodeFdInfoWithPath = unsafe { std::mem::zeroed() };
+        // SAFETY: the buffer is `size` writable bytes laid out like the
+        // kernel's vnode_fdinfowithpath; the kernel writes at most `size`.
+        let n = unsafe {
+            libc::proc_pidfdinfo(
+                pid,
+                fd.proc_fd,
+                PROC_PIDFDVNODEPATHINFO,
+                (&mut info as *mut VnodeFdInfoWithPath).cast::<c_void>(),
+                size,
+            )
+        };
+        // The descriptor may have been closed since the list: skip it.
+        if n != size {
+            continue;
+        }
+        let raw = &info.pvip.vip_path;
+        // SAFETY: [[c_char; 32]; 32] is 1024 contiguous c_char.
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(raw.as_ptr().cast::<u8>(), std::mem::size_of_val(raw))
+        };
+        if let Ok(path) = CStr::from_bytes_until_nul(bytes) {
+            if !path.is_empty() {
+                out.push(PathBuf::from(OsStr::from_bytes(path.to_bytes())));
+            }
+        }
+    }
+    out
 }
 
 fn c_name(raw: &[c_char]) -> String {
@@ -302,6 +415,38 @@ impl Platform for MacOs {
     fn proc_start_string(&self, pid: i32) -> Option<String> {
         bsd_info(pid).map(|i| format_proc_start(start_time_us(&i)))
     }
+
+    fn proc_env(&self, pid: i32) -> Option<Vec<(String, String)>> {
+        let info = bsd_info(pid)?;
+        // Other users' environments are none of our business.
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if info.pbi_uid != unsafe { libc::geteuid() } {
+            return None;
+        }
+        parse_procargs2_env(&procargs2(pid)?)
+    }
+
+    fn open_paths(&self, pid: i32) -> Vec<PathBuf> {
+        vnode_paths(pid)
+    }
+
+    fn pids_named(&self, name: &str) -> Vec<i32> {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        let Ok(pids) = pids_by_type(ProcFilter::ByUID { uid }) else {
+            return Vec::new();
+        };
+        let mut out: Vec<i32> = pids
+            .into_iter()
+            .filter_map(|p| i32::try_from(p).ok())
+            .filter(|&p| {
+                bsd_info(p)
+                    .is_some_and(|i| c_name(&i.pbi_comm) == name || c_name(&i.pbi_name) == name)
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    }
 }
 
 #[cfg(test)]
@@ -360,6 +505,31 @@ mod tests {
         let mut data = 2i32.to_ne_bytes().to_vec();
         data.extend_from_slice(b"/bin/sleep\0\x0030\0SECRET=1\0");
         assert_eq!(parse_procargs2(&data), None);
+    }
+
+    #[test]
+    fn parses_procargs2_env_after_args() {
+        let mut data = 2i32.to_ne_bytes().to_vec();
+        data.extend_from_slice(b"/bin/sh\0\0sh\0-c\0");
+        data.extend_from_slice(b"A=1\0CODEX_THREAD_ID=abc\0noequals\0\0\0");
+        assert_eq!(
+            parse_procargs2_env(&data),
+            Some(vec![
+                ("A".to_string(), "1".to_string()),
+                ("CODEX_THREAD_ID".to_string(), "abc".to_string())
+            ])
+        );
+        // The shared helper layout: its fixed environment is parsed too.
+        let data = procargs(1, "/bin/sh", &["sh"]);
+        let env = parse_procargs2_env(&data).unwrap();
+        assert_eq!(env[0], ("PATH".to_string(), "/bin".to_string()));
+    }
+
+    #[test]
+    fn env_parse_rejects_bad_padding() {
+        let mut data = 2i32.to_ne_bytes().to_vec();
+        data.extend_from_slice(b"/bin/sleep\0\x0030\0SECRET=1\0");
+        assert_eq!(parse_procargs2_env(&data), None);
     }
 
     #[test]

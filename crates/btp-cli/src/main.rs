@@ -5,10 +5,10 @@
 use btp_core::config::{data_dir, effective_claude_dirs, read_config, save_config};
 use btp_core::display::format_idle as ago;
 use btp_core::display::{format_idle, name_list, server_state as state_label, session_ended_body};
-use btp_core::labels::tool_label;
-use btp_core::model::{KillReason, KillTarget, ServerKey};
+use btp_core::labels::{location_label, tool_label};
+use btp_core::model::{KillReason, KillTarget, ServerKey, TrackedServer};
 use btp_core::platform::MacOs;
-use btp_core::state::{KillRecord, SessionEndedGroup};
+use btp_core::state::{is_read_only_error, read_state_readonly, KillRecord, SessionEndedGroup};
 use btp_core::watcher::{
     acquire_watch_lock, now_ms, NoteCmd, NoteOutcome, OwnKillOutcome, ServerView, TickReport,
     Watcher,
@@ -61,7 +61,7 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Tell btp your intent for a server of your own Claude Code session
+    /// Tell btp your intent for a server of your own coding-agent session
     Note(NoteArgs),
     /// Servers of an earlier conversation of your session, idle more than
     /// 5 min (JSON; each is listed once)
@@ -156,6 +156,9 @@ struct ServerOut<'a> {
     view: &'a ServerView,
     /// `active`, `idle` or `session dead`, as in the plain output.
     state: &'static str,
+    /// `false` only in the read-only list, where nothing was probed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    probed: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -175,6 +178,8 @@ impl From<io::Error> for Failure {
     fn from(e: io::Error) -> Self {
         if e.kind() == io::ErrorKind::WouldBlock {
             Failure::User(e.to_string())
+        } else if is_read_only_error(&e) {
+            Failure::User("data dir is read-only here; run btp outside the sandbox".into())
         } else {
             Failure::Internal(e.to_string())
         }
@@ -212,17 +217,36 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
     let dir = data_dir();
     match cmd {
         Cmd::List { json } => {
-            let report = Watcher::new(MacOs, dir.clone()).observe(now_ms())?;
-            warn_config(report.config_error.as_deref());
-            let kills = btp_core::state::with_state(&dir, |s| s.recent_kills.clone())?;
+            let pass = Watcher::new(MacOs, dir.clone())
+                .observe(now_ms())
+                .and_then(|report| {
+                    let kills = btp_core::state::with_state(&dir, |s| s.recent_kills.clone())?;
+                    Ok((report.servers, report.config_error, kills))
+                });
+            let mut probed = true;
+            let (servers, config_error, kills) = match pass {
+                Ok(all) => all,
+                Err(e) if is_read_only_error(&e) => {
+                    let saved = read_state_readonly(&dir)?;
+                    eprintln!(
+                        "btp: data dir is read-only here (sandbox?), showing the last saved state"
+                    );
+                    probed = false;
+                    let now = now_ms();
+                    let servers = saved.servers.iter().map(|s| saved_view(s, now)).collect();
+                    (servers, None, saved.recent_kills)
+                }
+                Err(e) => return Err(e.into()),
+            };
+            warn_config(config_error.as_deref());
             if json {
                 let out = ListOutput {
-                    servers: report
-                        .servers
+                    servers: servers
                         .iter()
                         .map(|view| ServerOut {
                             view,
-                            state: state_label(view),
+                            state: if probed { state_label(view) } else { "saved" },
+                            probed: (!probed).then_some(false),
                         })
                         .collect(),
                     recent_kills: &kills,
@@ -233,11 +257,16 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
                         .map_err(|e| Failure::Internal(e.to_string()))?
                 );
             } else {
-                print!("{}", render_list(&report.servers));
+                if probed {
+                    print!("{}", render_list(&servers));
+                } else {
+                    print!("{}", render_list_with(&servers, |_| "saved"));
+                }
             }
             Ok(0)
         }
         Cmd::Kill(KillArgs { key: Some(key), .. }) => {
+            require_writable(&dir)?;
             let mut w = Watcher::new(MacOs, dir);
             let out = w.kill_own(std::process::id() as i32, key)?;
             warn_config(w.config_error());
@@ -322,8 +351,16 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
                 (None, true) => NoteCmd::Done,
                 _ => return Err(Failure::User("give --keep [reason] or --done".into())),
             };
+            require_writable(&dir)?;
             let mut w = Watcher::new(MacOs, dir);
-            let out = w.note(std::process::id() as i32, a.port, cmd.clone(), now_ms())?;
+            let thread = std::env::var("CODEX_THREAD_ID").ok();
+            let out = w.note(
+                std::process::id() as i32,
+                thread.as_deref(),
+                a.port,
+                cmd.clone(),
+                now_ms(),
+            )?;
             warn_config(w.config_error());
             match out {
                 NoteOutcome::Set { port, tool_label } => {
@@ -334,14 +371,14 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
                     Ok(0)
                 }
                 NoteOutcome::NoSession => Err(Failure::User(
-                    "not run from a Claude Code session: notes only apply to your own session's servers".into(),
+                    "not run from a coding-agent session: notes only apply to your own session's servers".into(),
                 )),
                 NoteOutcome::NotTracked => Err(Failure::User(format!(
                     "no tracked server on port {}",
                     a.port
                 ))),
                 NoteOutcome::OtherSession => Err(Failure::User(format!(
-                    "port {} belongs to another Claude Code session: notes only apply to your own session's servers",
+                    "port {} belongs to another session: notes only apply to your own session's servers",
                     a.port
                 ))),
             }
@@ -781,8 +818,44 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Fails with the sandbox message before a command that needs to write the
+/// data dir resolves its caller (which would otherwise answer first).
+fn require_writable(dir: &std::path::Path) -> Result<(), Failure> {
+    btp_core::state::with_state(dir, |_| ())?;
+    Ok(())
+}
+
+/// A tracked server as last saved, for the read-only list: nothing is probed,
+/// so only the saved idle time means anything (the list labels them `saved`).
+fn saved_view(s: &TrackedServer, now_ms: u64) -> ServerView {
+    ServerView {
+        key: s.key,
+        port: s.port,
+        ports: vec![s.port],
+        command: s.command.clone(),
+        tool_label: tool_label(&s.command),
+        worktree: s.worktree.clone(),
+        worktree_name: s
+            .worktree
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| s.worktree.display().to_string()),
+        location_label: location_label(&s.worktree),
+        session_name: s.session_name.clone(),
+        agent: s.agent,
+        started_ms: s.key.start_time / 1000,
+        session_alive: true,
+        idle_ms: now_ms.saturating_sub(s.last_active_ms),
+        kill_in_ms: None,
+    }
+}
+
 /// Aligned table, header `PORT  COMMAND  WORKTREE  STATE  IDLE`.
 fn render_list(servers: &[ServerView]) -> String {
+    render_list_with(servers, state_label)
+}
+
+fn render_list_with(servers: &[ServerView], label: fn(&ServerView) -> &'static str) -> String {
     let mut rows: Vec<[String; 5]> = vec![[
         "PORT".into(),
         "COMMAND".into(),
@@ -795,7 +868,7 @@ fn render_list(servers: &[ServerView]) -> String {
             s.port.to_string(),
             truncate(&s.command, 50),
             s.worktree_name.clone(),
-            state_label(s).to_string(),
+            label(s).to_string(),
             format_idle(s.idle_ms),
         ]);
     }
@@ -821,6 +894,7 @@ fn render_list(servers: &[ServerView]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use btp_core::agents::AgentKind;
     use btp_core::model::ServerKey;
 
     fn view(port: u16, alive: bool, idle_ms: u64) -> ServerView {
@@ -837,6 +911,7 @@ mod tests {
             worktree_name: "app".into(),
             location_label: "app".into(),
             session_name: "app-1d".into(),
+            agent: AgentKind::ClaudeCode,
             started_ms: 0,
             session_alive: alive,
             idle_ms,
@@ -923,6 +998,7 @@ mod tests {
                 })
                 .collect(),
             delivered: true,
+            agent: btp_core::agents::AgentKind::ClaudeCode,
         }
     }
 
@@ -1067,5 +1143,17 @@ mod tests {
         assert_eq!(lines[0].split_whitespace().count(), 5);
         assert!(lines[1].starts_with("3000"));
         assert!(lines[1].ends_with("12 min"));
+    }
+
+    #[test]
+    fn list_json_has_agent_field() {
+        let v = view(3000, true, 0);
+        let json = serde_json::to_string(&ServerOut {
+            view: &v,
+            state: "idle",
+            probed: None,
+        })
+        .unwrap();
+        assert!(json.contains("\"agent\":\"claude_code\""), "{json}");
     }
 }

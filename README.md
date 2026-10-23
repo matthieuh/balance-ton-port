@@ -2,24 +2,24 @@
 
 Claude Code sessions start dev servers (Astro, wrangler, Metro, Vite, `serve`...) and leave them behind. The session ends or crashes, the worktree is deleted, and the ports stay taken. Balance ton port cleans up automatically and asks only when it cannot be sure.
 
-It is a macOS menu bar app plus a `btp` CLI, both on one Rust core, and an agent skill.
+It is a macOS menu bar app plus a `btp` CLI, both on one Rust core, and an agent skill. Codex CLI sessions are supported too (alerted on port idle only, like a busy Claude Code session; no session-end cleanup); Codex users paste `plugin/skills/balance-ton-port/AGENTS.md` into their repo's `AGENTS.md`.
 
 ## What it does
 
-Every 5 seconds it links new listening servers to the Claude Code session that started them, then applies three triggers:
+Every 5 seconds it links new listening servers to the coding-agent session (Claude Code or Codex CLI) that started them, then applies three triggers:
 
 1. **Worktree deleted**: the server is killed at once.
 2. **Session dead and port idle for 20 min**: the server is killed.
 3. **Session alive but idle for 30 min**: a notification with Kill and Keep buttons (app only).
 
-A server is a process tree: the listening process started under the session plus its children (for example Astro or wrangler with their `workerd` workers). A child listening on its own port is part of its parent's server, and "idle" means no established connection on any port of the whole tree. Kill is SIGTERM on that tree, then SIGKILL after 5 s for survivors; a Claude Code process found in the tree, or a process matching an excluded command (a `postgres` the dev server started, say), is never signalled, nor is anything it runs. The menu bar lists running servers and the last 5 kills with their reason.
+A server is a process tree: the listening process started under the session plus its children (for example Astro or wrangler with their `workerd` workers). A child listening on its own port is part of its parent's server, and "idle" means no established connection on any port of the whole tree. Kill is SIGTERM on that tree, then SIGKILL after 5 s for survivors; a process of any agent CLI (Claude Code, Codex) found in the tree, or a process matching an excluded command (a `postgres` the dev server started, say), is never signalled, nor is anything it runs. The menu bar lists running servers and the last 5 kills with their reason.
 
 ## How it decides
 
 - Only servers linked, at first sight, to a live Claude Code session are tracked; a Claude Code session is recognised by its session file and its process start time.
 - Worktree deleted: killed at once. Session dead: killed after 20 min without any established connection on its process tree. Session alive and idle 30 min: an alert, never a silent kill.
 - A server whose worktree another live session uses is left alone.
-- Excluded commands and ports are re-checked on every scan and right before each kill; excluded children and nested Claude Code processes are spared.
+- Excluded commands and ports are re-checked on every scan and right before each kill; excluded children and nested agent CLI processes are spared.
 - Every signal is preceded by a start time check, so a reused pid is never hit.
 
 The full design, limitations included, is in [docs/design.md](docs/design.md).
@@ -107,9 +107,9 @@ If you use a custom `CLAUDE_CONFIG_DIR`, copy it into that directory's `skills/`
 
 ## Safety rules
 
-- Never kills a process that was not started from a live Claude Code session.
+- Never kills a process that was not started from a live coding-agent session.
 - A server whose worktree is used by another live session is never touched.
-- Claude Code processes themselves are never tracked, and never signalled when found inside a server's process tree.
+- Agent CLI processes (Claude Code, Codex) themselves are never tracked, and never signalled when found inside a server's process tree.
 - A child matching an excluded command (a database started by the dev server) is never signalled when its server is killed.
 - Excluded commands and ports are re-checked on every scan and right before each kill.
 - Start times are re-checked before every signal, so a reused pid is never hit.

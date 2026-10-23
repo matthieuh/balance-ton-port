@@ -47,8 +47,12 @@ pub struct ServerViewFfi {
     pub worktree_name: String,
     /// `<repo> › <worktree>`, the repo dir name, or a `~`-shortened path.
     pub location_label: String,
-    /// The Claude Code session's display name.
+    /// The session's display name.
     pub session_name: String,
+    /// `claude_code` or `codex`.
+    pub agent: String,
+    /// `Claude` or `Codex`, the word shown before `session`.
+    pub agent_label: String,
     /// When the server process started, Unix milliseconds.
     pub started_ms: u64,
     /// `started 4 min ago`, as of the pass that produced this view.
@@ -166,6 +170,14 @@ fn file_name(p: &Path) -> String {
         .unwrap_or_else(|| p.display().to_string())
 }
 
+/// The serialized name of an agent kind (`claude_code`, `codex`).
+fn agent_id(a: btp_core::agents::AgentKind) -> &'static str {
+    match a {
+        btp_core::agents::AgentKind::ClaudeCode => "claude_code",
+        btp_core::agents::AgentKind::Codex => "codex",
+    }
+}
+
 impl ServerViewFfi {
     /// `v` as the menu shows it at `now_ms`.
     pub fn at(v: &ServerView, now_ms: u64) -> Self {
@@ -179,6 +191,8 @@ impl ServerViewFfi {
             worktree_name: v.worktree_name.clone(),
             location_label: v.location_label.clone(),
             session_name: v.session_name.clone(),
+            agent: agent_id(v.agent).to_string(),
+            agent_label: v.agent.label().to_string(),
             started_ms: v.started_ms,
             started_label: started_label(v.started_ms, now_ms),
             session_alive: v.session_alive,
@@ -515,6 +529,32 @@ mod tests {
     }
 
     #[test]
+    fn server_view_carries_agent() {
+        let v = ServerView {
+            key: ServerKey {
+                pid: 42,
+                start_time: 7,
+            },
+            port: 5173,
+            ports: vec![5173],
+            command: "vite".into(),
+            tool_label: "Vite".into(),
+            worktree: "/repo/app".into(),
+            worktree_name: "app".into(),
+            location_label: "app".into(),
+            session_name: "app-1d".into(),
+            agent: btp_core::agents::AgentKind::ClaudeCode,
+            started_ms: 0,
+            session_alive: true,
+            idle_ms: 0,
+            kill_in_ms: None,
+        };
+        let f = ServerViewFfi::at(&v, 0);
+        assert_eq!(f.agent, "claude_code");
+        assert_eq!(f.agent_label, "Claude");
+    }
+
+    #[test]
     fn server_view_carries_state() {
         let v = ServerView {
             key: ServerKey {
@@ -529,6 +569,7 @@ mod tests {
             worktree_name: "app".into(),
             location_label: "app".into(),
             session_name: "app-1d".into(),
+            agent: btp_core::agents::AgentKind::ClaudeCode,
             started_ms: 0,
             session_alive: false,
             idle_ms: 0,
@@ -648,6 +689,7 @@ mod tests {
                 alerted: false,
                 note: None,
                 asked_stale: false,
+                agent: btp_core::agents::AgentKind::ClaudeCode,
             });
             let open = |pid, port| GroupServer {
                 key: ServerKey { pid, start_time: 1 },
@@ -664,6 +706,7 @@ mod tests {
                 stopped: Vec::new(),
                 still_open: vec![open(dead_pid, 5173), open(dead_pid + 1, 3000)],
                 delivered: false,
+                agent: btp_core::agents::AgentKind::ClaudeCode,
             });
         })
         .unwrap();
@@ -766,6 +809,7 @@ mod tests {
                 alerted: false,
                 note: None,
                 asked_stale: false,
+                agent: btp_core::agents::AgentKind::ClaudeCode,
             });
             for (at_ms, start) in [(7, start_time + 1), (8, start_time)] {
                 s.record_session_ended(SessionEndedGroup {
@@ -785,6 +829,7 @@ mod tests {
                         in_use: false,
                     }],
                     delivered: false,
+                    agent: btp_core::agents::AgentKind::ClaudeCode,
                 });
             }
         })

@@ -1,5 +1,5 @@
 //! Human-readable labels for a tracked server: what it is (`tool_label`),
-//! where it runs (`location_label`) and which Claude Code session started it
+//! where it runs (`location_label`) and which agent session started it
 //! (`session_display_name`). Pure functions, shared by the CLI and the app.
 
 use std::path::Path;

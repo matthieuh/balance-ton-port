@@ -1,3 +1,4 @@
+use crate::agents::AgentKind;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -40,6 +41,9 @@ pub struct TrackedServer {
     /// same process (tier 3): never offered again.
     #[serde(default)]
     pub asked_stale: bool,
+    /// The agent whose session started this server.
+    #[serde(default)]
+    pub agent: AgentKind,
 }
 
 impl TrackedServer {

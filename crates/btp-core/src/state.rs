@@ -1,3 +1,4 @@
+use crate::agents::AgentKind;
 use crate::model::{KillReason, ServerKey, TrackedServer};
 use fs4::FileExt;
 use serde::{Deserialize, Serialize};
@@ -63,6 +64,8 @@ pub struct SessionEndedGroup {
     /// held the watch lock, else set by the app once delivered).
     #[serde(default)]
     pub delivered: bool,
+    #[serde(default)]
+    pub agent: AgentKind,
 }
 
 impl SessionEndedGroup {
@@ -202,6 +205,25 @@ fn write_atomic(dir: &Path, state: &State) -> io::Result<()> {
     result
 }
 
+/// The saved state for a reader that cannot write the data dir (a sandbox):
+/// no lock file, no directory creation, never a write. Missing: empty.
+/// Unparsable: an `InvalidData` error (the corrupt file is left alone).
+pub fn read_state_readonly(dir: &Path) -> io::Result<State> {
+    match fs::read(dir.join("state.json")) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(io::Error::other),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(State::default()),
+        Err(e) => Err(e),
+    }
+}
+
+/// `true` for the errors a sandboxed process gets writing the data dir.
+pub fn is_read_only_error(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+    )
+}
+
 /// Runs `f` on the state under an exclusive lock (`state.lock`, separate from
 /// `state.json` so the atomic rename never invalidates it), then writes it back.
 pub fn with_state<T>(dir: &Path, f: impl FnOnce(&mut State) -> T) -> io::Result<T> {
@@ -259,6 +281,7 @@ mod tests {
             alerted: false,
             note: None,
             asked_stale: false,
+            agent: crate::agents::AgentKind::ClaudeCode,
         }
     }
 
@@ -393,6 +416,7 @@ mod tests {
         assert!(!d.path().join("state.json.corrupt").exists());
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].note, None);
+        assert_eq!(servers[0].agent, AgentKind::ClaudeCode);
         assert!(!servers[0].asked_stale);
         assert!(servers[0].kept);
         assert_eq!(kills[0].reason, KillReason::Manual);
@@ -433,6 +457,7 @@ mod tests {
                 })
                 .collect(),
             delivered: false,
+            agent: crate::agents::AgentKind::ClaudeCode,
         }
     }
 
@@ -503,5 +528,36 @@ mod tests {
         assert_eq!(lines.len(), 2);
         let back: KillRecord = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(back, rec(2));
+    }
+
+    #[test]
+    fn read_state_readonly_never_writes() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        with_state(d.path(), |s| s.servers.push(server(7))).unwrap();
+        let listing = || {
+            let mut v: Vec<_> = fs::read_dir(d.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            v.sort();
+            v
+        };
+        let before = listing();
+        fs::set_permissions(d.path(), fs::Permissions::from_mode(0o500)).unwrap();
+        let got = read_state_readonly(d.path());
+        let denied = with_state(d.path(), |_| ());
+        fs::set_permissions(d.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(got.unwrap().servers.len(), 1);
+        assert!(is_read_only_error(&denied.unwrap_err()));
+        assert_eq!(listing(), before);
+        let empty = tempfile::tempdir().unwrap();
+        assert!(read_state_readonly(empty.path())
+            .unwrap()
+            .servers
+            .is_empty());
     }
 }

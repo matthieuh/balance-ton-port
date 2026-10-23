@@ -39,10 +39,15 @@ impl Drop for Helper {
 }
 
 fn spawn_helper(mode: &str, cwd: &std::path::Path) -> Helper {
+    spawn_helper_env(mode, cwd, &[])
+}
+
+fn spawn_helper_env(mode: &str, cwd: &std::path::Path, env: &[(&str, &str)]) -> Helper {
     let exe = std::env::current_exe().unwrap();
     let mut child = Command::new(exe)
         .args(["--exact", "zz_helper", "--nocapture", "--test-threads=1"])
         .env(HELPER_ENV, mode)
+        .envs(env.iter().copied())
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -289,6 +294,53 @@ fn empty_argv0_keeps_the_environment_out_of_the_command() {
     }));
     assert!(!command.contains("hunter2"), "env leaked: {command:?}");
     assert_eq!(command, " 30");
+}
+
+#[test]
+fn proc_env_reads_a_child_env() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = spawn_helper_env("listen", dir.path(), &[("BTP_TEST_MARK", "42")]);
+    let env = MacOs
+        .proc_env(h.pid())
+        .expect("own child's env is readable");
+    assert!(
+        env.contains(&("BTP_TEST_MARK".to_string(), "42".to_string())),
+        "mark missing"
+    );
+    // pid 1 belongs to root: never readable by a regular user.
+    if unsafe { libc::geteuid() } != 0 {
+        assert_eq!(MacOs.proc_env(1), None);
+    }
+}
+
+#[test]
+fn open_paths_sees_a_held_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("held.lock");
+    let file = std::fs::File::create(&path).unwrap();
+    assert!(file.try_lock().is_ok());
+    let want = path.canonicalize().unwrap();
+    let paths = MacOs.open_paths(std::process::id() as i32);
+    assert!(
+        paths.contains(&want),
+        "{want:?} not in {} paths",
+        paths.len()
+    );
+    assert!(MacOs.open_paths(999_999).is_empty());
+}
+
+#[test]
+fn pids_named_finds_the_helper() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = spawn_helper("listen", dir.path());
+    let info = MacOs.proc_info(h.pid()).unwrap();
+    // comm is the executable name, truncated by the kernel to 15 bytes.
+    let exe = std::env::current_exe().unwrap();
+    let name = exe.file_name().unwrap().to_str().unwrap();
+    let comm: String = name.chars().take(15).collect();
+    assert!(info.command.contains("zz_helper"));
+    assert!(MacOs.pids_named(&comm).contains(&h.pid()));
+    assert!(MacOs.pids_named("btp-no-such-process").is_empty());
 }
 
 #[test]

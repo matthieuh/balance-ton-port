@@ -144,7 +144,7 @@ impl<P: Platform> Watcher<P> {
                 format!("pid {session_pid} is not an ancestor of this process"),
             ));
         };
-        if !is_claude_cli(&session_proc.command) {
+        if is_agent_cli(&session_proc.command) != Some(AgentKind::ClaudeCode) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("pid {session_pid} is not a Claude Code process"),
@@ -174,14 +174,16 @@ impl<P: Platform> Watcher<P> {
         } else {
             trace.push("session file: missing, linking with the process identity".into());
             scan.live.push(LiveSession {
-                session: ClaudeSession {
+                session: AgentSession {
+                    agent: AgentKind::ClaudeCode,
                     pid: session_pid,
-                    session_id: conversation.unwrap_or_default().to_string(),
+                    proc_start: proc_start.clone(),
+                    conversation_id: conversation.unwrap_or_default().to_string(),
+                    other_conversations: Vec::new(),
                     cwd,
+                    name: String::new(),
                     status: crate::sessions::SessionStatus::Unknown,
                     status_updated_at_ms: 0,
-                    proc_start: proc_start.clone(),
-                    name: String::new(),
                 },
                 root: session_root.clone(),
             });
@@ -296,6 +298,7 @@ impl<P: Platform> Watcher<P> {
                 })
                 .collect(),
             delivered: !app_running,
+            agent: AgentKind::ClaudeCode,
         };
         with_state(&self.data_dir, |state| {
             state.record_session_ended(group.clone())
@@ -410,9 +413,10 @@ impl<P: Platform> Watcher<P> {
         }
     }
 
-    /// The Claude Code process the caller descends from, as (pid, start
+    /// The agent session process the caller descends from, as (pid, start
     /// time in session-file format): its nearest ancestor that matches a
-    /// live session file. Failing that, `session_pid` when given and it is
+    /// live session, of agent `only` when given (a session of another agent
+    /// is passed over). Failing that, `session_pid` when given and it is
     /// a Claude Code ancestor of the caller: Claude Code rewrites its session
     /// file after `/clear` and `/resume` only once the SessionStart hook has
     /// run, so the proven process stands in for the file, as at session end.
@@ -420,6 +424,7 @@ impl<P: Platform> Watcher<P> {
         &self,
         caller_pid: i32,
         session_pid: Option<i32>,
+        only: Option<AgentKind>,
         scan: &Scan,
     ) -> Option<(i32, String)> {
         let chain = ancestry(&self.platform, caller_pid);
@@ -429,13 +434,16 @@ impl<P: Platform> Watcher<P> {
                 let started = format_proc_start(p.start_time);
                 scan.live
                     .iter()
+                    .filter(|l| only.is_none_or(|k| l.session.agent == k))
                     .find(|l| l.session.pid == p.pid && l.session.proc_start == started)
                     .map(|l| (l.session.pid, l.session.proc_start.clone()))
             })
             .or_else(|| {
                 let pid = session_pid?;
                 ancestors()
-                    .find(|p| p.pid == pid && is_claude_cli(&p.command))
+                    .find(|p| {
+                        p.pid == pid && is_agent_cli(&p.command) == Some(AgentKind::ClaudeCode)
+                    })
                     .map(|p| (p.pid, format_proc_start(p.start_time)))
             })
     }
@@ -443,15 +451,20 @@ impl<P: Platform> Watcher<P> {
     /// Sets the agent's note on the server listening on `port`, when it
     /// belongs to the caller's own live session process. The latest note
     /// replaces the previous one; the user's Keep is never touched.
+    /// `env_thread` is the caller's own `CODEX_THREAD_ID`, when set.
     pub fn note(
         &mut self,
         caller_pid: i32,
+        env_thread: Option<&str>,
         port: u16,
         cmd: NoteCmd,
         now_ms: u64,
     ) -> io::Result<NoteOutcome> {
         let scan = self.scan();
-        let Some((caller_pid, caller_start)) = self.caller_process(caller_pid, None, &scan) else {
+        let ancestry_pick = self.caller_process(caller_pid, None, None, &scan);
+        let Some((caller_pid, caller_start)) =
+            caller_session(env_thread, &scan.sessions(), ancestry_pick)
+        else {
             return Ok(NoteOutcome::NoSession);
         };
         let listeners = self.platform.listeners();
@@ -493,8 +506,8 @@ impl<P: Platform> Watcher<P> {
         })
     }
 
-    /// The leftovers of earlier conversations of the caller's live session
-    /// process (tier 3), each returned once: they are marked as asked.
+    /// The leftovers of earlier conversations of the caller's live Claude Code
+    /// session process (tier 3), each returned once: they are marked as asked.
     /// Excluded servers are never returned. `None` when the caller does not
     /// descend from a live session (see `caller_process` for `session_pid`).
     pub fn stale(
@@ -505,7 +518,8 @@ impl<P: Platform> Watcher<P> {
         now_ms: u64,
     ) -> io::Result<Option<Vec<StaleServer>>> {
         let scan = self.scan();
-        let Some((caller_pid, caller_start)) = self.caller_process(caller_pid, session_pid, &scan)
+        let Some((caller_pid, caller_start)) =
+            self.caller_process(caller_pid, session_pid, Some(AgentKind::ClaudeCode), &scan)
         else {
             return Ok(None);
         };
@@ -558,13 +572,15 @@ impl<P: Platform> Watcher<P> {
     }
 
     /// Kills exactly the process `key` (pid and start time), only when it is
-    /// a tracked server of the caller's own live session process. Used for
+    /// a tracked server of the caller's own live Claude Code session process. Used for
     /// the tier 3 "yes": whatever took the port since the offer is never
     /// touched, nor is another session's server.
     pub fn kill_own(&mut self, caller_pid: i32, key: ServerKey) -> io::Result<OwnKillOutcome> {
         let now = now_ms();
         let scan = self.scan();
-        let Some((caller_pid, caller_start)) = self.caller_process(caller_pid, None, &scan) else {
+        let Some((caller_pid, caller_start)) =
+            self.caller_process(caller_pid, None, Some(AgentKind::ClaudeCode), &scan)
+        else {
             return Ok(OwnKillOutcome::NoSession);
         };
         let listeners = self.platform.listeners();
@@ -594,6 +610,27 @@ impl<P: Platform> Watcher<P> {
             },
         )
     }
+}
+
+/// The session a `btp note` caller speaks for. The process ancestry wins:
+/// a caller inside a live session tree speaks for that session, whatever
+/// `CODEX_THREAD_ID` it inherited. Only when the ancestry finds nothing does
+/// the thread in the caller's own environment name the live session holding
+/// it (`conversation_id` or `other_conversations`); an unknown thread is
+/// refused.
+fn caller_session(
+    env_thread: Option<&str>,
+    sessions: &[AgentSession],
+    ancestry_pick: Option<(i32, String)>,
+) -> Option<(i32, String)> {
+    if ancestry_pick.is_some() {
+        return ancestry_pick;
+    }
+    let thread = env_thread.filter(|t| !t.is_empty())?;
+    sessions
+        .iter()
+        .find(|s| holds_thread(s, thread))
+        .map(|s| (s.pid, s.proc_start.clone()))
 }
 
 #[cfg(test)]
@@ -696,7 +733,7 @@ mod tests {
         let mut f = fx();
         hook(&f);
         tracked(&mut f);
-        f.w.note(HOOK, 3000, NoteCmd::Done, T0).unwrap();
+        f.w.note(HOOK, None, 3000, NoteCmd::Done, T0).unwrap();
         let r = end(&mut f, T0);
         assert!(f.p().signals().is_empty());
         assert_eq!(r.sweep_at, Some(T0));
@@ -929,7 +966,7 @@ mod tests {
         let mut f = fx();
         hook(&f);
         tracked(&mut f);
-        f.w.note(HOOK, 3000, NoteCmd::Done, T0).unwrap();
+        f.w.note(HOOK, None, 3000, NoteCmd::Done, T0).unwrap();
         f.p().set_established(30, 3000, 1);
         end(&mut f, T0);
         quit(&f);
@@ -1032,8 +1069,14 @@ mod tests {
         hook(&f);
         tracked(&mut f);
         let out =
-            f.w.note(HOOK, 3000, NoteCmd::Keep(Some("form demo".into())), T0)
-                .unwrap();
+            f.w.note(
+                HOOK,
+                None,
+                3000,
+                NoteCmd::Keep(Some("form demo".into())),
+                T0,
+            )
+            .unwrap();
         assert_eq!(
             out,
             NoteOutcome::Set {
@@ -1046,7 +1089,7 @@ mod tests {
         assert_eq!(n.reason.as_deref(), Some("form demo"));
         assert_eq!(n.set_at_ms, T0);
         // The latest intent replaces the previous one.
-        f.w.note(HOOK, 3000, NoteCmd::Done, T0 + 1).unwrap();
+        f.w.note(HOOK, None, 3000, NoteCmd::Done, T0 + 1).unwrap();
         let n = f.state_servers()[0].note.clone().unwrap();
         assert!(!n.keep && n.done);
     }
@@ -1058,7 +1101,7 @@ mod tests {
         f.p().spawn(50, 10, START + 50 * SEC, "claude", "/");
         f.session(50, "sess-b", Path::new("/elsewhere"), START + 50 * SEC);
         f.p().spawn(51, 50, START + 51 * SEC, "btp note", "/");
-        let out = f.w.note(51, 3000, NoteCmd::Done, T0).unwrap();
+        let out = f.w.note(51, None, 3000, NoteCmd::Done, T0).unwrap();
         assert_eq!(out, NoteOutcome::OtherSession);
         assert_eq!(f.state_servers()[0].note, None);
     }
@@ -1069,12 +1112,12 @@ mod tests {
         tracked(&mut f);
         f.p().spawn(51, 10, START + 51 * SEC, "btp note", "/");
         assert_eq!(
-            f.w.note(51, 3000, NoteCmd::Done, T0).unwrap(),
+            f.w.note(51, None, 3000, NoteCmd::Done, T0).unwrap(),
             NoteOutcome::NoSession
         );
         hook(&f);
         assert_eq!(
-            f.w.note(HOOK, 4444, NoteCmd::Done, T0).unwrap(),
+            f.w.note(HOOK, None, 4444, NoteCmd::Done, T0).unwrap(),
             NoteOutcome::NotTracked
         );
         assert_eq!(f.state_servers()[0].note, None);
@@ -1085,7 +1128,7 @@ mod tests {
         let mut f = fx();
         hook(&f);
         tracked(&mut f);
-        f.w.note(HOOK, 3000, NoteCmd::Keep(None), T0).unwrap();
+        f.w.note(HOOK, None, 3000, NoteCmd::Keep(None), T0).unwrap();
         // Same pid, new process (pid reuse), then a fresh pid.
         f.p().remove_proc(30);
         f.p().remove_proc(31);
@@ -1253,5 +1296,126 @@ mod tests {
         tracked(&mut f);
         f.p().spawn(51, 10, START + 51 * SEC, "btp stale", "/");
         assert_eq!(f.w.stale(51, Some(10), "sess-b", T0).unwrap(), None);
+    }
+
+    #[test]
+    fn tier_3_caller_never_resolves_to_a_codex_ancestor() {
+        let mut f = codex_fx();
+        codex_server_chain(&f);
+        f.w.tick(T0 - 30 * MIN).unwrap();
+        assert!(f.state_servers().iter().any(|s| s.key.pid == 304));
+        // A Claude process with no session file yet, in a Codex shell.
+        let web = f.wt.join("apps/web");
+        let web = web.to_str().unwrap();
+        f.p().spawn(330, 300, START + 330 * SEC, "zsh", web);
+        f.p().spawn(331, 330, START + 331 * SEC, "claude", web);
+        f.p()
+            .spawn(332, 331, START + 332 * SEC, "bash hook.sh", web);
+        let list = f.w.stale(332, Some(331), "sess-x", T0).unwrap();
+        assert!(list.unwrap_or_default().is_empty());
+        assert!(!f.state_servers().iter().any(|s| s.asked_stale));
+        let codex_key = ServerKey {
+            pid: 304,
+            start_time: START + 304 * SEC,
+        };
+        let out = f.w.kill_own(332, codex_key).unwrap();
+        assert!(
+            matches!(
+                out,
+                OwnKillOutcome::OtherSession | OwnKillOutcome::NoSession
+            ),
+            "{out:?}"
+        );
+        assert!(f.p().is_alive(304));
+        assert!(f.p().signals().is_empty());
+    }
+
+    #[test]
+    fn sweep_session_ignores_codex_servers_of_other_processes() {
+        let mut f = codex_fx();
+        codex_server_chain(&f);
+        f.w.tick(T0 - 30 * MIN).unwrap();
+        assert!(f.state_servers().iter().any(|s| s.key.pid == 304));
+        // Both sessions are gone (they share the worktree) and both servers
+        // are long idle: both are due, but only the swept session's is killed.
+        f.p().remove_proc(300);
+        f.p().remove_proc(20);
+        let proc_start = format_proc_start(START + 20 * SEC);
+        let out = f.w.sweep_session(20, &proc_start, T0 + 30 * MIN).unwrap();
+        let ports: Vec<u16> = out.killed.iter().map(|k| k.port).collect();
+        assert_eq!(ports, vec![3000]);
+        assert!(!f.p().is_alive(30));
+        assert!(f.p().is_alive(304));
+        assert!(f.p().signals().iter().all(|&(pid, _)| pid != 304));
+    }
+
+    #[test]
+    fn session_end_never_lists_a_codex_server_in_the_claude_group() {
+        let mut f = codex_fx();
+        // The Codex session works elsewhere, so nothing is shared.
+        let elsewhere = f.repo.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let lock = f.repo.path().join("codex-home/thread-writer-locks/T1.lock");
+        f.p().remove_proc(300);
+        f.p().spawn(
+            300,
+            10,
+            START + 300 * SEC,
+            "codex",
+            elsewhere.to_str().unwrap(),
+        );
+        f.p()
+            .set_open_paths(300, &[lock.canonicalize().unwrap().to_str().unwrap()]);
+        codex_server_chain(&f);
+        hook(&f);
+        f.w.tick(T0 - 10 * MIN).unwrap();
+        assert_eq!(f.state_servers().len(), 2);
+        let r = end(&mut f, T0);
+        let group = r.group.expect("group");
+        assert_eq!(group.still_open.len(), 1);
+        assert_eq!(group.still_open[0].port, 3000);
+    }
+
+    fn codex(pid: i32, thread: &str, others: &[&str]) -> AgentSession {
+        AgentSession {
+            agent: AgentKind::Codex,
+            pid,
+            proc_start: format!("start-{pid}"),
+            conversation_id: thread.into(),
+            other_conversations: others.iter().map(|o| o.to_string()).collect(),
+            cwd: "/w".into(),
+            name: "w".into(),
+            status: crate::sessions::SessionStatus::Unknown,
+            status_updated_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn note_from_codex_thread_env_is_checked() {
+        let sessions = [codex(300, "T1", &["T1b"]), codex(400, "T2", &[])];
+        let claude = Some((20, "claude-start".to_string()));
+        // No ancestry: the thread names its session.
+        assert_eq!(
+            caller_session(Some("T1"), &sessions, None),
+            Some((300, "start-300".into()))
+        );
+        assert_eq!(
+            caller_session(Some("T1b"), &sessions, None),
+            Some((300, "start-300".into()))
+        );
+        // An unknown thread is refused.
+        assert_eq!(caller_session(Some("nope"), &sessions, None), None);
+        // Ancestry wins: a Claude session inheriting a Codex thread env
+        // speaks for itself.
+        assert_eq!(
+            caller_session(Some("T1"), &sessions, claude.clone()),
+            claude
+        );
+        assert_eq!(
+            caller_session(Some("nope"), &sessions, claude.clone()),
+            claude
+        );
+        assert_eq!(caller_session(None, &sessions, claude.clone()), claude);
+        assert_eq!(caller_session(None, &sessions, None), None);
     }
 }
