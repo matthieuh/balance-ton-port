@@ -7,7 +7,7 @@
 //! guarded by a fresh start-time check (a pid can be reused at any moment).
 
 use crate::agents::claude::ClaudeAgent;
-use crate::agents::codex::CodexAgent;
+use crate::agents::codex::{classify_codex, env_thread, CodexAgent, CodexRole};
 use crate::agents::{is_agent_cli, session_idle_ms, Agent, AgentKind, AgentSession};
 use crate::config::{effective_claude_dirs_with, read_config, Config};
 use crate::decide::{decide, touch};
@@ -99,41 +99,82 @@ pub(crate) fn is_excluded(command: &str, cfg: &Config) -> bool {
         .any(|e| !e.is_empty() && command.contains(&e))
 }
 
-/// Links a new listener to the live Claude Code session it descends from.
+/// Links a new listener to the live agent session it belongs to.
 ///
 /// `chain` is the listener's ancestry (`chain[0]` is the listener's own
-/// process). The session is the first ancestor that matches a session file
-/// by pid and by start time (`procStart`), so a stale file whose pid now
-/// belongs to another process never links. `None` when the listener is a
-/// session itself, when no live session is found, when the server or any
-/// process between it and the session is a Claude Code CLI (watched or not)
-/// or matches an excluded command, when the port is excluded, or when
-/// the server's working directory cannot be read.
+/// process). The session is the nearest ancestor that matches a live session
+/// by pid and by start time, so a stale session file whose pid now belongs
+/// to another process never links. A Codex session picks the conversation
+/// named by `CODEX_THREAD_ID` (read through `envs`, from the listener or the
+/// nearest ancestor below the session) when that session holds it. A server
+/// reparented to launchd (no ancestor matches) links through that same
+/// variable, only to the one live Codex session holding the thread.
+///
+/// `None` when the listener is a session or an agent CLI itself, when a
+/// process between it and the session is an agent CLI (a Codex `exec` or
+/// launcher excepted) or matches an excluded command, when the port is
+/// excluded, or when the server's working directory cannot be read.
 pub fn link(
     listener: &Listener,
     chain: &[ProcInfo],
+    envs: &dyn Fn(i32) -> Option<Vec<(String, String)>>,
     sessions: &[AgentSession],
     cfg: &Config,
     now_ms: u64,
 ) -> Option<TrackedServer> {
     let server = chain.first().filter(|p| p.pid == listener.pid)?;
-    if sessions.iter().any(|s| s.pid == listener.pid) || cfg.exclude_ports.contains(&listener.port)
+    if sessions.iter().any(|s| s.pid == listener.pid)
+        || cfg.exclude_ports.contains(&listener.port)
+        || is_agent_cli(&server.command).is_some()
     {
         return None;
     }
-    let (depth, session) = chain.iter().enumerate().skip(1).find_map(|(i, p)| {
+    // Processes that stop a link: another agent CLI (a nested `codex exec`
+    // and a launcher stay with the outer session) or an excluded command.
+    let blocks = |p: &ProcInfo| {
+        let agent = match (is_agent_cli(&p.command), classify_codex(&p.command)) {
+            (Some(_), Some(CodexRole::NonInteractive | CodexRole::Wrapper)) => false,
+            (agent, _) => agent.is_some(),
+        };
+        agent || is_excluded(&p.command, cfg)
+    };
+    // The thread id of the nearest process of `chain[..end]` that has one.
+    let thread = |end: usize| {
+        chain[..end]
+            .iter()
+            .find_map(|p| envs(p.pid).and_then(|e| env_thread(&e)))
+    };
+    let matched = chain.iter().enumerate().skip(1).find_map(|(i, p)| {
         let started = format_proc_start(p.start_time);
         sessions
             .iter()
             .find(|s| s.pid == p.pid && s.proc_start == started)
             .map(|s| (i, s))
-    })?;
-    if chain[..depth]
-        .iter()
-        .any(|p| is_agent_cli(&p.command).is_some() || is_excluded(&p.command, cfg))
-    {
-        return None;
-    }
+    });
+    let (session, conversation) = match matched {
+        Some((depth, session)) => {
+            if chain[..depth].iter().any(blocks) {
+                return None;
+            }
+            let conversation = (session.agent == AgentKind::Codex)
+                .then(|| thread(depth))
+                .flatten()
+                .filter(|t| holds_thread(session, t))
+                .unwrap_or_else(|| session.conversation_id.clone());
+            (session, conversation)
+        }
+        None => {
+            if chain.iter().any(blocks) {
+                return None;
+            }
+            let thread = thread(chain.len())?;
+            let mut holders = sessions
+                .iter()
+                .filter(|s| s.agent == AgentKind::Codex && holds_thread(s, &thread));
+            let session = holders.next().filter(|_| holders.next().is_none())?;
+            (session, thread)
+        }
+    };
     let cwd = server.cwd.as_deref()?;
     Some(TrackedServer {
         key: ServerKey {
@@ -143,7 +184,7 @@ pub fn link(
         port: listener.port,
         command: server.command.clone(),
         worktree: worktree_root(cwd),
-        session_id: session.conversation_id.clone(),
+        session_id: conversation,
         session_pid: session.pid,
         session_proc_start: session.proc_start.clone(),
         session_name: session_display_name(Some(&session.name), &session.cwd),
@@ -155,6 +196,11 @@ pub fn link(
         asked_stale: false,
         agent: session.agent,
     })
+}
+
+/// `thread` is the session's conversation or one of its others.
+fn holds_thread(s: &AgentSession, thread: &str) -> bool {
+    s.conversation_id == thread || s.other_conversations.iter().any(|c| c == thread)
 }
 
 /// `true` when `pid` is the very process that started at `start_time`.
@@ -672,7 +718,14 @@ impl<P: Platform> Watcher<P> {
                 continue;
             }
             let chain = ancestry(&self.platform, l.pid);
-            let Some(new) = link(l, &chain, &sessions, &scan.cfg, now_ms) else {
+            let Some(new) = link(
+                l,
+                &chain,
+                &|pid| self.platform.proc_env(pid),
+                &sessions,
+                &scan.cfg,
+                now_ms,
+            ) else {
                 continue;
             };
             if owner_in_chain(&chain, new.session_pid, &state.servers).is_some() {
@@ -1103,6 +1156,276 @@ mod tests {
         }
     }
 
+    /// The fixture with a temp Codex home. A `codex` process (300, cwd
+    /// `<wt>/apps/web`, so the session is named "web") holds the thread
+    /// lock `T1` there: launchd > zsh(10) > codex(300).
+    pub(super) fn codex_fx() -> Fx {
+        let f = fx();
+        let home = f.repo.path().join("codex-home");
+        fs::create_dir_all(home.join("thread-writer-locks")).unwrap();
+        let lock = home.join("thread-writer-locks/T1.lock");
+        fs::write(&lock, "").unwrap();
+        let web = f.wt.join("apps/web");
+        f.p()
+            .spawn(300, 10, START + 300 * SEC, "codex", web.to_str().unwrap());
+        f.p()
+            .set_open_paths(300, &[canonical(&lock).to_str().unwrap()]);
+        let Fx {
+            data,
+            claude,
+            repo,
+            wt,
+            w,
+        } = f;
+        Fx {
+            data,
+            claude,
+            repo,
+            wt,
+            w: w.with_codex_home(Some(home)),
+        }
+    }
+
+    /// codex(300) > sandbox-exec(301) > zsh(302) > `npm run dev`(303) >
+    /// node(304, listens on 5173), the shape the brief describes.
+    pub(super) fn codex_server_chain(f: &Fx) {
+        let web = f.wt.join("apps/web");
+        let web = web.to_str().unwrap();
+        f.p()
+            .spawn(301, 300, START + 301 * SEC, "sandbox-exec -p x", web);
+        f.p().spawn(302, 301, START + 302 * SEC, "zsh", web);
+        f.p().spawn(303, 302, START + 303 * SEC, "npm run dev", web);
+        f.p().spawn(304, 303, START + 304 * SEC, "node vite", web);
+        f.p().add_listener(304, 5173);
+    }
+
+    fn server_of(f: &Fx, pid: i32) -> Option<TrackedServer> {
+        f.state_servers().into_iter().find(|s| s.key.pid == pid)
+    }
+
+    #[test]
+    fn links_server_under_codex_session_by_ancestry() {
+        let mut f = codex_fx();
+        codex_server_chain(&f);
+        f.w.tick(T0).unwrap();
+        let s = server_of(&f, 304).expect("linked");
+        assert_eq!(s.agent, AgentKind::Codex);
+        assert_eq!(s.session_id, "T1");
+        assert_eq!(s.session_name, "web");
+        assert_eq!(s.session_pid, 300);
+    }
+
+    #[test]
+    fn links_server_that_is_a_direct_child_of_codex_with_its_thread_env() {
+        let mut f = codex_fx();
+        let web = f.wt.join("apps/web");
+        f.p().spawn(
+            310,
+            300,
+            START + 310 * SEC,
+            "node vite",
+            web.to_str().unwrap(),
+        );
+        f.p().add_listener(310, 5174);
+        f.p().set_env(
+            310,
+            &[
+                ("CODEX_THREAD_ID", "T1"),
+                ("CODEX_SESSION_ID", "S"),
+                ("X", "y"),
+            ],
+        );
+        f.w.tick(T0).unwrap();
+        let s = server_of(&f, 310).expect("linked");
+        assert_eq!((s.agent, s.session_id.as_str()), (AgentKind::Codex, "T1"));
+    }
+
+    #[test]
+    fn links_reparented_server_by_codex_thread_id() {
+        let mut f = codex_fx();
+        let web = f.wt.join("apps/web");
+        f.p().spawn(
+            310,
+            1,
+            START + 310 * SEC,
+            "node vite",
+            web.to_str().unwrap(),
+        );
+        f.p().add_listener(310, 5174);
+        f.p().set_env(310, &[("CODEX_THREAD_ID", "T1")]);
+        f.w.tick(T0).unwrap();
+        let s = server_of(&f, 310).expect("linked");
+        assert_eq!(s.agent, AgentKind::Codex);
+        assert_eq!((s.session_pid, s.session_id.as_str()), (300, "T1"));
+    }
+
+    #[test]
+    fn env_thread_of_unknown_or_dead_session_does_not_link() {
+        let mut f = codex_fx();
+        let web = f.wt.join("apps/web");
+        f.p().spawn(
+            310,
+            1,
+            START + 310 * SEC,
+            "node vite",
+            web.to_str().unwrap(),
+        );
+        f.p().add_listener(310, 5174);
+        f.p().set_env(310, &[("CODEX_THREAD_ID", "T9")]);
+        f.w.tick(T0).unwrap();
+        assert_eq!(server_of(&f, 310), None);
+        // The right thread, but its session is gone.
+        f.p().set_env(310, &[("CODEX_THREAD_ID", "T1")]);
+        f.p().remove_proc(300);
+        f.w.tick(T0 + MIN).unwrap();
+        assert_eq!(server_of(&f, 310), None);
+    }
+
+    #[test]
+    fn thread_held_by_two_live_codex_sessions_does_not_link() {
+        let mut f = codex_fx();
+        let web = f.wt.join("apps/web");
+        let lock = f.repo.path().join("codex-home/thread-writer-locks/T1.lock");
+        f.p()
+            .spawn(320, 10, START + 320 * SEC, "codex", web.to_str().unwrap());
+        f.p()
+            .set_open_paths(320, &[canonical(&lock).to_str().unwrap()]);
+        f.p().spawn(
+            310,
+            1,
+            START + 310 * SEC,
+            "node vite",
+            web.to_str().unwrap(),
+        );
+        f.p().add_listener(310, 5174);
+        f.p().set_env(310, &[("CODEX_THREAD_ID", "T1")]);
+        f.w.tick(T0).unwrap();
+        assert_eq!(server_of(&f, 310), None);
+    }
+
+    #[test]
+    fn a_claude_server_never_takes_a_codex_thread_from_its_env() {
+        let mut f = codex_fx();
+        // The fixture's server (30) is under Claude (20); its env names T1.
+        f.p().set_env(30, &[("CODEX_THREAD_ID", "T1")]);
+        f.w.tick(T0).unwrap();
+        let s = server_of(&f, 30).expect("linked");
+        assert_eq!((s.agent, s.session_pid), (AgentKind::ClaudeCode, 20));
+        assert_eq!(s.session_id, "sess-a");
+    }
+
+    #[test]
+    fn claude_inside_codex_shell_links_to_claude() {
+        let mut f = codex_fx();
+        let web = f.wt.join("apps/web");
+        let web = web.to_str().unwrap();
+        f.p().spawn(301, 300, START + 301 * SEC, "zsh", web);
+        f.p().spawn(70, 301, START + 70 * SEC, "claude", web);
+        f.session(70, "sess-in", &f.wt.join("apps/web"), START + 70 * SEC);
+        f.p().spawn(71, 70, START + 71 * SEC, "bun dev", web);
+        f.p().add_listener(71, 5180);
+        f.p().set_env(71, &[("CODEX_THREAD_ID", "T1")]);
+        f.w.tick(T0).unwrap();
+        let s = server_of(&f, 71).expect("linked");
+        assert_eq!(s.agent, AgentKind::ClaudeCode);
+        assert_eq!(s.session_pid, 70);
+        assert_eq!(s.session_id, "sess-in");
+    }
+
+    #[test]
+    fn codex_exec_inside_claude_tree_server_belongs_to_claude() {
+        let mut f = fx();
+        let web = f.wt.join("apps/web");
+        let web = web.to_str().unwrap();
+        f.p().spawn(60, 20, START + 60 * SEC, "zsh", web);
+        f.p()
+            .spawn(61, 60, START + 61 * SEC, "codex exec fix it", web);
+        f.p().spawn(62, 61, START + 62 * SEC, "zsh", web);
+        f.p().spawn(63, 62, START + 63 * SEC, "vite", web);
+        f.p().add_listener(63, 5190);
+        f.w.tick(T0).unwrap();
+        let s = server_of(&f, 63).expect("linked");
+        assert_eq!((s.agent, s.session_pid), (AgentKind::ClaudeCode, 20));
+    }
+
+    #[test]
+    fn codex_inside_server_tree_is_spared_on_kill() {
+        let mut f = fx();
+        let web = f.wt.join("apps/web");
+        let web = web.to_str().unwrap();
+        f.p()
+            .spawn(60, 30, START + 60 * SEC, "codex exec fix it", web);
+        f.p().spawn(61, 60, START + 61 * SEC, "vite", web);
+        f.p().add_listener(61, 5191);
+        f.w.tick(T0).unwrap();
+        assert!(f.w.kill(KillTarget::Port(3000)).unwrap().is_some());
+        assert!(f
+            .p()
+            .signals()
+            .iter()
+            .all(|&(pid, _)| pid != 60 && pid != 61));
+        assert!(f.p().is_alive(60) && f.p().is_alive(61));
+    }
+
+    #[test]
+    fn codex_app_server_listener_never_tracked() {
+        let mut f = fx();
+        let web = f.wt.join("apps/web");
+        f.p().spawn(
+            60,
+            20,
+            START + 60 * SEC,
+            "codex app-server --listen ws://127.0.0.1:7000",
+            web.to_str().unwrap(),
+        );
+        f.p().add_listener(60, 7000);
+        f.w.tick(T0).unwrap();
+        assert_eq!(server_of(&f, 60), None);
+        assert_eq!(f.state_servers().len(), 1);
+    }
+
+    #[test]
+    fn claude_and_codex_in_same_worktree_are_shared() {
+        let mut f = codex_fx();
+        // The Codex session's cwd is the worktree root.
+        f.p().remove_proc(300);
+        f.p()
+            .spawn(300, 10, START + 300 * SEC, "codex", f.wt.to_str().unwrap());
+        let lock = f.repo.path().join("codex-home/thread-writer-locks/T1.lock");
+        f.p()
+            .set_open_paths(300, &[canonical(&lock).to_str().unwrap()]);
+        f.w.tick(T0).unwrap();
+        assert!(server_of(&f, 30).is_some());
+        f.p().remove_proc(20); // the Claude session exits
+        let killed = tick_minutes(&mut f, T0, T0 + 30 * MIN);
+        assert!(killed.is_empty());
+        assert!(f.p().is_alive(30));
+    }
+
+    #[test]
+    fn codex_dead_session_idle_kill_after_20_min() {
+        let mut f = codex_fx();
+        codex_server_chain(&f);
+        f.w.tick(T0).unwrap();
+        // Both sessions share the worktree: both must be gone.
+        f.p().remove_proc(300);
+        f.p().remove_proc(20);
+        let r = f.w.tick(T0 + 19 * MIN).unwrap();
+        assert!(r.killed.is_empty());
+        let r = f.w.tick(T0 + 20 * MIN).unwrap();
+        let rec = r
+            .killed
+            .iter()
+            .find(|k| k.port == 5173)
+            .expect("codex server killed");
+        assert_eq!(
+            rec.reason,
+            KillReason::DeadSessionIdle { idle_ms: 20 * MIN }
+        );
+        assert!(!f.p().is_alive(304));
+        assert!(f.kill_log().iter().any(|k| k.port == 5173));
+    }
+
     pub(super) fn key30() -> ServerKey {
         ServerKey {
             pid: 30,
@@ -1119,7 +1442,14 @@ mod tests {
 
     fn link_pid(f: &Fx, pid: i32, port: u16) -> Option<TrackedServer> {
         let chain = ancestry(f.p(), pid);
-        link(&Listener { pid, port }, &chain, &sessions(f), &f.cfg(), T0)
+        link(
+            &Listener { pid, port },
+            &chain,
+            &|_| None,
+            &sessions(f),
+            &f.cfg(),
+            T0,
+        )
     }
 
     #[test]
@@ -1231,7 +1561,10 @@ mod tests {
             pid: 31,
             port: 9999,
         };
-        assert_eq!(link(&l, &chain, &sessions(&f), &f.cfg(), T0), None);
+        assert_eq!(
+            link(&l, &chain, &|_| None, &sessions(&f), &f.cfg(), T0),
+            None
+        );
 
         let r = f.w.tick(T0).unwrap();
         let ports: Vec<u16> = r.servers.iter().map(|v| v.port).collect();

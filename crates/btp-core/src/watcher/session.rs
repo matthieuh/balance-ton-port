@@ -1259,4 +1259,46 @@ mod tests {
         f.p().spawn(51, 10, START + 51 * SEC, "btp stale", "/");
         assert_eq!(f.w.stale(51, Some(10), "sess-b", T0).unwrap(), None);
     }
+
+    #[test]
+    fn sweep_session_ignores_codex_servers_of_other_processes() {
+        let mut f = codex_fx();
+        codex_server_chain(&f);
+        f.w.tick(T0 - 30 * MIN).unwrap();
+        assert!(f.state_servers().iter().any(|s| s.key.pid == 304));
+        // The Codex session is gone and its server long idle: due.
+        f.p().remove_proc(300);
+        let proc_start = format_proc_start(START + 20 * SEC);
+        let out = f.w.sweep_session(20, &proc_start, T0 + 30 * MIN).unwrap();
+        assert!(out.killed.iter().all(|k| k.port != 5173));
+        assert!(f.p().is_alive(304));
+        assert!(f.p().signals().iter().all(|&(pid, _)| pid != 304));
+    }
+
+    #[test]
+    fn session_end_never_lists_a_codex_server_in_the_claude_group() {
+        let mut f = codex_fx();
+        // The Codex session works elsewhere, so nothing is shared.
+        let elsewhere = f.repo.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let lock = f.repo.path().join("codex-home/thread-writer-locks/T1.lock");
+        f.p().remove_proc(300);
+        f.p().spawn(
+            300,
+            10,
+            START + 300 * SEC,
+            "codex",
+            elsewhere.to_str().unwrap(),
+        );
+        f.p()
+            .set_open_paths(300, &[lock.canonicalize().unwrap().to_str().unwrap()]);
+        codex_server_chain(&f);
+        hook(&f);
+        f.w.tick(T0 - 10 * MIN).unwrap();
+        assert_eq!(f.state_servers().len(), 2);
+        let r = end(&mut f, T0);
+        let group = r.group.expect("group");
+        assert_eq!(group.still_open.len(), 1);
+        assert_eq!(group.still_open[0].port, 3000);
+    }
 }

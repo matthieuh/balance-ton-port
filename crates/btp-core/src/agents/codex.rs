@@ -277,11 +277,16 @@ impl Agent for CodexAgent {
     }
 
     fn env_conversation(&self, env: &[(String, String)]) -> Option<String> {
-        env.iter()
-            .find(|(k, _)| k == "CODEX_THREAD_ID")
-            .map(|(_, v)| v.clone())
-            .filter(|v| !v.is_empty())
+        env_thread(env)
     }
+}
+
+/// `CODEX_THREAD_ID` from a process environment: the only value read from it.
+pub fn env_thread(env: &[(String, String)]) -> Option<String> {
+    env.iter()
+        .find(|(k, _)| k == "CODEX_THREAD_ID")
+        .map(|(_, v)| v.clone())
+        .filter(|v| !v.is_empty())
 }
 
 #[cfg(test)]
@@ -518,7 +523,8 @@ mod tests {
             };
             let chain = ancestry(&p, 301);
             let server =
-                crate::watcher::link(&listener, &chain, &s, &Config::default(), 0).expect("linked");
+                crate::watcher::link(&listener, &chain, &|_| None, &s, &Config::default(), 0)
+                    .expect("linked");
             assert_eq!(server.agent, AgentKind::Codex);
         }
 
