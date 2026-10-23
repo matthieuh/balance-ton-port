@@ -367,14 +367,14 @@ func canRestartNow(_ s: ServerViewFfi, restarting: Bool) -> Bool {
 /// The ⋯ menu, the same everywhere. Restart only when the core can restart
 /// it, Keep for agent servers, Ignore this alert with an alert card, Stop
 /// unless excluded; neither Restart nor Stop while a Restart runs.
-/// Details… waits for the detail view.
-func moreMenuItems(_ s: ServerViewFfi, restarting: Bool = false) -> [MenuItem] {
+/// Details… opens the detail view (not offered from the detail itself).
+func moreMenuItems(_ s: ServerViewFfi, restarting: Bool = false, inDetail: Bool = false) -> [MenuItem] {
     [
         MenuItem(kind: .open, title: "\u{2197} Open in browser", enabled: true),
         MenuItem(kind: .restart, title: "\u{27F3} Restart", enabled: canRestartNow(s, restarting: restarting)),
         MenuItem(kind: .keep, title: "\u{23F8} Keep (no alerts)", enabled: s.managed),
         MenuItem(kind: .ignoreAlert, title: "\u{2298} Ignore this alert", enabled: hasAlertCard(s)),
-        MenuItem(kind: .details, title: "\u{24D8} Details\u{2026}", enabled: false),
+        MenuItem(kind: .details, title: "\u{24D8} Details\u{2026}", enabled: !inDetail),
         MenuItem(kind: .separator, title: "", enabled: false),
         MenuItem(kind: .stop, title: "\u{25A0} Stop", enabled: canStopNow(s, restarting: restarting)),
     ]
@@ -455,6 +455,212 @@ func alertIgnoredView(_ s: ServerViewFfi) -> ServerViewFfi {
     var v = s
     if hasAlertCard(v) { v.card = nil }
     return v
+}
+
+// MARK: - Detail
+
+/// A button of the detail view: the two at the bottom and the status card's.
+enum DetailButton: Hashable, Sendable {
+    case open, stop, restart, postpone, stopNow
+
+    var title: String {
+        switch self {
+        case .open: return "Open"
+        case .stop: return "Stop"
+        case .restart: return "Restart"
+        case .postpone: return "Postpone 1 h"
+        case .stopNow: return "Stop now"
+        }
+    }
+}
+
+/// The detail's one sentence: what is going on with this server and why.
+/// A leak first, then a server no agent started, in use, kept, its
+/// session's state.
+func statusSentence(_ s: ServerViewFfi) -> String {
+    if s.card?.kind == "leak", let reason = s.card?.reason {
+        return reason + "."
+    }
+    if s.inUse { return "In use: a browser is connected." }
+    if !s.managed { return "Not started by an agent. Balance ton port never stops it on its own." }
+    if s.statusText.hasPrefix("kept by ") {
+        return "K" + s.statusText.dropFirst() + ". No alerts."
+    }
+    let idle = durationLabel(ms: s.idleMs)
+    if !s.sessionAlive {
+        return "Its \(s.agentLabel) session ended and nothing has connected for \(idle)."
+    }
+    if s.state == "idle" {
+        return "Its \(s.agentLabel) session is open; nothing has connected for \(idle)."
+    }
+    return "Its \(s.agentLabel) session is open."
+}
+
+/// The status card's bold line when a stop is scheduled: `Stops in 8 min`.
+func statusTitle(_ s: ServerViewFfi) -> String? {
+    guard let killIn = s.killInMs else { return nil }
+    return killIn < 60_000 ? "Stops soon" : "Stops in \(durationLabel(ms: killIn))"
+}
+
+/// How much of the countdown is left, 0 to 1; `nil` when no stop is
+/// scheduled.
+func countdownFraction(killInMs: UInt64?, totalMs: UInt64) -> Double? {
+    guard let killInMs, totalMs > 0 else { return nil }
+    return min(1, Double(killInMs) / Double(totalMs))
+}
+
+/// The countdown's full length: one hour after Postpone 1 h, else the dead
+/// session delay.
+func countdownTotalMs(_ s: ServerViewFfi, deadSessionIdleS: UInt64) -> UInt64 {
+    s.postponed ? 3_600_000 : deadSessionIdleS * 1000
+}
+
+/// About to stop: Postpone 1 h, Stop now. Leak: Restart, Stop. Otherwise
+/// (in use included): Open, Stop.
+func bottomButtons(_ s: ServerViewFfi) -> [DetailButton] {
+    switch s.card?.kind {
+    case "leak": return [.restart, .stop]
+    case "about_to_stop": return [.postpone, .stopNow]
+    default: return [.open, .stop]
+    }
+}
+
+/// The status card's own button: Postpone 1 h when about to stop, Restart
+/// for a leak.
+func statusCardAction(_ s: ServerViewFfi) -> DetailButton? {
+    switch s.card?.kind {
+    case "about_to_stop": return .postpone
+    case "leak": return .restart
+    default: return nil
+    }
+}
+
+/// The menu's rules: Stop unless excluded, Restart when the core can,
+/// neither while a Restart runs, Postpone for an agent server.
+func detailButtonEnabled(_ b: DetailButton, _ s: ServerViewFfi, restarting: Bool) -> Bool {
+    switch b {
+    case .open: return true
+    case .stop, .stopNow: return canStopNow(s, restarting: restarting)
+    case .restart: return canRestartNow(s, restarting: restarting)
+    case .postpone: return s.managed
+    }
+}
+
+/// `up 5 h`.
+func uptimeChip(ms: UInt64) -> String {
+    "up \(durationLabel(ms: ms))"
+}
+
+/// `3 processes ›`.
+func processesLabel(_ n: Int) -> String {
+    (n == 1 ? "1 process" : "\(n) processes") + " \u{203A}"
+}
+
+/// `CPU 4%`, rounded.
+func cpuLabel(_ pct: Float) -> String {
+    "CPU \(Int(pct.rounded()))%"
+}
+
+/// The session chip: `✳ "revva-b8" ↗`. A click copies the resume command.
+func sessionChipText(_ s: ServerViewFfi) -> String {
+    let glyph = s.agent == "codex" ? "\u{25CE}" : "\u{2733}"
+    return "\(glyph) \"\(truncatedSessionName(s.sessionName))\" \u{2197}"
+}
+
+/// What the session chip says for a moment after the copy.
+let copiedLabel = "Copied"
+let copiedDuration: TimeInterval = 1.5
+
+/// The hero's second line: the framework (else the tool, when it is not
+/// the title), then the ports.
+func heroSubtitle(_ s: ServerViewFfi) -> (kind: String?, port: String, otherPorts: String?) {
+    let t = titleParts(s)
+    let kind = t.framework ?? (s.toolLabel.lowercased() == t.title.lowercased() ? nil : s.toolLabel)
+    let p = subtitleParts(s)
+    return (kind, p.port, p.otherPorts)
+}
+
+/// An event's label under the chart: `✳ started` for an agent start, else
+/// the core's label.
+func eventChartLabel(_ e: EventFfi) -> String {
+    switch (e.kind, e.label) {
+    case ("started", "started by Claude"): return "\u{2733} started"
+    case ("started", "started by Codex"): return "\u{25CE} started"
+    default: return e.label
+    }
+}
+
+/// Which event labels fit under the chart: `positions` are 0 to 1 across
+/// it, oldest first. The latest are kept; one closer than `minGap` to a
+/// kept one is drawn without its label. Indices, oldest first.
+func labelledEvents(at positions: [Double], minGap: Double) -> [Int] {
+    var kept: [Int] = []
+    for i in positions.indices.reversed() where kept.allSatisfy({ abs(positions[$0] - positions[i]) >= minGap }) {
+        kept.append(i)
+    }
+    return kept.reversed()
+}
+
+/// The chart's top, in bytes, and whether the leak line is drawn to scale.
+/// A small server is not flattened under a line far above it: the line is
+/// then pinned to the top and labelled as above.
+func chartScale(maxBytes: UInt64, lineBytes: UInt64) -> (upper: Double, lineOnScale: Bool) {
+    let upper = max(Double(maxBytes) * 1.25, 64 * 1_048_576)
+    let line = Double(lineBytes)
+    guard line <= upper * 2 else { return (upper, false) }
+    return (max(upper, line * 1.1), true)
+}
+
+/// `2 GB`, `1.5 GB`: the leak line's label.
+func leakLineLabel(_ bytes: UInt64) -> String {
+    let gb = Double(bytes) / Double(1024 * 1_048_576)
+    return gb.rounded() == gb ? "\(Int(gb)) GB" : String(format: "%.1f GB", gb)
+}
+
+/// The tallest the detail may be on a screen whose visible height is
+/// `screenHeight`; it scrolls past that. Never under 300 pt.
+func detailMaxHeight(screenHeight: CGFloat) -> CGFloat {
+    max(300, screenHeight - 40)
+}
+
+// MARK: - Page preview
+
+/// A live preview is taken only for a server a browser already uses: the
+/// preview never wakes an idle one.
+func shouldSnapshot(_ s: ServerViewFfi) -> Bool {
+    s.inUse
+}
+
+/// How long a preview is kept for one server (pid and start time).
+let previewCacheTTL: TimeInterval = 180
+
+func previewCacheFresh(takenAt: Date, now: Date = Date()) -> Bool {
+    now.timeIntervalSince(takenAt) < previewCacheTTL
+}
+
+/// The page the preview loads.
+func previewURL(port: UInt16) -> URL {
+    URL(string: "http://127.0.0.1:\(String(port))/")!
+}
+
+/// The preview may only go to the server itself: plain http on loopback
+/// (`localhost` or `127.0.0.1`), on its own port.
+func previewAllows(_ url: URL, port: UInt16) -> Bool {
+    guard url.scheme?.lowercased() == "http", let host = url.host?.lowercased(), url.port == Int(port) else {
+        return false
+    }
+    return host == "localhost" || host == "127.0.0.1"
+}
+
+/// A content rule list that blocks every load (subresources included)
+/// except the server's own origin on loopback.
+func previewContentRules(port: UInt16) -> String {
+    let p = String(port)
+    return """
+    [{"trigger":{"url-filter":".*"},"action":{"type":"block"}},\
+    {"trigger":{"url-filter":"^http://localhost:\(p)/"},"action":{"type":"ignore-previous-rules"}},\
+    {"trigger":{"url-filter":"^http://127\\\\.0\\\\.0\\\\.1:\(p)/"},"action":{"type":"ignore-previous-rules"}}]
+    """
 }
 
 // MARK: - Notifications

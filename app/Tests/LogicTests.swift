@@ -779,21 +779,22 @@ final class MenuActionTests: XCTestCase {
              "\u{24D8} Details\u{2026}", "", "\u{25A0} Stop"]
         )
         XCTAssertEqual(items.map(\.kind), [.open, .restart, .keep, .ignoreAlert, .details, .separator, .stop])
-        XCTAssertEqual(items.filter(\.enabled).map(\.kind), [.open, .restart, .keep, .ignoreAlert, .stop])
+        XCTAssertEqual(items.filter(\.enabled).map(\.kind), [.open, .restart, .keep, .ignoreAlert, .details, .stop])
+        XCTAssertFalse(moreMenuItems(s, inDetail: true).first { $0.kind == .details }!.enabled, "not from the detail")
 
         func enabled(_ s: ServerViewFfi) -> [MenuItemKind] { moreMenuItems(s).filter(\.enabled).map(\.kind) }
-        XCTAssertEqual(enabled(menuServer()), [.open, .keep, .stop], "no Restart when it cannot, no Ignore without a card")
-        XCTAssertEqual(enabled(menuServer(managed: false, agent: "")), [.open, .stop], "no Keep for an observed server")
+        XCTAssertEqual(enabled(menuServer()), [.open, .keep, .details, .stop], "no Restart when it cannot, no Ignore without a card")
+        XCTAssertEqual(enabled(menuServer(managed: false, agent: "")), [.open, .details, .stop], "no Keep for an observed server")
         var excluded = menuServer(managed: false, agent: "")
         excluded.excluded = true
-        XCTAssertEqual(enabled(excluded), [.open], "no Stop for an excluded server")
-        XCTAssertEqual(enabled(menuServer(card: "leak", action: "restart")), [.open, .keep, .ignoreAlert, .stop])
+        XCTAssertEqual(enabled(excluded), [.open, .details], "no Stop for an excluded server")
+        XCTAssertEqual(enabled(menuServer(card: "leak", action: "restart")), [.open, .keep, .ignoreAlert, .details, .stop])
         XCTAssertEqual(
-            enabled(menuServer(card: "about_to_stop", action: "postpone")), [.open, .keep, .stop],
+            enabled(menuServer(card: "about_to_stop", action: "postpone")), [.open, .keep, .details, .stop],
             "an about-to-stop card is not an alert"
         )
         XCTAssertEqual(
-            moreMenuItems(s, restarting: true).filter(\.enabled).map(\.kind), [.open, .keep, .ignoreAlert],
+            moreMenuItems(s, restarting: true).filter(\.enabled).map(\.kind), [.open, .keep, .ignoreAlert, .details],
             "no Restart nor Stop while a Restart runs"
         )
     }
@@ -865,6 +866,246 @@ final class MenuActionTests: XCTestCase {
             let t = confirmationText(s, action: a)
             copy += [t.title, t.message, t.button]
         }
+        for text in copy {
+            XCTAssertFalse(text.contains("\u{2014}"), text)
+        }
+    }
+}
+
+private func detailServer(
+    managed: Bool = true,
+    agent: String = "claude_code",
+    sessionAlive: Bool = false,
+    idleMs: UInt64 = 12 * 60_000,
+    killInMs: UInt64? = nil,
+    inUse: Bool = false,
+    card: String? = nil,
+    action: String = "stop",
+    reason: String = "why",
+    statusText: String = "idle 12 min",
+    state: String = "idle"
+) -> ServerViewFfi {
+    var s = menuServer(managed: managed, agent: agent, card: card, action: action)
+    s.card = card.map { CardFfi(kind: $0, reason: reason, action: action) }
+    s.sessionAlive = sessionAlive
+    s.idleMs = idleMs
+    s.killInMs = killInMs
+    s.inUse = inUse
+    s.statusText = statusText
+    s.state = state
+    s.agentLabel = managed ? (agent == "codex" ? "Codex" : "Claude") : "no agent"
+    return s
+}
+
+final class DetailTests: XCTestCase {
+    func testStatusSentences() {
+        XCTAssertEqual(
+            statusSentence(detailServer(killInMs: 8 * 60_000, card: "about_to_stop", action: "postpone")),
+            "Its Claude session ended and nothing has connected for 12 min."
+        )
+        XCTAssertEqual(statusSentence(detailServer(inUse: true, statusText: "in use")), "In use: a browser is connected.")
+        XCTAssertEqual(
+            statusSentence(detailServer(
+                inUse: true, card: "leak", action: "restart", reason: "Growing fast: +600 MB in 10 min"
+            )),
+            "Growing fast: +600 MB in 10 min."
+        )
+        XCTAssertEqual(
+            statusSentence(detailServer(card: "leak", action: "restart", reason: "Using 2.3 GB")), "Using 2.3 GB."
+        )
+        XCTAssertEqual(
+            statusSentence(detailServer(sessionAlive: true, statusText: "kept by Claude: \"watching the build\"")),
+            "Kept by Claude: \"watching the build\". No alerts."
+        )
+        XCTAssertEqual(statusSentence(detailServer(statusText: "kept by you")), "Kept by you. No alerts.")
+        XCTAssertEqual(statusSentence(detailServer(statusText: "kept by Codex")), "Kept by Codex. No alerts.")
+        XCTAssertEqual(
+            statusSentence(detailServer(managed: false, agent: "")),
+            "Not started by an agent. Balance ton port never stops it on its own."
+        )
+        XCTAssertEqual(
+            statusSentence(detailServer(managed: false, agent: "", inUse: true, statusText: "in use")),
+            "In use: a browser is connected."
+        )
+        XCTAssertEqual(
+            statusSentence(detailServer(agent: "codex", sessionAlive: false)),
+            "Its Codex session ended and nothing has connected for 12 min."
+        )
+        XCTAssertEqual(
+            statusSentence(detailServer(sessionAlive: true, idleMs: 34 * 60_000, statusText: "idle 34 min")),
+            "Its Claude session is open; nothing has connected for 34 min."
+        )
+        XCTAssertEqual(
+            statusSentence(detailServer(sessionAlive: true, idleMs: 0, statusText: "active", state: "active")),
+            "Its Claude session is open."
+        )
+    }
+
+    func testStatusTitle() {
+        XCTAssertEqual(statusTitle(detailServer(killInMs: 8 * 60_000)), "Stops in 8 min")
+        XCTAssertEqual(statusTitle(detailServer(killInMs: 30_000)), "Stops soon")
+        XCTAssertNil(statusTitle(detailServer()))
+    }
+
+    func testBottomButtonsPerCase() {
+        func titles(_ s: ServerViewFfi) -> [String] { bottomButtons(s).map(\.title) }
+        XCTAssertEqual(
+            titles(detailServer(killInMs: 8 * 60_000, card: "about_to_stop", action: "postpone")),
+            ["Postpone 1 h", "Stop now"]
+        )
+        XCTAssertEqual(titles(detailServer(inUse: true)), ["Open", "Stop"])
+        XCTAssertEqual(titles(detailServer(inUse: true, card: "leak", action: "restart")), ["Restart", "Stop"])
+        XCTAssertEqual(titles(detailServer()), ["Open", "Stop"])
+        XCTAssertEqual(titles(detailServer(managed: false, agent: "")), ["Open", "Stop"])
+    }
+
+    func testDetailButtonsFollowTheMenuRules() {
+        var leak = detailServer(card: "leak", action: "restart")
+        XCTAssertFalse(detailButtonEnabled(.restart, leak, restarting: false), "no Restart when it cannot")
+        leak.canRestart = true
+        XCTAssertTrue(detailButtonEnabled(.restart, leak, restarting: false))
+        XCTAssertFalse(detailButtonEnabled(.restart, leak, restarting: true))
+        XCTAssertFalse(detailButtonEnabled(.stop, leak, restarting: true))
+        var excluded = detailServer(managed: false, agent: "")
+        excluded.excluded = true
+        XCTAssertFalse(detailButtonEnabled(.stop, excluded, restarting: false))
+        XCTAssertTrue(detailButtonEnabled(.open, excluded, restarting: true))
+        XCTAssertTrue(detailButtonEnabled(.postpone, detailServer(), restarting: false))
+        XCTAssertFalse(detailButtonEnabled(.postpone, detailServer(managed: false, agent: ""), restarting: false))
+    }
+
+    func testStatusCardAction() {
+        XCTAssertEqual(statusCardAction(detailServer(card: "about_to_stop", action: "postpone")), .postpone)
+        XCTAssertEqual(statusCardAction(detailServer(card: "leak", action: "restart")), .restart)
+        XCTAssertNil(statusCardAction(detailServer(card: "idle_alert")))
+        XCTAssertNil(statusCardAction(detailServer(card: "session_ended_open")))
+        XCTAssertNil(statusCardAction(detailServer()))
+        XCTAssertEqual(DetailButton.postpone.title, "Postpone 1 h")
+    }
+
+    func testCountdownFraction() {
+        XCTAssertEqual(countdownFraction(killInMs: 8 * 60_000, totalMs: 60 * 60_000)!, 8.0 / 60.0, accuracy: 1e-9)
+        XCTAssertNil(countdownFraction(killInMs: nil, totalMs: 60 * 60_000))
+        XCTAssertNil(countdownFraction(killInMs: 1000, totalMs: 0))
+        XCTAssertEqual(countdownFraction(killInMs: 2 * 3_600_000, totalMs: 3_600_000), 1)
+        var s = detailServer(killInMs: 1000)
+        XCTAssertEqual(countdownTotalMs(s, deadSessionIdleS: 1800), 1_800_000)
+        s.postponed = true
+        XCTAssertEqual(countdownTotalMs(s, deadSessionIdleS: 1800), 3_600_000, "Postpone 1 h restarts an hour")
+    }
+
+    func testUptimeChip() {
+        XCTAssertEqual(uptimeChip(ms: 5 * 3_600_000 + 20 * 60_000), "up 5 h")
+        XCTAssertEqual(uptimeChip(ms: 12 * 60_000), "up 12 min")
+        XCTAssertEqual(uptimeChip(ms: 3 * 86_400_000), "up 3 d")
+    }
+
+    func testDetailLabels() {
+        XCTAssertEqual(processesLabel(3), "3 processes \u{203A}")
+        XCTAssertEqual(processesLabel(1), "1 process \u{203A}")
+        XCTAssertEqual(cpuLabel(0.4), "CPU 0%")
+        XCTAssertEqual(cpuLabel(12.6), "CPU 13%")
+        var s = detailServer()
+        s.sessionName = "web-itinerairer-public-cb4fa7a5"
+        XCTAssertEqual(sessionChipText(s), "\u{2733} \"web-itinerairer-pub\u{2026}\" \u{2197}")
+        s.agent = "codex"
+        s.sessionName = "fix"
+        XCTAssertEqual(sessionChipText(s), "\u{25CE} \"fix\" \u{2197}")
+        var hero = menuServer(port: 3010, ports: [3010, 9229], title: "revva-server", framework: "wrangler")
+        XCTAssertEqual(heroSubtitle(hero).kind, "wrangler")
+        XCTAssertEqual(heroSubtitle(hero).port, ":3010")
+        XCTAssertEqual(heroSubtitle(hero).otherPorts, "+9229")
+        hero.framework = nil
+        hero.toolLabel = "Bun dev"
+        XCTAssertEqual(heroSubtitle(hero).kind, "Bun dev")
+        hero.title = "Bun dev"
+        XCTAssertNil(heroSubtitle(hero).kind, "not the title twice")
+    }
+
+    func testEventChartLabels() {
+        XCTAssertEqual(eventChartLabel(EventFfi(atMs: 0, kind: "started", label: "started by Claude")), "\u{2733} started")
+        XCTAssertEqual(eventChartLabel(EventFfi(atMs: 0, kind: "started", label: "started by Codex")), "\u{25CE} started")
+        XCTAssertEqual(eventChartLabel(EventFfi(atMs: 0, kind: "started", label: "started")), "started")
+        XCTAssertEqual(
+            eventChartLabel(EventFfi(atMs: 0, kind: "browser_closed", label: "browser closed")), "browser closed"
+        )
+    }
+
+    func testCrowdedEventLabelsKeepTheLatest() {
+        XCTAssertEqual(labelledEvents(at: [0.06, 0.52, 0.73], minGap: 0.15), [0, 1, 2])
+        XCTAssertEqual(labelledEvents(at: [0.50, 0.55, 0.60, 0.90], minGap: 0.15), [2, 3])
+        XCTAssertEqual(labelledEvents(at: [0.30, 0.55, 0.60, 0.90], minGap: 0.15), [0, 2, 3])
+        XCTAssertEqual(labelledEvents(at: [], minGap: 0.15), [])
+    }
+
+    func testChartScale() {
+        let mb: UInt64 = 1_048_576
+        let small = chartScale(maxBytes: 90 * mb, lineBytes: 2048 * mb)
+        XCTAssertFalse(small.lineOnScale, "a 90 MB server is not flattened under a 2 GB line")
+        XCTAssertEqual(small.upper, Double(90 * mb) * 1.25, accuracy: 1)
+        let big = chartScale(maxBytes: 1500 * mb, lineBytes: 2048 * mb)
+        XCTAssertTrue(big.lineOnScale)
+        XCTAssertEqual(big.upper, Double(2048 * mb) * 1.1, accuracy: 1)
+        let leak = chartScale(maxBytes: 3000 * mb, lineBytes: 2048 * mb)
+        XCTAssertTrue(leak.lineOnScale)
+        XCTAssertEqual(leak.upper, Double(3000 * mb) * 1.25, accuracy: 1)
+        XCTAssertEqual(chartScale(maxBytes: 0, lineBytes: 2048 * mb).upper, Double(64 * mb), accuracy: 1)
+        XCTAssertEqual(leakLineLabel(2048 * mb), "2 GB")
+        XCTAssertEqual(leakLineLabel(3072 * mb), "3 GB")
+        XCTAssertEqual(leakLineLabel(1536 * mb), "1.5 GB")
+    }
+
+    func testDetailHeightStaysOnScreen() {
+        XCTAssertEqual(detailMaxHeight(screenHeight: 1000), 960)
+        XCTAssertEqual(detailMaxHeight(screenHeight: 200), 300)
+    }
+
+    func testDominantColorsOfATwoColorImage() throws {
+        // 10 x 10: 5 red columns, 3 blue, 2 transparent.
+        let ctx = try XCTUnwrap(CGContext(
+            data: nil, width: 10, height: 10, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        ctx.setFillColor(red: 1, green: 0, blue: 0, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: 5, height: 10))
+        ctx.setFillColor(red: 0, green: 0, blue: 1, alpha: 1)
+        ctx.fill(CGRect(x: 5, y: 0, width: 3, height: 10))
+        let rep = NSBitmapImageRep(cgImage: try XCTUnwrap(ctx.makeImage()))
+        let png = try XCTUnwrap(rep.representation(using: .png, properties: [:]))
+        XCTAssertEqual(dominantRGB(png), [0xFF0000, 0x0000FF])
+        XCTAssertEqual(dominantColors(png, fallback: .gray), [Color(hex: 0xFF0000), Color(hex: 0x0000FF)])
+        XCTAssertEqual(dominantColors(Data([1, 2, 3]), fallback: .gray), [.gray], "unreadable: the port color")
+    }
+
+    func testPreviewOnlyWhenInUse() {
+        XCTAssertTrue(shouldSnapshot(detailServer(inUse: true)))
+        XCTAssertFalse(shouldSnapshot(detailServer(inUse: false)))
+        XCTAssertTrue(previewCacheFresh(takenAt: Date(timeIntervalSince1970: 0), now: Date(timeIntervalSince1970: 179)))
+        XCTAssertFalse(previewCacheFresh(takenAt: Date(timeIntervalSince1970: 0), now: Date(timeIntervalSince1970: 180)))
+    }
+
+    func testPreviewStaysOnTheServersOwnPort() {
+        func allows(_ u: String) -> Bool { previewAllows(URL(string: u)!, port: 3010) }
+        XCTAssertTrue(allows("http://localhost:3010/"))
+        XCTAssertTrue(allows("http://127.0.0.1:3010/app?x=1"))
+        XCTAssertFalse(allows("http://localhost:3011/"))
+        XCTAssertFalse(allows("http://localhost/"), "no port is port 80")
+        XCTAssertFalse(allows("https://localhost:3010/"))
+        XCTAssertFalse(allows("http://example.com:3010/"))
+        XCTAssertFalse(allows("http://localhost.example.com:3010/"))
+        XCTAssertFalse(allows("http://[::1]:3010/"))
+        XCTAssertEqual(previewURL(port: 3010).absoluteString, "http://127.0.0.1:3010/")
+        let rules = previewContentRules(port: 3010)
+        let parsed = try? JSONSerialization.jsonObject(with: Data(rules.utf8)) as? [[String: Any]]
+        XCTAssertEqual(parsed?.count, 3, "block all, then let the two loopback origins through")
+        XCTAssertTrue(rules.contains("^http://127\\\\.0\\\\.0\\\\.1:3010/"))
+        XCTAssertTrue(rules.contains("^http://localhost:3010/"))
+    }
+
+    func testDetailCopyHasNoEmDash() {
+        let s = detailServer()
+        let copy = [statusSentence(s), uptimeChip(ms: 1), processesLabel(2), copiedLabel, sessionChipText(s)]
+            + [DetailButton.open, .stop, .restart, .postpone, .stopNow].map(\.title)
         for text in copy {
             XCTAssertFalse(text.contains("\u{2014}"), text)
         }

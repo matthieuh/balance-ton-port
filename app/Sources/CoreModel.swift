@@ -37,6 +37,8 @@ final class CoreModel: ObservableObject {
     @Published private(set) var settingsError: String?
     /// What macOS allows for notifications; `nil` until first read.
     @Published private(set) var notificationPermission: NotificationPermission?
+    /// Passes landed so far: an open detail refreshes on each.
+    @Published private(set) var passesDone = 0
 
     private let core = Core()
     private let queue = DispatchQueue(label: "com.matthieuh.balancetonport.core", qos: .utility)
@@ -481,6 +483,7 @@ final class CoreModel: ObservableObject {
             let live = Set(result.servers.map(\.id))
             rowNotes = rowNotes.filter { live.contains($0.key) || restarts[$0.key] != nil }
             publish()
+            passesDone += 1
             if !firstPassDone {
                 firstPassDone = true
                 let waiting = afterFirstPass
@@ -564,6 +567,26 @@ final class CoreModel: ObservableObject {
         }
     }
 
+    /// What the detail view shows beyond the row: history, events,
+    /// processes, the resume command, the favicon bytes and the config
+    /// figures for the chart and the countdown. Cheap reads, on the core
+    /// queue; empty when they fail.
+    func detail(_ id: ServerID) async -> DetailData {
+        let data = try? await onCore { core in
+            let config = try? core.config()
+            return DetailData(
+                history: core.history(pid: id.pid, startTime: id.startTime),
+                events: core.events(pid: id.pid, startTime: id.startTime),
+                processes: core.processes(pid: id.pid, startTime: id.startTime),
+                resumeCommand: (try? core.resumeCommand(pid: id.pid, startTime: id.startTime)) ?? nil,
+                icon: core.icon(pid: id.pid, startTime: id.startTime),
+                leakLineBytes: (config?.leakMemoryMb ?? 2048) * 1_048_576,
+                deadSessionIdleS: config?.deadSessionIdleS ?? 0
+            )
+        }
+        return data ?? DetailData()
+    }
+
     /// Fetches the favicon of each server that has one and is not cached
     /// yet, on the core queue; forgets the icons of servers gone. A fetch
     /// that finds nothing is tried again on a later pass; bytes that do not
@@ -635,4 +658,15 @@ private struct PassResult: Sendable {
     let configError: String?
     let memory: MemoryBarFfi
     let leaks: [ServerViewFfi]
+}
+
+/// The detail view's data for one server (`CoreModel.detail`).
+struct DetailData: Sendable, Equatable {
+    var history: [SampleFfi] = []
+    var events: [EventFfi] = []
+    var processes: [ProcRowFfi] = []
+    var resumeCommand: String?
+    var icon: Data?
+    var leakLineBytes: UInt64 = 2048 * 1_048_576
+    var deadSessionIdleS: UInt64 = 0
 }

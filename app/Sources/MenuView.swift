@@ -3,19 +3,43 @@ import SwiftUI
 
 /// The menu, decision first: header and usage bar, the servers that need
 /// you (one card each), the others as compact rows behind a fold, then the
-/// footer.
+/// footer. A click on a card or a row slides its detail in, in the same
+/// panel.
 struct MenuView: View {
     @EnvironmentObject private var model: CoreModel
     @Environment(\.openSettings) private var openSettings
     @Environment(\.colorScheme) private var scheme
+    @StateObject private var nav = MenuNavigation()
     @State private var showAll = false
     /// The cards and rows' natural height, measured, so the scroll view is
     /// only as tall as its content up to `sectionsMaxHeight`.
     @State private var sectionsHeight: CGFloat = 0
 
     var body: some View {
+        ZStack(alignment: .top) {
+            if let id = nav.detail, let server = model.servers.first(where: { $0.id == id }) {
+                DetailView(server: server)
+                    .transition(.move(edge: .trailing))
+            } else {
+                list
+                    .transition(.move(edge: .leading))
+            }
+        }
+        .frame(width: panelWidth, alignment: .top)
+        .clipped()
+        .environmentObject(nav)
+        .onChange(of: model.servers) { _, servers in
+            let live = Set(servers.map(\.id))
+            PreviewStore.shared.retain(live)
+            // A server stopped (or replaced by its restart) closes its detail.
+            if let id = nav.detail, !live.contains(id) { nav.back() }
+        }
+    }
+
+    /// The servers' list: what the panel shows without a detail open.
+    private var list: some View {
         let sections = menuSections(model.servers, visibleAllGood: showAll ? .max : allGoodVisibleRows)
-        VStack(alignment: .leading, spacing: 0) {
+        return VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 0) {
                 HeaderView(count: model.servers.count, memory: model.memory, servers: model.servers)
                     .padding(.bottom, 12)
