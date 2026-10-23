@@ -18,6 +18,10 @@ pub struct Config {
     /// Ports never tracked: a server listening on one of them (itself or a
     /// child) is left alone.
     pub exclude_ports: Vec<u16>,
+    /// A server above this much memory (MB) leaks.
+    pub leak_memory_mb: u64,
+    /// A server growing by more than this (MB) in 10 minutes leaks.
+    pub leak_growth_mb: u64,
 }
 
 impl Default for Config {
@@ -40,6 +44,8 @@ impl Default for Config {
             .map(|s| s.to_string())
             .collect(),
             exclude_ports: Vec::new(),
+            leak_memory_mb: 2048,
+            leak_growth_mb: 500,
         }
     }
 }
