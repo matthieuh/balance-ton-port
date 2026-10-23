@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 import UserNotifications
 
 // Pure helpers: no UI, no notification center, no core queue. Compiled into
@@ -27,12 +28,18 @@ func stateLabel(_ s: ServerViewFfi) -> String {
     return s.state
 }
 
-/// The menu panel's width, its padding, and the indent of a row's lines 2
-/// and 3 (past the status dot). A row's third line must fit in
-/// `rowTextWidth` at the callout font (tested).
+/// The previous menu's width, padding and row indent, against which the
+/// session lines are measured (tested). The decision-first menu uses
+/// `panelWidth`, `panelPadding` and `cardIndent`.
 let menuWidth: CGFloat = 480
 let menuPadding: CGFloat = 12
 let rowIndent: CGFloat = 16
+
+/// The menu panel's width and padding, and the indent of a card's second
+/// and third lines (past the 22 pt icon and its 8 pt gap).
+let panelWidth: CGFloat = 420
+let panelPadding: CGFloat = 14
+let cardIndent: CGFloat = 30
 var rowTextWidth: CGFloat { menuWidth - 2 * menuPadding - rowIndent }
 
 /// `:8081`. Always the bare digits: a port is not a quantity, so no
@@ -91,6 +98,294 @@ func relativeTime(atMs: UInt64, now: Date = Date()) -> String {
     case 60..<(24 * 60): return "\(min / 60) h ago"
     case (24 * 60)..<(48 * 60): return "yesterday"
     default: return "\(min / (24 * 60)) days ago"
+    }
+}
+
+// MARK: - Menu (decision first)
+
+/// "All good" rows shown before the `+ N more` fold.
+let allGoodVisibleRows = 3
+
+/// Card action pills and row capsule buttons: 26 to 28 pt high, pressed at
+/// 96 %.
+let actionButtonHeight: CGFloat = 27
+let pressScale: CGFloat = 0.96
+
+/// The radius of a shape inset by `padding` in one of radius `outer`, so
+/// both curves share a centre; never under 4 pt.
+func concentricRadius(outer: CGFloat, padding: CGFloat) -> CGFloat {
+    max(4, outer - padding)
+}
+
+/// The menu panel's corner radius, and the radii that nest in it.
+let panelRadius: CGFloat = 16
+let cardRadius = concentricRadius(outer: panelRadius, padding: 4)
+let rowRadius = concentricRadius(outer: panelRadius, padding: 6)
+let iconRadius = concentricRadius(outer: rowRadius, padding: 4)
+
+/// The menu's two lists: servers that need a decision (one card each) and
+/// the others, of which the first `visibleAllGood` show before the fold.
+struct MenuSections {
+    let needsYou: [ServerViewFfi]
+    let allGood: [ServerViewFfi]
+    let hiddenCount: Int
+}
+
+/// Cards: leak, session ended but open, about to stop, idle alert, then the
+/// biggest first. All good: agent servers by port, then the others by port.
+func menuSections(_ servers: [ServerViewFfi], visibleAllGood: Int = allGoodVisibleRows) -> MenuSections {
+    let cards = servers.filter { $0.card != nil }.sorted {
+        let (a, b) = (cardRank($0.card?.kind), cardRank($1.card?.kind))
+        return a != b ? a < b : $0.rssBytes > $1.rssBytes
+    }
+    let rest = servers.filter { $0.card == nil }.sorted {
+        $0.managed != $1.managed ? $0.managed : $0.port < $1.port
+    }
+    let shown = Array(rest.prefix(max(0, visibleAllGood)))
+    return MenuSections(needsYou: cards, allGood: shown, hiddenCount: rest.count - shown.count)
+}
+
+private func cardRank(_ kind: String?) -> Int {
+    switch kind {
+    case "leak": return 0
+    case "session_ended_open": return 1
+    case "about_to_stop": return 2
+    case "idle_alert": return 3
+    default: return 4
+    }
+}
+
+/// The pill on a card: `Restart`, `Postpone 1 h` or `Stop`.
+func cardActionLabel(_ card: CardFfi) -> String {
+    switch card.action {
+    case "restart": return "Restart"
+    case "postpone": return "Postpone 1 h"
+    default: return "Stop"
+    }
+}
+
+/// A card's pill is filled (amber) only for Restart, the fix for a leak.
+func cardActionIsProminent(_ card: CardFfi) -> Bool {
+    card.action == "restart"
+}
+
+/// Leak and idle cards are amber; the session ended ones rose.
+func cardTint(_ card: CardFfi) -> Color {
+    switch card.kind {
+    case "leak", "idle_alert": return .orange
+    default: return .pink
+    }
+}
+
+/// `green`, `amber` or `red` memory health, as system colors.
+func healthColor(_ health: String) -> Color {
+    switch health {
+    case "red": return .red
+    case "amber": return .orange
+    default: return .green
+    }
+}
+
+/// A size label's color: plain (`nil`) while healthy.
+func sizeColor(_ health: String) -> Color? {
+    health == "green" ? nil : healthColor(health)
+}
+
+/// A port's hue in 0..<1: the golden-ratio step from the port number, so
+/// neighbours differ and a port keeps its color across launches.
+func portHue(_ port: UInt16) -> Double {
+    (Double(port) * 0.618_033_988_75).truncatingRemainder(dividingBy: 1)
+}
+
+/// A port's color: pastel on the dark panel, deeper on the light one.
+func portColor(_ port: UInt16, dark: Bool = true) -> Color {
+    Color(hue: portHue(port), saturation: dark ? 0.45 : 0.75, brightness: dark ? 0.95 : 0.62)
+}
+
+/// `✳ Claude` orange, `◎ Codex` blue, `no agent` secondary (`nil`).
+func agentBadge(_ s: ServerViewFfi) -> (text: String, color: Color?) {
+    switch s.agent {
+    case "claude_code": return ("\u{2733} Claude", .orange)
+    case "codex": return ("\u{25CE} Codex", .blue)
+    default: return ("no agent", nil)
+    }
+}
+
+/// The parts of a row's second line, so each can take its own color.
+struct SubtitleParts: Equatable {
+    /// `:3010`
+    let port: String
+    /// `+9229 +9230`, or `nil` with a single port.
+    let otherPorts: String?
+    /// The branch, else the project folder; `nil` when neither is known.
+    let place: String?
+    let badge: String
+}
+
+func subtitleParts(_ s: ServerViewFfi) -> SubtitleParts {
+    let others = s.ports.filter { $0 != s.port }.map { "+" + String($0) }
+    let place = [s.branch ?? "", s.worktreeName].first { !$0.isEmpty }
+    return SubtitleParts(
+        port: portLabel(s.port),
+        otherPorts: others.isEmpty ? nil : others.joined(separator: " "),
+        place: place,
+        badge: agentBadge(s).text
+    )
+}
+
+/// `:3010 +9229 · roadbook-explore · ✳ Claude`.
+func rowSubtitle(_ s: ServerViewFfi) -> String {
+    let p = subtitleParts(s)
+    let port = [p.port, p.otherPorts].compactMap { $0 }.joined(separator: " ")
+    return [port, p.place, p.badge].compactMap { $0 }.joined(separator: " \u{00B7} ")
+}
+
+/// The row's title and its framework, the framework left out when it only
+/// repeats the title (`Vite · Vite`).
+func titleParts(_ s: ServerViewFfi) -> (title: String, framework: String?) {
+    let title = s.title.isEmpty ? s.toolLabel : s.title
+    guard let f = s.framework, !f.isEmpty, f.lowercased() != title.lowercased() else {
+        return (title, nil)
+    }
+    return (title, f)
+}
+
+/// A row's status after its badge: the core's text, plus `notifications
+/// off` when its alert is due but could not be shown.
+func rowStatus(_ s: ServerViewFfi, notificationsOff: Bool = false) -> String {
+    notificationsOff ? "\(s.statusText), notifications off" : s.statusText
+}
+
+/// `NEEDS YOU · 2`, `ALL GOOD · 5`.
+func sectionTitle(_ kind: String, count: Int) -> String {
+    "\(kind.uppercased()) \u{00B7} \(count)"
+}
+
+let nothingToDecide = "Nothing to decide"
+
+/// The fold under "All good": `+ 2 more ▸`.
+func moreLabel(_ n: Int) -> String {
+    "+ \(n) more \u{25B8}"
+}
+
+/// `Recently stopped (1)`.
+func recentlyStoppedLabel(_ n: Int) -> String {
+    "Recently stopped (\(n))"
+}
+
+/// `7 servers`, `1 server`.
+func headerCount(_ n: Int) -> String {
+    n == 1 ? "1 server" : "\(n) servers"
+}
+
+/// The `90 MB` / `2.3 GB` size label (same rounding as the core).
+func memoryLabel(_ bytes: UInt64) -> String {
+    let mbUnit: UInt64 = 1_048_576
+    let mb = (bytes + mbUnit / 2) / mbUnit
+    if mb < 1024 { return "\(mb) MB" }
+    return String(format: "%.1f GB", Double(bytes) / Double(mbUnit * 1024))
+}
+
+/// How full a row's memory gauge is: the share of 2 GB (the red line),
+/// at least 3 % so a small server still shows a tick.
+func gaugeFraction(_ bytes: UInt64) -> Double {
+    min(1, max(0.03, Double(bytes) / Double(2 * 1024 * 1_048_576)))
+}
+
+/// The usage bar's segments, as shares of the machine's memory: dev servers
+/// split by health, then every other app. Free memory is what is left.
+struct UsageSegments: Equatable {
+    let green: Double
+    let amber: Double
+    let red: Double
+    let apps: Double
+}
+
+func usageSegments(_ memory: MemoryBarFfi, servers: [ServerViewFfi]) -> UsageSegments {
+    guard memory.totalBytes > 0 else { return UsageSegments(green: 0, amber: 0, red: 0, apps: 0) }
+    let total = Double(memory.totalBytes)
+    func share(_ health: String) -> Double {
+        Double(servers.filter { $0.health == health }.reduce(UInt64(0)) { $0 + $1.rssBytes }) / total
+    }
+    return UsageSegments(
+        green: share("green"), amber: share("amber"), red: share("red"),
+        apps: Double(memory.appsBytes) / total
+    )
+}
+
+/// The core's usage line cut for the bar's caption: the bold figure, the
+/// rest of the left half, then the apps and free halves on the right.
+struct UsageCaption: Equatable {
+    /// `4.8 GB`
+    let figure: String
+    /// `dev servers (13%)`
+    let dev: String
+    /// `apps 26.8`
+    let apps: String
+    /// `free 4.4 of 36 GB`
+    let free: String
+}
+
+/// `nil` when the line is not in the core's shape.
+func usageCaption(_ line: String) -> UsageCaption? {
+    let halves = line.components(separatedBy: " \u{00B7} ")
+    guard halves.count == 3 else { return nil }
+    let words = halves[0].split(separator: " ", maxSplits: 2).map(String.init)
+    guard words.count == 3 else { return nil }
+    return UsageCaption(figure: "\(words[0]) \(words[1])", dev: words[2], apps: halves[1], free: halves[2])
+}
+
+/// The usage bar's tooltip: exact figures in MB.
+func usageHelp(_ m: MemoryBarFfi) -> String {
+    let mb = { (b: UInt64) in "\(b / 1_048_576) MB" }
+    return "Dev servers \(mb(m.devBytes))\nOther apps \(mb(m.appsBytes))\nFree \(mb(m.freeBytes)) of \(mb(m.totalBytes))"
+}
+
+/// What stands for a server without a favicon: its framework's tile, else
+/// the first letter of its title in its port's color.
+struct IconTile: Equatable {
+    let letter: String
+    /// An SF Symbol drawn instead of the letter.
+    let symbol: String?
+    /// `nil`: the neutral tile.
+    let background: Color?
+    /// `nil`: white on a colored tile, the port's color on the neutral one.
+    let foreground: Color?
+}
+
+func iconTile(_ s: ServerViewFfi) -> IconTile {
+    func tile(_ letter: String, _ hex: UInt32, symbol: String? = nil) -> IconTile {
+        IconTile(letter: letter, symbol: symbol, background: Color(hex: hex), foreground: nil)
+    }
+    switch s.framework {
+    case "Vite": return tile("V", 0x8A5CF6)
+    case "Next.js": return tile("N", 0x000000)
+    case "Astro": return tile("A", 0xFF5D01)
+    case "Remix": return tile("R", 0x3992FF)
+    case "Nuxt": return tile("N", 0x00C16A)
+    case "SvelteKit": return tile("S", 0xFF3E00)
+    case "Storybook": return tile("S", 0xFF4785)
+    case "Expo": return tile("E", 0x4630EB)
+    case "Django": return tile("D", 0x0C4B33)
+    case "Rails": return tile("R", 0xCC0000)
+    case "Flask": return tile("F", 0x3B3B3B)
+    case "wrangler": return tile("W", 0xF38020, symbol: "cloud.fill")
+    case "static": return tile("S", 0x5A6270, symbol: "doc.fill")
+    default:
+        let title = titleParts(s).title
+        let letter = title.first(where: { $0.isLetter || $0.isNumber }).map { String($0).uppercased() } ?? "?"
+        return IconTile(letter: letter, symbol: nil, background: nil, foreground: nil)
+    }
+}
+
+extension Color {
+    /// `0xRRGGBB`.
+    init(hex: UInt32) {
+        self.init(
+            red: Double((hex >> 16) & 0xFF) / 255,
+            green: Double((hex >> 8) & 0xFF) / 255,
+            blue: Double(hex & 0xFF) / 255
+        )
     }
 }
 

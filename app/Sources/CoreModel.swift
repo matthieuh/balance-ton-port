@@ -7,7 +7,13 @@ import Foundation
 /// on one serial background queue, never on the main thread.
 @MainActor
 final class CoreModel: ObservableObject {
+    /// Agent servers, then observed ones (`managed == false`, no agent).
     @Published private(set) var servers: [ServerViewFfi] = []
+    /// The usage bar's figures from the last pass.
+    @Published private(set) var memory: MemoryBarFfi?
+    /// Favicons by server, loaded off the main thread once per server.
+    @Published private(set) var icons: [ServerID: NSImage] = [:]
+    private var iconsLoading: Set<ServerID> = []
     @Published private(set) var recentKills: [KillRecordFfi] = []
     /// True while another process (for example `btp watch`) holds the watch
     /// lock: the app then only observes and never runs a killing tick.
@@ -204,11 +210,10 @@ final class CoreModel: ObservableObject {
                 // back to the default interval, the core keeps its last
                 // valid config anyway.
                 let scan = (try? core.config())?.scanIntervalS ?? 5
-                // Observed rows (no agent) wait for the menu that shows
-                // them; this one lists and kills agent servers only.
                 return PassResult(
-                    owner: owner, servers: report.servers.filter(\.managed), alerts: report.alerts,
-                    kills: kills, scanIntervalS: scan, configError: report.configError
+                    owner: owner, servers: report.servers, alerts: report.alerts,
+                    kills: kills, scanIntervalS: scan, configError: report.configError,
+                    memory: report.memory
                 )
             }
             watchedElsewhere = !result.owner
@@ -220,7 +225,9 @@ final class CoreModel: ObservableObject {
             }
             lastPassServers = result.servers
             servers = result.servers.filter { killedByHand[$0.id] == nil }
+            memory = result.memory
             recentKills = result.kills
+            loadIcons(for: result.servers)
             // Only the watching app alerts; a read-only pass leaves them to
             // the other watcher. An alert is marked only once it was added
             // to Notification Center, so a refused one is retried and its
@@ -283,6 +290,26 @@ final class CoreModel: ObservableObject {
         }
     }
 
+    /// Fetches the favicon of each server that has one and is not cached
+    /// yet, on the core queue; forgets the icons of servers gone. A fetch
+    /// that finds nothing is tried again on a later pass.
+    private func loadIcons(for servers: [ServerViewFfi]) {
+        let live = Set(servers.map(\.id))
+        icons = icons.filter { live.contains($0.key) }
+        for server in servers where server.hasIcon {
+            let id = server.id
+            guard icons[id] == nil, !iconsLoading.contains(id) else { continue }
+            iconsLoading.insert(id)
+            Task {
+                let data = try? await onCore { core in core.icon(pid: id.pid, startTime: id.startTime) }
+                iconsLoading.remove(id)
+                if let data, let image = NSImage(data: data), lastPassServers.contains(where: { $0.id == id }) {
+                    icons[id] = image
+                }
+            }
+        }
+    }
+
     private func scheduleNextPass(after interval: TimeInterval) {
         timer?.invalidate()
         let next = Timer(timeInterval: interval, repeats: false) { [weak self] _ in
@@ -316,4 +343,5 @@ private struct PassResult: Sendable {
     let kills: [KillRecordFfi]
     let scanIntervalS: UInt64
     let configError: String?
+    let memory: MemoryBarFfi
 }

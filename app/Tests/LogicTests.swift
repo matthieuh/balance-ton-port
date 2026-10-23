@@ -405,6 +405,15 @@ final class NotificationSetupTests: XCTestCase {
             }
         }
         XCTAssertFalse(sampleNotificationBody.contains("\u{2014}"))
+        let s = menuServer(port: 3010, ports: [3010, 9229], branch: "roadbook-explore")
+        let menuCopy = [
+            nothingToDecide, moreLabel(2), recentlyStoppedLabel(1), headerCount(7), headerCount(1),
+            sectionTitle("Needs you", count: 2), sectionTitle("All good", count: 5), rowSubtitle(s),
+            agentBadge(s).text, rowStatus(s, notificationsOff: true),
+        ] + ["restart", "postpone", "stop"].map { cardActionLabel(CardFfi(kind: "leak", reason: "", action: $0)) }
+        for text in menuCopy {
+            XCTAssertFalse(text.contains("\u{2014}"), text)
+        }
     }
 }
 
@@ -505,5 +514,190 @@ final class SessionEndedNotificationTests: XCTestCase {
         let sample = info(sampleNotificationUserInfo())
         XCTAssertNil(notificationRoute(actionIdentifier: NotificationIDs.kill, userInfo: sample))
         XCTAssertNil(notificationRoute(actionIdentifier: NotificationIDs.keep, userInfo: [:]))
+    }
+}
+
+private func menuServer(
+    port: UInt16 = 3000,
+    ports: [UInt16]? = nil,
+    managed: Bool = true,
+    agent: String = "claude_code",
+    branch: String? = nil,
+    worktree: String = "web",
+    card: String? = nil,
+    action: String = "stop",
+    rssMb: UInt64 = 100,
+    health: String = "green",
+    title: String = "Bun dev",
+    framework: String? = nil
+) -> ServerViewFfi {
+    var s = server(port: port, worktree: worktree, agent: agent)
+    s.pid = Int32(port)
+    s.ports = ports ?? [port]
+    s.managed = managed
+    s.branch = branch
+    s.card = card.map { CardFfi(kind: $0, reason: "why", action: action) }
+    s.rssBytes = rssMb * 1_048_576
+    s.health = health
+    s.title = title
+    s.framework = framework
+    return s
+}
+
+final class MenuLayoutTests: XCTestCase {
+    func testSectionsOrderCardsAndFoldAllGood() {
+        let servers = [
+            menuServer(port: 8081),
+            menuServer(port: 3000, managed: false, agent: ""),
+            menuServer(port: 3010, card: "about_to_stop", action: "postpone"),
+            menuServer(port: 4400),
+            menuServer(port: 5173, agent: "codex", card: "leak", action: "restart"),
+            menuServer(port: 1234, managed: false, agent: ""),
+            menuServer(port: 9000),
+        ]
+        let m = menuSections(servers)
+        XCTAssertEqual(m.needsYou.map(\.port), [5173, 3010])
+        XCTAssertEqual(m.allGood.map(\.port), [4400, 8081, 9000], "agent servers first, by port")
+        XCTAssertEqual(m.hiddenCount, 2)
+        XCTAssertEqual(menuSections(servers, visibleAllGood: 10).allGood.map(\.port), [4400, 8081, 9000, 1234, 3000])
+    }
+
+    func testCardsOrderByKindThenMemory() {
+        let servers = [
+            menuServer(port: 1, card: "idle_alert"),
+            menuServer(port: 2, card: "about_to_stop", rssMb: 10),
+            menuServer(port: 3, card: "about_to_stop", rssMb: 900),
+            menuServer(port: 4, card: "session_ended_open"),
+            menuServer(port: 5, card: "leak"),
+        ]
+        XCTAssertEqual(menuSections(servers).needsYou.map(\.port), [5, 4, 3, 2, 1])
+    }
+
+    func testNothingToDecideWhenNoCard() {
+        let m = menuSections([menuServer(port: 1), menuServer(port: 2)])
+        XCTAssertTrue(m.needsYou.isEmpty)
+        XCTAssertEqual(m.allGood.count, 2)
+        XCTAssertEqual(m.hiddenCount, 0)
+        XCTAssertEqual(nothingToDecide, "Nothing to decide")
+    }
+
+    func testPortColorIsStable() {
+        XCTAssertEqual(portHue(3010), portHue(3010))
+        XCTAssertEqual(portHue(3010), (3010 * 0.618_033_988_75).truncatingRemainder(dividingBy: 1), accuracy: 1e-12)
+        XCTAssertEqual(portColor(3010), portColor(3010))
+        XCTAssertNotEqual(portColor(3000), portColor(3001))
+        for port: UInt16 in [0, 1, 80, 3000, 65535] {
+            XCTAssertTrue((0..<1).contains(portHue(port)), "\(port)")
+        }
+    }
+
+    func testAgentBadges() {
+        let claude = agentBadge(menuServer())
+        XCTAssertEqual(claude.text, "\u{2733} Claude")
+        XCTAssertEqual(claude.color, .orange)
+        let codex = agentBadge(menuServer(agent: "codex"))
+        XCTAssertEqual(codex.text, "\u{25CE} Codex")
+        XCTAssertEqual(codex.color, .blue)
+        let none = agentBadge(menuServer(managed: false, agent: ""))
+        XCTAssertEqual(none.text, "no agent")
+        XCTAssertNil(none.color)
+    }
+
+    func testRowSubtitle() {
+        let s = menuServer(port: 3010, ports: [3010, 9229], branch: "roadbook-explore")
+        XCTAssertEqual(rowSubtitle(s), ":3010 +9229 \u{00B7} roadbook-explore \u{00B7} \u{2733} Claude")
+        XCTAssertEqual(
+            rowSubtitle(menuServer(port: 3000, agent: "", worktree: "client-portal")),
+            ":3000 \u{00B7} client-portal \u{00B7} no agent",
+            "the project when the branch is unknown"
+        )
+        XCTAssertEqual(rowSubtitle(menuServer(port: 8081, worktree: "")), ":8081 \u{00B7} \u{2733} Claude")
+    }
+
+    func testTitlePartsDropARepeatedFramework() {
+        XCTAssertEqual(titleParts(menuServer(title: "Revva", framework: "Expo")).framework, "Expo")
+        XCTAssertNil(titleParts(menuServer(title: "Vite", framework: "Vite")).framework)
+        XCTAssertNil(titleParts(menuServer(title: "serve")).framework)
+    }
+
+    func testSectionTitles() {
+        XCTAssertEqual(sectionTitle("Needs you", count: 2), "NEEDS YOU \u{00B7} 2")
+        XCTAssertEqual(sectionTitle("All good", count: 5), "ALL GOOD \u{00B7} 5")
+        XCTAssertEqual(moreLabel(2), "+ 2 more \u{25B8}")
+        XCTAssertEqual(recentlyStoppedLabel(1), "Recently stopped (1)")
+    }
+
+    func testHeaderCount() {
+        XCTAssertEqual(headerCount(7), "7 servers")
+        XCTAssertEqual(headerCount(1), "1 server")
+        XCTAssertEqual(headerCount(0), "0 servers")
+    }
+
+    func testCardActionLabels() {
+        let label = { (action: String) in cardActionLabel(CardFfi(kind: "x", reason: "", action: action)) }
+        XCTAssertEqual(label("restart"), "Restart")
+        XCTAssertEqual(label("postpone"), "Postpone 1 h")
+        XCTAssertEqual(label("stop"), "Stop")
+        let aboutToStop = CardFfi(kind: "about_to_stop", reason: "Session ended, unused", action: "postpone")
+        XCTAssertEqual(cardActionLabel(aboutToStop), "Postpone 1 h")
+        XCTAssertFalse(cardActionIsProminent(aboutToStop))
+        XCTAssertTrue(cardActionIsProminent(CardFfi(kind: "leak", reason: "", action: "restart")))
+    }
+
+    func testConcentricRadius() {
+        XCTAssertEqual(concentricRadius(outer: 16, padding: 4), 12)
+        XCTAssertEqual(concentricRadius(outer: 16, padding: 6), 10)
+        XCTAssertEqual(concentricRadius(outer: 6, padding: 4), 4, "never under 4")
+        XCTAssertEqual(concentricRadius(outer: 4, padding: 10), 4)
+        XCTAssertTrue((26...28).contains(actionButtonHeight))
+        XCTAssertEqual(pressScale, 0.96)
+    }
+
+    func testHealthAndSizeColors() {
+        XCTAssertEqual(healthColor("green"), .green)
+        XCTAssertEqual(healthColor("amber"), .orange)
+        XCTAssertEqual(healthColor("red"), .red)
+        XCTAssertNil(sizeColor("green"))
+        XCTAssertEqual(sizeColor("red"), .red)
+    }
+
+    func testMemoryLabelsAndGauge() {
+        XCTAssertEqual(memoryLabel(90 * 1_048_576), "90 MB")
+        XCTAssertEqual(memoryLabel(2355 * 1_048_576), "2.3 GB")
+        XCTAssertEqual(gaugeFraction(0), 0.03)
+        XCTAssertEqual(gaugeFraction(1024 * 1_048_576), 0.5)
+        XCTAssertEqual(gaugeFraction(5 * 1024 * 1_048_576), 1)
+    }
+
+    func testUsageSegmentsSplitDevByHealth() {
+        let gb: UInt64 = 1024 * 1_048_576
+        let m = MemoryBarFfi(
+            devBytes: 3 * gb, appsBytes: 8 * gb, freeBytes: 5 * gb, totalBytes: 16 * gb, line: "", freeLow: false
+        )
+        let servers = [
+            menuServer(port: 1, rssMb: 1024, health: "green"),
+            menuServer(port: 2, rssMb: 2048, health: "red"),
+        ]
+        XCTAssertEqual(usageSegments(m, servers: servers), UsageSegments(green: 1 / 16, amber: 0, red: 2 / 16, apps: 0.5))
+        let empty = MemoryBarFfi(devBytes: 0, appsBytes: 0, freeBytes: 0, totalBytes: 0, line: "", freeLow: false)
+        XCTAssertEqual(usageSegments(empty, servers: servers), UsageSegments(green: 0, amber: 0, red: 0, apps: 0))
+        XCTAssertEqual(usageHelp(m), "Dev servers 3072 MB\nOther apps 8192 MB\nFree 5120 MB of 16384 MB")
+    }
+
+    func testUsageCaptionCutsTheCoreLine() {
+        XCTAssertEqual(
+            usageCaption("4.8 GB dev servers (13%) \u{00B7} apps 26.8 \u{00B7} free 4.4 of 36 GB"),
+            UsageCaption(figure: "4.8 GB", dev: "dev servers (13%)", apps: "apps 26.8", free: "free 4.4 of 36 GB")
+        )
+        XCTAssertNil(usageCaption(""))
+    }
+
+    func testIconTiles() {
+        XCTAssertEqual(iconTile(menuServer(framework: "Vite")).letter, "V")
+        XCTAssertEqual(iconTile(menuServer(framework: "wrangler")).symbol, "cloud.fill")
+        let plain = iconTile(menuServer(title: "serve"))
+        XCTAssertEqual(plain.letter, "S")
+        XCTAssertNil(plain.background)
+        XCTAssertEqual(iconTile(menuServer(title: "@scope/app")).letter, "S")
     }
 }
