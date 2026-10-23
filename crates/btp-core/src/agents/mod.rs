@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 pub mod claude;
 pub mod codex;
+pub mod codex_rollout;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
