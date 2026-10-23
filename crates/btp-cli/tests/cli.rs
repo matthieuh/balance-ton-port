@@ -202,7 +202,10 @@ fn list_degrades_to_read_only_when_data_dir_not_writable() {
     let out = btp_isolated(&data).arg("list").assert().success();
     let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
-    assert!(stdout.contains("4321"), "{stdout}");
+    assert!(
+        stdout.contains("4321") && stdout.contains("saved"),
+        "{stdout}"
+    );
     assert!(
         stderr.contains("btp: data dir is read-only here (sandbox?), showing the last saved state"),
         "{stderr}"

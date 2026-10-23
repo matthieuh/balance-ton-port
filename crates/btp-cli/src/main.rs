@@ -156,6 +156,9 @@ struct ServerOut<'a> {
     view: &'a ServerView,
     /// `active`, `idle` or `session dead`, as in the plain output.
     state: &'static str,
+    /// `false` only in the read-only list, where nothing was probed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    probed: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -220,6 +223,7 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
                     let kills = btp_core::state::with_state(&dir, |s| s.recent_kills.clone())?;
                     Ok((report.servers, report.config_error, kills))
                 });
+            let mut probed = true;
             let (servers, config_error, kills) = match pass {
                 Ok(all) => all,
                 Err(e) if is_read_only_error(&e) => {
@@ -227,6 +231,7 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
                     eprintln!(
                         "btp: data dir is read-only here (sandbox?), showing the last saved state"
                     );
+                    probed = false;
                     let now = now_ms();
                     let servers = saved.servers.iter().map(|s| saved_view(s, now)).collect();
                     (servers, None, saved.recent_kills)
@@ -240,7 +245,8 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
                         .iter()
                         .map(|view| ServerOut {
                             view,
-                            state: state_label(view),
+                            state: if probed { state_label(view) } else { "saved" },
+                            probed: (!probed).then_some(false),
                         })
                         .collect(),
                     recent_kills: &kills,
@@ -251,7 +257,11 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
                         .map_err(|e| Failure::Internal(e.to_string()))?
                 );
             } else {
-                print!("{}", render_list(&servers));
+                if probed {
+                    print!("{}", render_list(&servers));
+                } else {
+                    print!("{}", render_list_with(&servers, |_| "saved"));
+                }
             }
             Ok(0)
         }
@@ -808,7 +818,6 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// Aligned table, header `PORT  COMMAND  WORKTREE  STATE  IDLE`.
 /// Fails with the sandbox message before a command that needs to write the
 /// data dir resolves its caller (which would otherwise answer first).
 fn require_writable(dir: &std::path::Path) -> Result<(), Failure> {
@@ -817,7 +826,7 @@ fn require_writable(dir: &std::path::Path) -> Result<(), Failure> {
 }
 
 /// A tracked server as last saved, for the read-only list: nothing is probed,
-/// so the session counts as alive and the idle time is the saved one.
+/// so only the saved idle time means anything (the list labels them `saved`).
 fn saved_view(s: &TrackedServer, now_ms: u64) -> ServerView {
     ServerView {
         key: s.key,
@@ -841,7 +850,12 @@ fn saved_view(s: &TrackedServer, now_ms: u64) -> ServerView {
     }
 }
 
+/// Aligned table, header `PORT  COMMAND  WORKTREE  STATE  IDLE`.
 fn render_list(servers: &[ServerView]) -> String {
+    render_list_with(servers, state_label)
+}
+
+fn render_list_with(servers: &[ServerView], label: fn(&ServerView) -> &'static str) -> String {
     let mut rows: Vec<[String; 5]> = vec![[
         "PORT".into(),
         "COMMAND".into(),
@@ -854,7 +868,7 @@ fn render_list(servers: &[ServerView]) -> String {
             s.port.to_string(),
             truncate(&s.command, 50),
             s.worktree_name.clone(),
-            state_label(s).to_string(),
+            label(s).to_string(),
             format_idle(s.idle_ms),
         ]);
     }
@@ -1137,6 +1151,7 @@ mod tests {
         let json = serde_json::to_string(&ServerOut {
             view: &v,
             state: "idle",
+            probed: None,
         })
         .unwrap();
         assert!(json.contains("\"agent\":\"claude_code\""), "{json}");

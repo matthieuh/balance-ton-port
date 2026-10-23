@@ -606,19 +606,21 @@ impl<P: Platform> Watcher<P> {
     }
 }
 
-/// The session a `btp note` caller speaks for. A `CODEX_THREAD_ID` in the
-/// caller's own environment names the live session holding that thread
-/// (`conversation_id` or `other_conversations`); an unknown thread is
-/// refused and never falls back to the process ancestry. Without it, the
-/// ancestry pick stands.
+/// The session a `btp note` caller speaks for. The process ancestry wins:
+/// a caller inside a live session tree speaks for that session, whatever
+/// `CODEX_THREAD_ID` it inherited. Only when the ancestry finds nothing does
+/// the thread in the caller's own environment name the live session holding
+/// it (`conversation_id` or `other_conversations`); an unknown thread is
+/// refused.
 fn caller_session(
     env_thread: Option<&str>,
     sessions: &[AgentSession],
     ancestry_pick: Option<(i32, String)>,
 ) -> Option<(i32, String)> {
-    let Some(thread) = env_thread.filter(|t| !t.is_empty()) else {
+    if ancestry_pick.is_some() {
         return ancestry_pick;
-    };
+    }
+    let thread = env_thread.filter(|t| !t.is_empty())?;
     sessions
         .iter()
         .find(|s| holds_thread(s, thread))
@@ -1353,20 +1355,29 @@ mod tests {
     #[test]
     fn note_from_codex_thread_env_is_checked() {
         let sessions = [codex(300, "T1", &["T1b"]), codex(400, "T2", &[])];
-        let pick = Some((20, "claude-start".to_string()));
-        // The thread names its session, whatever the ancestry says.
+        let claude = Some((20, "claude-start".to_string()));
+        // No ancestry: the thread names its session.
         assert_eq!(
-            caller_session(Some("T1"), &sessions, pick.clone()),
+            caller_session(Some("T1"), &sessions, None),
             Some((300, "start-300".into()))
         );
         assert_eq!(
             caller_session(Some("T1b"), &sessions, None),
             Some((300, "start-300".into()))
         );
-        // An unknown thread is refused, never the ancestry.
-        assert_eq!(caller_session(Some("nope"), &sessions, pick.clone()), None);
-        // No thread: the ancestry pick.
-        assert_eq!(caller_session(None, &sessions, pick.clone()), pick);
+        // An unknown thread is refused.
+        assert_eq!(caller_session(Some("nope"), &sessions, None), None);
+        // Ancestry wins: a Claude session inheriting a Codex thread env
+        // speaks for itself.
+        assert_eq!(
+            caller_session(Some("T1"), &sessions, claude.clone()),
+            claude
+        );
+        assert_eq!(
+            caller_session(Some("nope"), &sessions, claude.clone()),
+            claude
+        );
+        assert_eq!(caller_session(None, &sessions, claude.clone()), claude);
         assert_eq!(caller_session(None, &sessions, None), None);
     }
 }
