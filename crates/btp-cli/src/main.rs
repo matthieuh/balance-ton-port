@@ -5,12 +5,12 @@
 use btp_core::config::{data_dir, effective_claude_dirs, read_config, save_config};
 use btp_core::display::format_idle as ago;
 use btp_core::display::{format_idle, server_state as state_label};
+use btp_core::labels::tool_label;
 use btp_core::model::{KillReason, KillTarget};
 use btp_core::platform::MacOs;
 use btp_core::state::{KillRecord, SessionEndedGroup};
 use btp_core::watcher::{
-    acquire_watch_lock, finish_kill, now_ms, EndBudget, NoteCmd, NoteOutcome, ServerView,
-    TickReport, Watcher,
+    acquire_watch_lock, now_ms, NoteCmd, NoteOutcome, ServerView, TickReport, Watcher,
 };
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
@@ -69,17 +69,19 @@ enum Cmd {
         #[arg(long)]
         conversation: String,
     },
-    /// Claude Code SessionEnd hook: stop the idle servers of the session
-    /// that quits. Prints nothing and always exits 0.
+    /// Claude Code SessionEnd hook: record the servers the quitting session
+    /// leaves running (never stops any). Prints nothing and always exits 0.
     SessionEnd(SessionEndArgs),
-    /// Detached SIGKILL stage of `session-end` (internal)
-    #[command(name = "_finish-kill", hide = true)]
-    FinishKill {
-        /// When to send SIGKILL, Unix milliseconds
+    /// Detached waiter of `session-end`: applies the dead-session rule to
+    /// that session's servers when no watcher runs (internal)
+    #[command(name = "_sweep-later", hide = true)]
+    SweepLater {
+        /// `<pid>:<procStart>` of the ended session process
         #[arg(long)]
-        deadline_ms: u64,
-        /// `<pid>:<start time>` pairs
-        targets: Vec<String>,
+        session: String,
+        /// When the first server becomes due, Unix milliseconds
+        #[arg(long)]
+        at: u64,
     },
 }
 
@@ -88,10 +90,10 @@ enum Cmd {
 struct NoteArgs {
     /// Port the server listens on
     port: u16,
-    /// Spare it when the session ends and stop alerts, with an optional reason
+    /// No idle alerts for it, with an optional reason
     #[arg(long, num_args = 0..=1, value_name = "REASON")]
     keep: Option<Option<String>>,
-    /// You are done with it: stopped when the session ends, once idle
+    /// You are done with it: stopped as soon as idle once your session has ended
     #[arg(long)]
     done: bool,
 }
@@ -263,14 +265,12 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
             }
             Ok(0)
         }
-        Cmd::FinishKill {
-            deadline_ms,
-            targets,
-        } => {
-            let targets = parse_targets(&targets);
-            let wait =
-                Duration::from_millis(deadline_ms.saturating_sub(now_ms())).min(MAX_FINISH_WAIT);
-            finish_kill(&MacOs, &targets, Instant::now() + wait);
+        Cmd::SweepLater { session, at } => {
+            let Some((pid, proc_start)) = parse_session(&session) else {
+                return Err(Failure::User(format!("bad --session {session:?}")));
+            };
+            let notify = notifier();
+            sweep_later(dir, pid, &proc_start, at, notify.as_ref(), hook_debug());
             Ok(0)
         }
         Cmd::Note(a) => {
@@ -396,14 +396,10 @@ fn watch(dir: std::path::PathBuf) -> Result<u8, Failure> {
     Ok(0)
 }
 
-/// SessionEnd budget: Claude Code gives the hook about 1.5 s in all, the
-/// hook script and process start included. A pass takes tens of ms.
-const SAMPLE_WINDOW: Duration = Duration::from_millis(300);
-const SAMPLE_EVERY: Duration = Duration::from_millis(100);
-/// From the start of `session-end` to the hand-off of the survivors.
-const TERM_BUDGET: Duration = Duration::from_millis(900);
-/// `_finish-kill` never waits longer than this, whatever it is given.
-const MAX_FINISH_WAIT: Duration = Duration::from_secs(120);
+/// The waiter wakes at least this often to record activity.
+const WAITER_POLL: Duration = Duration::from_secs(60);
+/// The waiter gives up this long after it started.
+const WAITER_CAP_MS: u64 = 24 * 3_600_000;
 const NOTIFY_TITLE: &str = "Balance ton port";
 
 /// Posts a notification (title, subtitle, body).
@@ -480,16 +476,11 @@ fn ends_process(reason: &str) -> bool {
     matches!(reason, "prompt_input_exit" | "other" | "logout")
 }
 
-/// `<pid>:<start time>` pairs; malformed ones, and pids <= 1, are dropped.
-fn parse_targets(raw: &[String]) -> Vec<(i32, u64)> {
-    raw.iter()
-        .filter_map(|t| {
-            let (pid, start) = t.split_once(':')?;
-            let pid: i32 = pid.parse().ok()?;
-            let start: u64 = start.parse().ok()?;
-            (pid > 1).then_some((pid, start))
-        })
-        .collect()
+/// `<pid>:<procStart>` (the start time contains colons too); pid > 1.
+fn parse_session(raw: &str) -> Option<(i32, String)> {
+    let (pid, start) = raw.split_once(':')?;
+    let pid: i32 = pid.parse().ok()?;
+    (pid > 1 && !start.is_empty()).then(|| (pid, start.to_string()))
 }
 
 /// At most this many servers are named per list in a notification.
@@ -509,34 +500,41 @@ fn name_list(items: Vec<String>) -> String {
     }
 }
 
-/// The notification for a group: (subtitle, body).
-fn notification_text(g: &SessionEndedGroup) -> (String, String) {
-    let mut parts = Vec::new();
-    if !g.stopped.is_empty() {
-        let names = g
-            .stopped
-            .iter()
-            .map(|s| format!("{} :{}", s.tool_label, s.port))
-            .collect();
-        parts.push(format!("Stopped {}.", name_list(names)));
-    }
-    if !g.still_open.is_empty() {
-        let names = g
-            .still_open
-            .iter()
-            .map(|s| {
-                let why = if s.in_use { "in use" } else { "kept" };
-                format!("{} :{} ({why})", s.tool_label, s.port)
-            })
-            .collect();
-        parts.push(format!("Still open: {}.", name_list(names)));
-    }
-    let subtitle = if g.session_name.is_empty() {
-        "Session ended".to_string()
+fn servers_word(n: usize) -> String {
+    if n == 1 {
+        "1 server".to_string()
     } else {
-        format!("Session ended: {}", g.session_name)
-    };
-    (subtitle, parts.join(" "))
+        format!("{n} servers")
+    }
+}
+
+/// The session-end notification: (subtitle, body), for the servers kept
+/// running. `dead_idle_s` is the dead-session delay.
+fn notification_text(g: &SessionEndedGroup, dead_idle_s: u64) -> (String, String) {
+    let names = g
+        .still_open
+        .iter()
+        .map(|s| format!("{} :{}", s.tool_label, s.port))
+        .collect();
+    let body = format!(
+        "Session ended: {} kept running, stopped after {} unused: {}.",
+        servers_word(g.still_open.len()),
+        ago(dead_idle_s.saturating_mul(1000)),
+        name_list(names)
+    );
+    (g.session_name.clone(), body)
+}
+
+/// The waiter's notification for what it stopped: (subtitle, body).
+fn stopped_text(kills: &[KillRecord]) -> (String, String) {
+    let names = kills
+        .iter()
+        .map(|k| format!("{} :{}", tool_label(&k.command), k.port))
+        .collect();
+    (
+        "Unused servers of an ended session".to_string(),
+        format!("Stopped {}.", name_list(names)),
+    )
 }
 
 /// One line per kill, newest first: `12 min ago  :5173 vite (app) [session ended]`.
@@ -602,20 +600,9 @@ fn session_end(dir: std::path::PathBuf, a: &SessionEndArgs, notify: &Notifier, d
         return;
     }
     let started = Instant::now();
-    let budget = EndBudget {
-        sample_window: SAMPLE_WINDOW,
-        sample_every: SAMPLE_EVERY,
-        term_until: started + TERM_BUDGET,
-    };
     let mut w = Watcher::new(MacOs, dir);
     let me = std::process::id() as i32;
-    let report = match w.session_end(
-        me,
-        a.session_pid,
-        a.session_id.as_deref(),
-        now_ms(),
-        &budget,
-    ) {
+    let report = match w.session_end(me, a.session_pid, a.session_id.as_deref(), now_ms()) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("btp: session-end: {e}");
@@ -625,37 +612,100 @@ fn session_end(dir: std::path::PathBuf, a: &SessionEndArgs, notify: &Notifier, d
         }
     };
     trace.extend(report.trace.iter().cloned());
-    // The SIGKILL stage first: it matters more than the message.
-    if !report.survivors.is_empty() {
-        let grace_ms = w.config().kill_grace_s.saturating_mul(1000);
-        let deadline = now_ms().saturating_sub(started.elapsed().as_millis() as u64) + grace_ms;
+    if let (Some(at), Some(g)) = (report.sweep_at, &report.group) {
         let spawned = std::env::current_exe().and_then(|exe| {
             let mut cmd = std::process::Command::new(exe);
-            cmd.arg("_finish-kill")
-                .arg("--deadline-ms")
-                .arg(deadline.to_string())
-                .args(report.survivors.iter().map(|(p, s)| format!("{p}:{s}")));
+            cmd.arg("_sweep-later")
+                .arg(format!(
+                    "--session={}:{}",
+                    g.session_pid, g.session_proc_start
+                ))
+                .arg(format!("--at={at}"));
             spawn_detached(cmd)
         });
         match spawned {
-            Ok(()) => trace.push("SIGKILL stage detached".into()),
+            Ok(()) => trace.push(format!("waiter started for {at}")),
             Err(e) => {
-                eprintln!("btp: could not start the SIGKILL stage: {e}");
-                trace.push(format!("SIGKILL stage failed to start: {e}"));
+                eprintln!("btp: could not start the waiter: {e}");
+                trace.push(format!("waiter failed to start: {e}"));
             }
         }
     }
     match (&report.group, report.post_notification) {
         (Some(g), true) => {
-            let (subtitle, body) = notification_text(g);
+            let (subtitle, body) = notification_text(g, w.config().dead_session_idle_s);
             notify(NOTIFY_TITLE, &subtitle, &body);
             trace.push(format!("notification posted: {body}"));
         }
         (Some(_), false) => trace.push("group left for the app to notify".into()),
-        (None, _) => trace.push("nothing stopped or left open: no notification".into()),
+        (None, _) => trace.push("no server kept running: no notification".into()),
     }
     trace.push(format!("done in {} ms", started.elapsed().as_millis()));
     finish(&trace);
+}
+
+/// Holds an exclusive lock on `path` for the life of the process (one
+/// waiter per ended session). `None` when another process holds it.
+fn exclusive(path: &std::path::Path) -> Option<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .ok()?;
+    // SAFETY: a plain flock on an fd we own.
+    let r = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    (r == 0).then_some(f)
+}
+
+/// `btp _sweep-later`: the dead-session rule for one ended session, when
+/// no watcher runs. Quiet; errors end it.
+fn sweep_later(
+    dir: std::path::PathBuf,
+    pid: i32,
+    proc_start: &str,
+    at: u64,
+    notify: &Notifier,
+    debug: bool,
+) {
+    let tag: String = proc_start
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    let lock_path = dir.join(format!("sweep-later-{pid}-{tag}.lock"));
+    let _ = std::fs::create_dir_all(&dir);
+    let Some(_lock) = exclusive(&lock_path) else {
+        if debug {
+            debug_log(&dir, &[format!("waiter for {pid}: another one runs")]);
+        }
+        return;
+    };
+    let mut trace = vec![format!("waiter for {pid} ({proc_start}) first due at {at}")];
+    let mut w = Watcher::new(MacOs, dir.clone());
+    let cap = now_ms().saturating_add(WAITER_CAP_MS);
+    let mut stopped = |kills: &[KillRecord]| {
+        let (subtitle, body) = stopped_text(kills);
+        notify(NOTIFY_TITLE, &subtitle, &body);
+        if debug {
+            debug_log(&dir, &[format!("waiter for {pid}: {body}")]);
+        }
+    };
+    let end = w.sweep_later(
+        pid,
+        proc_start,
+        at,
+        cap,
+        WAITER_POLL,
+        &now_ms,
+        &mut std::thread::sleep,
+        &mut stopped,
+    );
+    trace.push(format!("waiter for {pid} ended: {end:?}"));
+    if debug {
+        debug_log(&dir, &trace);
+    }
+    let _ = std::fs::remove_file(&lock_path);
 }
 
 /// Reports a `config.toml` that could not be used (stderr).
@@ -816,14 +866,14 @@ mod tests {
     }
 
     #[test]
-    fn finish_kill_targets_parse_strictly() {
-        let raw: Vec<String> = [
-            "12:34", "bad", "1:5", "0:5", "-3:5", "7:x", "8:9:10", "40:41",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        assert_eq!(parse_targets(&raw), vec![(12, 34), (40, 41)]);
+    fn waiter_session_parses_strictly() {
+        assert_eq!(
+            parse_session("20:Thu Oct 22 10:00:00 2026"),
+            Some((20, "Thu Oct 22 10:00:00 2026".to_string()))
+        );
+        for bad in ["", "20", "20:", "x:Thu", "1:Thu", "-4:Thu"] {
+            assert_eq!(parse_session(bad), None, "{bad}");
+        }
     }
 
     fn group(stopped: &[(&str, u16)], open: &[(&str, u16, bool)]) -> SessionEndedGroup {
@@ -861,30 +911,49 @@ mod tests {
     }
 
     #[test]
-    fn notification_names_stopped_and_still_open_servers() {
-        let (sub, body) = notification_text(&group(
-            &[("Vite", 5173), ("Astro", 4322)],
-            &[("Expo (Metro)", 8081, true), ("Bun dev", 3000, false)],
-        ));
-        assert_eq!(sub, "Session ended: web-app");
+    fn notification_names_the_servers_kept_running() {
+        let (sub, body) = notification_text(
+            &group(
+                &[],
+                &[("Expo (Metro)", 8081, true), ("Bun dev", 3000, false)],
+            ),
+            1200,
+        );
+        assert_eq!(sub, "web-app");
         assert_eq!(
             body,
-            "Stopped Vite :5173, Astro :4322. Still open: Expo (Metro) :8081 (in use), Bun dev :3000 (kept)."
+            "Session ended: 2 servers kept running, stopped after 20 min unused: Expo (Metro) :8081, Bun dev :3000."
         );
-        let (_, body) = notification_text(&group(&[("Vite", 5173)], &[]));
-        assert_eq!(body, "Stopped Vite :5173.");
-        let (_, body) = notification_text(&group(&[], &[("Vite", 5173, true)]));
-        assert_eq!(body, "Still open: Vite :5173 (in use).");
+        let (_, body) = notification_text(&group(&[], &[("Vite", 5173, false)]), 3600);
+        assert_eq!(
+            body,
+            "Session ended: 1 server kept running, stopped after 1 h unused: Vite :5173."
+        );
     }
 
     #[test]
     fn notification_caps_long_lists() {
-        let many: Vec<(&str, u16)> = (0..6).map(|i| ("Vite", 5000 + i)).collect();
-        let (_, body) = notification_text(&group(&many, &[]));
-        assert_eq!(
-            body,
-            "Stopped Vite :5000, Vite :5001, Vite :5002, Vite :5003 and 2 more."
+        let many: Vec<(&str, u16, bool)> = (0..6).map(|i| ("Vite", 5000 + i, false)).collect();
+        let (_, body) = notification_text(&group(&[], &many), 1200);
+        assert!(
+            body.ends_with(": Vite :5000, Vite :5001, Vite :5002, Vite :5003 and 2 more."),
+            "{body}"
         );
+    }
+
+    #[test]
+    fn the_waiter_notification_names_what_it_stopped() {
+        let k = |port, command: &str| KillRecord {
+            port,
+            command: command.into(),
+            worktree: "/w".into(),
+            reason: KillReason::DeadSessionIdle { idle_ms: 1 },
+            at_ms: 0,
+        };
+        let (_, body) =
+            stopped_text(&[k(5173, "node vite"), k(8790, "python3 -m http.server 8790")]);
+        assert!(body.starts_with("Stopped Vite :5173, "), "{body}");
+        assert!(body.ends_with(":8790."), "{body}");
     }
 
     #[test]

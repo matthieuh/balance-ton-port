@@ -1,15 +1,16 @@
 #!/bin/bash
-# Balance ton port, SessionEnd hook: stops the idle dev servers of the
-# Claude Code process that quits (`btp session-end`).
+# Balance ton port, SessionEnd hook: records the dev servers the Claude
+# Code process leaves running when it quits (`btp session-end`). It never
+# stops any: they follow the dead-session rule (a detached `btp
+# _sweep-later` applies it when neither the app nor `btp watch` runs).
 #
 # Claude Code shows nothing a SessionEnd hook prints (except stderr on exit
 # 2, as an error) and gives it about 1.5 s. So this hook prints nothing and
 # always exits 0. All the work (finding btp, checking its version, running
 # `btp session-end`) happens in a child detached into its own session, so
-# Claude Code quitting cannot kill it mid-kill; the hook waits for it at
-# most 1.2 s from its own start. `btp session-end` stays within about 0.9 s,
-# hands its SIGKILL stage to a detached process, and posts the result as a
-# macOS notification.
+# Claude Code quitting cannot kill it midway; the hook waits for it at
+# most 1.2 s from its own start. `btp session-end` takes tens of ms and
+# posts what was kept as a macOS notification.
 #
 #   session-end.sh            the hook (payload on stdin)
 #   session-end.sh --run PID REASON [SESSION_ID]   the detached child
@@ -29,7 +30,7 @@ if [ "${1:-}" = --run ]; then
   exec </dev/null >/dev/null
   claude_pid="${2:-}" reason="${3:-}" session_id="${4:-}"
   # A hung btp never lingers: the whole child's process group goes after
-  # 15 s (`btp session-end` detaches its SIGKILL stage into another session).
+  # 15 s (`btp session-end` detaches its waiter into another session).
   (
     sleep 15
     kill -TERM 0

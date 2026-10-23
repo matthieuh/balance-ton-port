@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 mod session;
-pub use session::{EndBudget, NoteCmd, NoteOutcome, SessionEndReport, StaleServer};
+pub use session::{NoteCmd, NoteOutcome, SessionEndReport, StaleServer, SweepOutcome, WaiterEnd};
 
 /// One tracked server as the UI and the CLI show it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -817,32 +817,12 @@ impl<P: Platform> Watcher<P> {
         cfg: &Config,
         now_ms: u64,
     ) -> io::Result<(Vec<KillRecord>, HashSet<ServerKey>)> {
-        let grace = Duration::from_secs(cfg.kill_grace_s);
-        let done = self.execute_staged(targets, cfg, now_ms, Stage::Full(grace))?;
-        Ok((
-            done.killed.into_iter().map(|(_, r)| r).collect(),
-            done.dropped,
-        ))
-    }
-
-    /// `execute` with a choice of stage: the whole kill per target, or
-    /// SIGTERM to every target then one shared wait until a deadline, the
-    /// survivors returned for a later SIGKILL (`finish_kill`). Every target
-    /// gets the same checks as a pass first: config re-read from disk,
-    /// exclusions on the command, any port of the tree and the ancestors
-    /// below the session.
-    pub(crate) fn execute_staged(
-        &self,
-        targets: Vec<(TrackedServer, KillReason)>,
-        cfg: &Config,
-        now_ms: u64,
-        stage: Stage,
-    ) -> io::Result<Executed> {
-        let mut out = Executed::default();
         if targets.is_empty() {
-            return Ok(out);
+            return Ok((Vec::new(), HashSet::new()));
         }
-        let mut termed = Vec::new();
+        let grace = Duration::from_secs(cfg.kill_grace_s);
+        let mut killed = Vec::new();
+        let mut dropped = HashSet::new();
         for (s, reason) in &targets {
             // Kills can wait seconds each: an exclusion saved meanwhile
             // still protects the next target, with the same check as a pass
@@ -850,21 +830,11 @@ impl<P: Platform> Watcher<P> {
             let fresh = read_config(&self.data_dir).unwrap_or_else(|_| cfg.clone());
             let tree = tree_of(&self.platform, s, &self.platform.listeners());
             if self.excluded_now(s, &tree, &fresh) {
-                out.dropped.insert(s.key);
+                dropped.insert(s.key);
                 continue;
             }
-            let sent = match stage {
-                Stage::Full(grace) => kill_tree(&self.platform, s.key, grace, &fresh),
-                Stage::TermUntil(_) => match term_tree(&self.platform, s.key, &fresh) {
-                    Some(t) => {
-                        termed.extend(t);
-                        true
-                    }
-                    None => false,
-                },
-            };
-            if sent {
-                out.killed.push((s.key, record(s, reason.clone(), now_ms)));
+            if kill_tree(&self.platform, s.key, grace, &fresh) {
+                killed.push(record(s, reason.clone(), now_ms));
             } else if same_process(&self.platform, s.key.pid, s.key.start_time) {
                 // Still our process but the signal was refused (EPERM):
                 // keep tracking it so a later pass can retry.
@@ -874,41 +844,19 @@ impl<P: Platform> Watcher<P> {
                 );
                 continue;
             }
-            out.dropped.insert(s.key);
-        }
-        if let Stage::TermUntil(deadline) = stage {
-            out.survivors = wait_gone(&self.platform, &termed, deadline);
+            dropped.insert(s.key);
         }
         with_state(&self.data_dir, |state| {
-            state.servers.retain(|s| !out.dropped.contains(&s.key));
-            for (_, r) in &out.killed {
+            state.servers.retain(|s| !dropped.contains(&s.key));
+            for r in &killed {
                 state.record_kill(r.clone());
             }
         })?;
-        for (_, r) in &out.killed {
+        for r in &killed {
             append_kill_log(&self.data_dir, r)?;
         }
-        Ok(out)
+        Ok((killed, dropped))
     }
-}
-
-/// How far `execute_staged` goes.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum Stage {
-    /// SIGTERM, grace, SIGKILL, one target after the other.
-    Full(Duration),
-    /// SIGTERM to every target, then wait until the deadline at most.
-    TermUntil(Instant),
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct Executed {
-    /// Signalled servers, in target order.
-    pub killed: Vec<(ServerKey, KillRecord)>,
-    /// No longer tracked (signalled, gone or excluded).
-    pub dropped: HashSet<ServerKey>,
-    /// `TermUntil` only: processes still running at the deadline.
-    pub survivors: Vec<(i32, u64)>,
 }
 
 /// Resolved path, so `/tmp/x` and `/private/tmp/x` compare equal; the path

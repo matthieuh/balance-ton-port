@@ -19,10 +19,10 @@ Run `btp list --json` and read the `servers` array. Each entry has `port` (its m
 
 ## Tell btp your intent
 
-When the session quits, btp stops its idle servers right away and leaves the ones still in use. Tell it what you meant a server for, right after you start it or once you are done with it:
+When the session quits, btp stops nothing at once: the servers still running were kept on purpose, and each is stopped once unused for 20 minutes (the dead-session rule). Tell it what you meant a server for, right after you start it or once you are done with it:
 
-- `btp note <port> --keep "<why>"` when you start a server for the user to look at (a preview, a demo): it is spared when the session quits and gets no idle alert. Give a short reason the user will recognise, for example `btp note 5173 --keep "preview of the new pricing page"`.
-- `btp note <port> --done` when the check you started it for is finished: it is stopped when the session quits, as soon as it is idle, without asking.
+- `btp note <port> --keep "<why>"` when you start a server for the user to look at (a preview, a demo): it gets no idle alert and is never offered for cleanup in a later conversation. Give a short reason the user will recognise, for example `btp note 5173 --keep "preview of the new pricing page"`.
+- `btp note <port> --done` when the check you started it for is finished: once the session has quit, it is stopped as soon as it is idle, without waiting the 20 minutes and without asking.
 
 A note only applies to a server of your own session (exit 1 otherwise: leave it alone). It never stops a server that is in use, excluded, or shared with another live session.
 

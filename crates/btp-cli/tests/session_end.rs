@@ -240,41 +240,83 @@ fn run_result(sb: &Sandbox) -> (i32, u64) {
     )
 }
 
+/// The `_sweep-later` processes started for the session `sh`.
+fn waiters(sh: i32) -> Vec<Spawned> {
+    let out = std::process::Command::new("/usr/bin/pgrep")
+        .args(["-f", &format!("_sweep-later --session={sh}:")])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .filter_map(|p| p.parse::<i32>().ok())
+        .filter_map(|pid| {
+            let start = MacOs.proc_info(pid)?.start_time;
+            Some(Spawned { pid, start })
+        })
+        .collect()
+}
+
 #[test]
-fn session_end_stops_an_idle_server_and_hands_survivors_to_the_kill_stage() {
+fn session_end_kills_nothing_and_starts_one_waiter() {
     let sb = Sandbox::new();
     let port = free_port();
-    let mut session = spawn_session(
+    let session = spawn_session(
         &sb,
-        &perl_server(port, true),
+        &perl_server(port, false),
         "session-end --session-pid $$ --reason prompt_input_exit --session-id conv-1",
     );
     let sh = session.0.id() as i32;
     let server = wait_listener(sh, port);
     sb.session_file(sh, "conv-1");
     std::fs::write(sb.data.path().join("go"), "").unwrap();
-    let server = server.pid;
     let (code, ms) = run_result(&sb);
     assert_eq!(code, 0);
     assert!(ms < 1500, "session-end took {ms} ms");
     let out = std::fs::read_to_string(sb.data.path().join("out.txt")).unwrap();
     assert_eq!(out, "", "nothing printed");
-    // SIGTERM is ignored: the detached stage SIGKILLs it after the grace.
-    assert!(wait_gone(server, Duration::from_secs(6)), "server survived");
+    // One detached waiter (held for cleanup before any assertion).
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut found = waiters(sh);
+    while found.is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        found = waiters(sh);
+    }
+    assert_eq!(found.len(), 1, "one waiter");
+    assert!(!wait_gone(server.pid, Duration::from_millis(500)), "killed");
     let n = sb.notified();
-    assert!(n.starts_with("Balance ton port|Session ended: "), "{n}");
+    assert!(n.starts_with("Balance ton port|"), "{n}");
     assert!(
-        n.contains("|Stopped ") && n.contains(&format!(":{port}.")),
+        n.contains("|Session ended: 1 server kept running, stopped after 20 min unused: "),
         "{n}"
     );
-    let recent = sb.btp().args(["recent", "--json"]).assert().success();
-    let v: serde_json::Value = serde_json::from_slice(&recent.get_output().stdout).unwrap();
-    assert_eq!(v[0]["port"], port);
-    assert_eq!(v[0]["reason"]["kind"], "session_ended");
-    // The fake session itself is never signalled: it exits on its own once
-    // its server is gone.
-    let status = session.0.wait().unwrap();
-    assert_eq!(status.code(), Some(0), "{status:?}");
+    assert!(n.contains(&format!(":{port}.")), "{n}");
+    assert!(sb
+        .btp()
+        .args(["recent"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .starts_with(b"no kills"));
+    // A second waiter for the same session gives way at once.
+    let proc_start = MacOs.proc_start_string(sh).unwrap();
+    let t = Instant::now();
+    sb.btp()
+        .env("BTP_HOOK_DEBUG", "1")
+        .args([
+            "_sweep-later",
+            &format!("--session={sh}:{proc_start}"),
+            "--at=0",
+        ])
+        .timeout(Duration::from_secs(5))
+        .assert()
+        .success();
+    assert!(t.elapsed() < Duration::from_secs(2));
+    assert!(MacOs.proc_info(server.pid).is_some());
+    let log = sb.debug_log();
+    assert!(log.contains("kept running"), "{log}");
+    assert!(log.contains("waiter started for"), "{log}");
+    assert!(log.contains("another one runs"), "{log}");
 }
 
 #[test]
@@ -286,7 +328,7 @@ fn session_end_works_after_the_session_file_is_gone() {
     let session = spawn_session(
         &sb,
         &perl_server(port, false),
-        "session-end --session-pid $$ --reason prompt_input_exit --session-id conv-1",
+        "session-end --session-pid $$ --reason other --session-id conv-1",
     );
     let sh = session.0.id() as i32;
     let server = wait_listener(sh, port);
@@ -294,20 +336,13 @@ fn session_end_works_after_the_session_file_is_gone() {
     std::fs::remove_file(sb.claude.path().join(format!("sessions/{sh}.json"))).unwrap();
     std::fs::write(sb.data.path().join("go"), "").unwrap();
     assert_eq!(run_result(&sb).0, 0);
-    assert!(
-        wait_gone(server.pid, Duration::from_secs(3)),
-        "server survived"
-    );
+    assert!(!wait_gone(server.pid, Duration::from_millis(300)), "killed");
     let log = sb.debug_log();
-    assert!(log.contains("reason=prompt_input_exit"), "{log}");
+    assert!(log.contains("reason=other"), "{log}");
     assert!(log.contains("session file: missing"), "{log}");
     assert!(log.contains(&format!("linked :{port}")), "{log}");
-    assert!(log.contains(&format!("stopped :{port}")), "{log}");
-    assert!(
-        sb.notified().contains(&format!(":{port}.")),
-        "{}",
-        sb.notified()
-    );
+    assert!(sb.notified().contains("kept running"), "{}", sb.notified());
+    let _w = waiters(sh);
 }
 
 #[test]
@@ -323,16 +358,17 @@ fn a_server_already_moved_out_of_the_session_is_left_and_traced() {
     );
     let server = wait_port(port);
     assert_eq!(MacOs.proc_info(server.pid).unwrap().ppid, 1);
-    let _ = session.0.id();
+    let sh = session.0.id() as i32;
     std::fs::write(sb.data.path().join("go"), "").unwrap();
     assert_eq!(run_result(&sb).0, 0);
-    assert!(!wait_gone(server.pid, Duration::from_millis(500)), "killed");
+    assert!(!wait_gone(server.pid, Duration::from_millis(300)), "killed");
     let log = sb.debug_log();
     assert!(
         log.contains(&format!("left :{port} pid {}", server.pid)),
         "{log}"
     );
     assert_eq!(sb.notified(), "");
+    assert!(waiters(sh).is_empty(), "no waiter without kept servers");
 }
 
 #[test]
@@ -346,16 +382,71 @@ fn session_end_leaves_a_server_with_an_open_connection() {
     );
     let sh = session.0.id() as i32;
     let guard = wait_listener(sh, port);
-    let server = guard.pid;
     sb.session_file(sh, "conv-1");
     let _tab = TcpStream::connect(("127.0.0.1", port)).unwrap();
     std::thread::sleep(Duration::from_millis(200));
     std::fs::write(sb.data.path().join("go"), "").unwrap();
     assert_eq!(run_result(&sb).0, 0);
-    assert!(!wait_gone(server, Duration::from_millis(500)), "killed");
+    assert!(!wait_gone(guard.pid, Duration::from_millis(300)), "killed");
+    assert!(
+        sb.notified().contains(&format!(":{port}.")),
+        "{}",
+        sb.notified()
+    );
+    let _w = waiters(sh);
+}
+
+#[test]
+fn the_waiter_stops_a_done_server_once_the_session_is_gone() {
+    // The session marks its server done and quits; the server stays
+    // behind (reparented). The waiter then applies the rule, unless a
+    // watcher holds the lock.
+    let sb = Sandbox::new();
+    let port = free_port();
+    let session = spawn_session(
+        &sb,
+        &perl_server(port, false),
+        &format!("note {port} --done"),
+    );
+    let sh = session.0.id() as i32;
+    let server = wait_listener(sh, port);
+    sb.session_file(sh, "conv-1");
+    let proc_start = MacOs.proc_start_string(sh).unwrap();
+    std::fs::write(sb.data.path().join("go"), "").unwrap();
+    assert_eq!(run_result(&sb).0, 0);
+    // The fake session quits; its server lives on.
+    drop(session);
+    assert!(wait_gone(sh, Duration::from_secs(3)));
+    assert!(MacOs.proc_info(server.pid).is_some());
+    let waiter = || {
+        let mut c = sb.btp();
+        c.args([
+            "_sweep-later",
+            &format!("--session={sh}:{proc_start}"),
+            "--at=0",
+        ])
+        .timeout(Duration::from_secs(20));
+        c
+    };
+    {
+        let _lock = btp_core::watcher::acquire_watch_lock(sb.data.path(), "btp watch").unwrap();
+        waiter().assert().success();
+        assert!(
+            MacOs.proc_info(server.pid).is_some(),
+            "acted under a watcher"
+        );
+    }
+    waiter().assert().success();
+    assert!(wait_gone(server.pid, Duration::from_secs(3)), "not stopped");
     let n = sb.notified();
-    assert!(n.contains(&format!(":{port} (in use)")), "{n}");
-    assert!(!n.contains("Stopped"), "{n}");
+    assert!(
+        n.contains(&format!("|Stopped Perl :{port}.")) || n.contains(&format!(":{port}.")),
+        "{n}"
+    );
+    let recent = sb.btp().args(["recent", "--json"]).assert().success();
+    let v: serde_json::Value = serde_json::from_slice(&recent.get_output().stdout).unwrap();
+    assert_eq!(v[0]["port"], port);
+    assert_eq!(v[0]["reason"]["kind"], "dead_session_idle");
 }
 
 #[test]
@@ -459,42 +550,6 @@ fn session_end_never_fails_even_on_bad_input() {
     assert_eq!(sb.notified(), "");
     // Diagnostics are opt-in: no BTP_HOOK_DEBUG, no log.
     assert_eq!(sb.debug_log(), "");
-}
-
-#[test]
-fn finish_kill_kills_only_the_exact_process() {
-    let sb = Sandbox::new();
-    let mut c = std::process::Command::new("perl");
-    c.args(["-e", "$SIG{TERM}=q(IGNORE); sleep 30"]);
-    let mut child = Owned(c.spawn().unwrap());
-    let pid = child.0.id() as i32;
-    let start = MacOs.proc_info(pid).unwrap().start_time;
-    // A wrong start time: never signalled.
-    sb.btp()
-        .args([
-            "_finish-kill",
-            "--deadline-ms",
-            "0",
-            &format!("{pid}:{}", start + 1),
-        ])
-        .assert()
-        .success();
-    assert!(MacOs.proc_info(pid).is_some());
-    sb.btp()
-        .args([
-            "_finish-kill",
-            "--deadline-ms",
-            "0",
-            &format!("{pid}:{start}"),
-        ])
-        .assert()
-        .success();
-    // Our own child: reap it to see it gone.
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while child.0.try_wait().unwrap().is_none() {
-        assert!(Instant::now() < deadline, "not killed");
-        std::thread::sleep(Duration::from_millis(50));
-    }
 }
 
 #[test]
