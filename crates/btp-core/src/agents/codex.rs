@@ -165,9 +165,21 @@ impl CodexAgent {
         p: &dyn Platform,
         outer: &[AgentSession],
     ) -> Vec<AgentSession> {
-        p.pids_named("codex")
+        let found: Vec<(CodexRole, AgentSession)> = p
+            .pids_named("codex")
             .into_iter()
             .filter_map(|pid| self.session_of(p, pid, outer))
+            .collect();
+        // Interactive sessions are never nested; an `exec` below one belongs to it.
+        let tuis: Vec<AgentSession> = found
+            .iter()
+            .filter(|(r, _)| *r == CodexRole::Interactive)
+            .map(|(_, s)| s.clone())
+            .collect();
+        found
+            .into_iter()
+            .filter(|(r, s)| *r == CodexRole::Interactive || !nested_in_session(p, s.pid, &tuis))
+            .map(|(_, s)| s)
             .collect()
     }
 
@@ -176,7 +188,7 @@ impl CodexAgent {
         p: &dyn Platform,
         pid: i32,
         outer: &[AgentSession],
-    ) -> Option<AgentSession> {
+    ) -> Option<(CodexRole, AgentSession)> {
         let info = p.proc_info(pid)?;
         let role = classify_codex(&info.command)?;
         if !matches!(role, CodexRole::Interactive | CodexRole::NonInteractive) {
@@ -222,7 +234,7 @@ impl CodexAgent {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        Some(AgentSession {
+        let session = AgentSession {
             agent: AgentKind::Codex,
             pid,
             proc_start: format_proc_start(info.start_time),
@@ -232,16 +244,19 @@ impl CodexAgent {
             name,
             status: SessionStatus::Unknown,
             status_updated_at_ms: start_ms,
-        })
+        };
+        Some((role, session))
     }
 }
 
 /// An ancestor of `pid` is an agent CLI that is a live session in `outer`.
 fn nested_in_session(p: &dyn Platform, pid: i32, outer: &[AgentSession]) -> bool {
-    ancestry(p, pid)
-        .iter()
-        .skip(1)
-        .any(|a| is_agent_cli(&a.command).is_some() && outer.iter().any(|s| s.pid == a.pid))
+    ancestry(p, pid).iter().skip(1).any(|a| {
+        is_agent_cli(&a.command).is_some()
+            && outer
+                .iter()
+                .any(|s| s.pid == a.pid && s.proc_start == format_proc_start(a.start_time))
+    })
 }
 
 impl Agent for CodexAgent {
@@ -362,6 +377,7 @@ mod tests {
     mod agent {
         use super::super::*;
         use crate::agents::codex_rollout::civil_from_days;
+        use crate::config::Config;
         use crate::platform::FakePlatform;
         use std::fs;
 
@@ -486,6 +502,24 @@ mod tests {
             assert_eq!(s[0].conversation_id, "");
             assert_eq!(s[0].status, SessionStatus::Unknown);
             assert_eq!(s[0].cwd, PathBuf::from("/Users/test/web"));
+
+            // A server below the session links to it as a Codex server.
+            p.spawn(
+                301,
+                300,
+                START_US + 1_000_000,
+                "bun run dev",
+                "/Users/test/web",
+            );
+            p.add_listener(301, 3000);
+            let listener = crate::platform::Listener {
+                pid: 301,
+                port: 3000,
+            };
+            let chain = ancestry(&p, 301);
+            let server =
+                crate::watcher::link(&listener, &chain, &s, &Config::default(), 0).expect("linked");
+            assert_eq!(server.agent, AgentKind::Codex);
         }
 
         #[test]
@@ -539,7 +573,7 @@ mod tests {
             let outer = AgentSession {
                 agent: AgentKind::ClaudeCode,
                 pid: 10,
-                proc_start: String::new(),
+                proc_start: format_proc_start(START_US),
                 conversation_id: "c".into(),
                 other_conversations: Vec::new(),
                 cwd: PathBuf::from("/Users/test/web"),
@@ -551,6 +585,24 @@ mod tests {
             assert!(a.live_sessions_nested(&p, &[outer]).is_empty());
             // Without a live outer session it is a session of its own.
             assert_eq!(a.live_sessions(&p).len(), 1);
+        }
+
+        #[test]
+        fn nested_exec_inside_codex_tui_is_not_a_session() {
+            let home = tempfile::tempdir().unwrap();
+            let p = FakePlatform::new();
+            p.spawn(
+                300,
+                1,
+                START_US,
+                "/Users/test/.local/bin/codex",
+                "/Users/test/web",
+            );
+            p.spawn(301, 300, START_US, "zsh", "/Users/test/web");
+            p.spawn(302, 301, START_US, "codex exec fix", "/Users/test/web");
+            let s = agent(home.path()).live_sessions(&p);
+            assert_eq!(s.len(), 1);
+            assert_eq!(s[0].pid, 300);
         }
 
         #[test]

@@ -463,6 +463,8 @@ pub struct Watcher<P: Platform> {
     data_dir: PathBuf,
     /// Finds the Claude config dirs on its own; the config's dirs are extras.
     discover: fn() -> Vec<PathBuf>,
+    /// Codex's home (`~/.codex`) when the process env names none.
+    codex_home: Option<PathBuf>,
     /// The last config read successfully: kept while `config.toml` is broken.
     last_good: Option<Config>,
     /// Why the last read of `config.toml` failed, cleared once it parses.
@@ -475,6 +477,7 @@ impl<P: Platform> Watcher<P> {
             platform,
             data_dir,
             discover: default_config_dirs,
+            codex_home: dirs::home_dir().map(|h| h.join(".codex")),
             last_good: None,
             config_error: None,
         }
@@ -484,6 +487,13 @@ impl<P: Platform> Watcher<P> {
     /// `Vec::new` so only the configured extras are read).
     pub fn with_discovery(mut self, discover: fn() -> Vec<PathBuf>) -> Self {
         self.discover = discover;
+        self
+    }
+
+    /// Replaces the default Codex home (tests pass `None` or a temp dir so the
+    /// real `~/.codex` is never read).
+    pub fn with_codex_home(mut self, home: Option<PathBuf>) -> Self {
+        self.codex_home = home;
         self
     }
 
@@ -625,7 +635,7 @@ impl<P: Platform> Watcher<P> {
                 dirs: effective_claude_dirs_with((self.discover)(), cfg),
             }),
             Box::new(CodexAgent {
-                default_home: dirs::home_dir().map(|h| h.join(".codex")),
+                default_home: self.codex_home.clone(),
             }),
         ]
     }
@@ -1081,7 +1091,9 @@ mod tests {
         );
         p.add_listener(30, 3000);
         write_session(claude.path(), 20, "sess-a", &wt, START + 20 * SEC);
-        let w = Watcher::new(p, data.path().to_path_buf()).with_discovery(Vec::new);
+        let w = Watcher::new(p, data.path().to_path_buf())
+            .with_discovery(Vec::new)
+            .with_codex_home(None);
         Fx {
             data,
             claude,
@@ -1849,8 +1861,9 @@ mod tests {
     fn unparsable_config_at_start_uses_defaults_and_is_reported() {
         let f = fx();
         fs::write(f.data.path().join("config.toml"), "nope = [").unwrap();
-        let mut w =
-            Watcher::new(FakePlatform::new(), f.data.path().to_path_buf()).with_discovery(Vec::new);
+        let mut w = Watcher::new(FakePlatform::new(), f.data.path().to_path_buf())
+            .with_discovery(Vec::new)
+            .with_codex_home(None);
         let e = w.tick(T0).unwrap().config_error.expect("reported");
         assert!(e.contains("defaults"), "{e}");
         assert_eq!(w.config_error(), Some(e.as_str()));
