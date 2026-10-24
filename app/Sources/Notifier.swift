@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 import UserNotifications
 import os
 
@@ -28,17 +29,32 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
 
     private let center = UNUserNotificationCenter.current()
     private let log = Logger(subsystem: "com.matthieuh.balancetonport", category: "notifications")
+    private let language = LanguageModel.shared
+    private var languageChange: AnyCancellable?
 
     private override init() {
         super.init()
         center.delegate = self
-        let kill = UNNotificationAction(identifier: IDs.kill, title: "Kill", options: [.destructive])
-        let keep = UNNotificationAction(identifier: IDs.keep, title: "Keep", options: [])
-        let stopNow = UNNotificationAction(identifier: IDs.stopNow, title: "Stop now", options: [.destructive])
+        registerCategories()
+        // The action buttons follow the app's language: register again when
+        // the choice changes (after it is applied, hence the hop).
+        languageChange = language.$choice.dropFirst().receive(on: DispatchQueue.main).sink { [weak self] _ in
+            MainActor.assumeIsolated { self?.registerCategories() }
+        }
+    }
+
+    /// The three categories with their buttons in the chosen language.
+    private func registerCategories() {
+        let title = { (button: NotificationButtonTitle) in
+            button.text(bundle: self.language.bundle, locale: self.language.locale)
+        }
+        let kill = UNNotificationAction(identifier: IDs.kill, title: title(.kill), options: [.destructive])
+        let keep = UNNotificationAction(identifier: IDs.keep, title: title(.keep), options: [])
+        let stopNow = UNNotificationAction(identifier: IDs.stopNow, title: title(.stopAll), options: [.destructive])
         // Restart may ask first (a server no agent started): it brings the
         // app forward.
-        let restart = UNNotificationAction(identifier: IDs.restart, title: "Restart", options: [.foreground])
-        let ignore = UNNotificationAction(identifier: IDs.ignore, title: "Ignore", options: [])
+        let restart = UNNotificationAction(identifier: IDs.restart, title: title(.restart), options: [.foreground])
+        let ignore = UNNotificationAction(identifier: IDs.ignore, title: title(.ignore), options: [])
         center.setNotificationCategories([
             UNNotificationCategory(
                 identifier: IDs.idleCategory, actions: [kill, keep], intentIdentifiers: [], options: []
@@ -74,8 +90,8 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     /// `true` once Notification Center accepted it.
     func postSample() async -> Bool {
         let content = UNMutableNotificationContent()
-        content.title = "Balance ton port"
-        content.body = sampleNotificationBody
+        content.title = language.tr("Balance ton port")
+        content.body = sampleNotificationText(bundle: language.bundle, locale: language.locale)
         content.categoryIdentifier = IDs.idleCategory
         content.sound = .default
         content.userInfo = sampleNotificationUserInfo()
@@ -97,8 +113,8 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         var delivered: [ServerID] = []
         for server in servers {
             let content = UNMutableNotificationContent()
-            content.title = "Balance ton port"
-            content.body = notificationBody(server)
+            content.title = language.tr("Balance ton port")
+            content.body = notificationBody(server, bundle: language.bundle, locale: language.locale)
             content.categoryIdentifier = IDs.idleCategory
             content.sound = .default
             content.userInfo = notificationUserInfo(server.id)
@@ -125,8 +141,8 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         var delivered: [ServerID] = []
         for server in servers {
             let content = UNMutableNotificationContent()
-            content.title = "Balance ton port"
-            content.body = leakNotificationBody(server)
+            content.title = language.tr("Balance ton port")
+            content.body = leakNotificationBody(server, bundle: language.bundle, locale: language.locale)
             content.categoryIdentifier = IDs.leakCategory
             content.sound = .default
             content.userInfo = notificationUserInfo(server.id)
@@ -150,9 +166,9 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         var delivered: [SessionEndedID] = []
         for group in groups {
             let content = UNMutableNotificationContent()
-            content.title = "Balance ton port"
+            content.title = language.tr("Balance ton port")
             content.subtitle = group.sessionName
-            content.body = group.body
+            content.body = sessionEndedBody(group, bundle: language.bundle, locale: language.locale)
             content.categoryIdentifier = IDs.sessionEndedCategory
             content.sound = .default
             content.userInfo = sessionEndedUserInfo(group.id)

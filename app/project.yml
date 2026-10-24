@@ -64,6 +64,7 @@ targets:
     sources:
       - path: Tests
       - path: Sources/Logic.swift
+      - path: Sources/Copy.swift
       - path: Sources/Menu/MenuStyle.swift
       - path: Sources/Updates.swift
       - path: Sources/Language.swift

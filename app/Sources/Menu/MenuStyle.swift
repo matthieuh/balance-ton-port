@@ -38,8 +38,10 @@ func portColor(_ port: UInt16, dark: Bool = true) -> Color {
 }
 
 /// `✳ Claude` orange, `◎ Codex` blue, `no agent` secondary (`nil`).
-func agentBadge(_ s: ServerViewFfi) -> (text: String, color: Color?) {
-    let text = agentBadgeText(s)
+func agentBadge(
+    _ s: ServerViewFfi, bundle: Bundle = copyBundle, locale: Locale = copyLocale
+) -> (text: String, color: Color?) {
+    let text = agentBadgeText(s, bundle: bundle, locale: locale)
     switch s.agent {
     case "claude_code": return (text, .orange)
     case "codex": return (text, .blue)

@@ -76,6 +76,7 @@ final class CoreModel: ObservableObject {
     private var afterFirstPass: [() -> Void] = []
     private let killedHoldTime: TimeInterval = 30
     private let notifier = Notifier.shared
+    private let language = LanguageModel.shared
 
     init() {
         notifier.onAction = { [weak self] route in
@@ -149,7 +150,8 @@ final class CoreModel: ObservableObject {
                 if record == nil {
                     killedByHand[id] = nil
                     killNotice = missedKillNotice(
-                        id, tracked: lastPassServers.map(\.id), fromNotification: fromNotification
+                        id, tracked: lastPassServers.map(\.id), fromNotification: fromNotification,
+                        bundle: language.bundle, locale: language.locale
                     )
                     killNoticeAt = killNotice == nil ? nil : Date()
                 } else {
@@ -193,7 +195,9 @@ final class CoreModel: ObservableObject {
                 recentKills = kills
                 if record == nil {
                     killedByHand[id] = nil
-                    killNotice = missedKillNotice(id, tracked: [], fromNotification: false)
+                    killNotice = missedKillNotice(
+                        id, tracked: [], fromNotification: false, bundle: language.bundle, locale: language.locale
+                    )
                     killNoticeAt = Date()
                     publish()
                 } else {
@@ -242,7 +246,7 @@ final class CoreModel: ObservableObject {
     /// confirmation of a server no agent started shows on top.
     private func restartFromNotification(_ id: ServerID) {
         guard let server = lastPassServers.first(where: { $0.id == id }) else {
-            killNotice = missedRestartNotice
+            killNotice = missedRestartNoticeText(bundle: language.bundle, locale: language.locale)
             killNoticeAt = Date()
             return
         }
@@ -278,8 +282,8 @@ final class CoreModel: ObservableObject {
         }
     }
 
-    private func showBlocked(_ copy: String, for id: ServerID) {
-        let note = RowNote.blocked(copy)
+    private func showBlocked(_ blocked: RestartBlockedFfi, for id: ServerID) {
+        let note = RowNote.blocked(restartBlockedText(blocked, bundle: language.bundle, locale: language.locale))
         rowNotes[id] = note
         Task {
             try? await Task.sleep(for: .seconds(blockedNoteDuration))
@@ -342,7 +346,8 @@ final class CoreModel: ObservableObject {
     private func confirm(_ server: ServerViewFfi, _ action: ConfirmAction, then run: @escaping @MainActor () -> Void) {
         guard !confirming else { return }
         confirming = true
-        let text = confirmationText(server, action: action)
+        let text = confirmationText(server, action: action, bundle: language.bundle, locale: language.locale)
+        let cancelTitle = language.tr("Cancel")
         RunLoop.main.perform(inModes: [.common]) {
             MainActor.assumeIsolated { [weak self] in
                 NSApp.activate(ignoringOtherApps: true)
@@ -353,7 +358,7 @@ final class CoreModel: ObservableObject {
                 let button = alert.addButton(withTitle: text.button)
                 button.hasDestructiveAction = action == .stop
                 button.keyEquivalent = ""
-                let cancel = alert.addButton(withTitle: "Cancel")
+                let cancel = alert.addButton(withTitle: cancelTitle)
                 cancel.keyEquivalent = "\r"
                 // Escape cancels too (Return on Cancel replaced NSAlert's
                 // own Escape).

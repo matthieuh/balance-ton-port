@@ -7,6 +7,7 @@ import SwiftUI
 /// panel.
 struct MenuView: View {
     @EnvironmentObject private var model: CoreModel
+    @EnvironmentObject private var language: LanguageModel
     @Environment(\.openSettings) private var openSettings
     @Environment(\.colorScheme) private var scheme
     @StateObject private var nav = MenuNavigation()
@@ -73,13 +74,14 @@ struct MenuView: View {
     @ViewBuilder private func sectionsView(_ sections: MenuSections) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             if sections.needsYou.isEmpty {
-                Label(nothingToDecide, systemImage: "checkmark.circle.fill")
+                Label(nothingToDecideText(bundle: language.bundle, locale: language.locale), systemImage: "checkmark.circle.fill")
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(.green)
                     .padding(.bottom, 12)
             } else {
                 sectionHeader(
-                    sectionTitle("Needs you", count: sections.needsYou.count), color: needsYouColor(dark: scheme == .dark)
+                    sectionTitle(language.tr("Needs you"), count: sections.needsYou.count, locale: language.locale),
+                    color: needsYouColor(dark: scheme == .dark)
                 )
                     .padding(.bottom, 6)
                 VStack(spacing: 8) {
@@ -97,7 +99,10 @@ struct MenuView: View {
 
             let allGoodCount = sections.allGood.count + sections.hiddenCount
             if allGoodCount > 0 {
-                sectionHeader(sectionTitle("All good", count: allGoodCount), color: Color(nsColor: .tertiaryLabelColor))
+                sectionHeader(
+                    sectionTitle(language.tr("All good"), count: allGoodCount, locale: language.locale),
+                    color: Color(nsColor: .tertiaryLabelColor)
+                )
                     .padding(.bottom, 2)
                 ForEach(sections.allGood, id: \.id) { server in
                     ServerRowView(
@@ -110,7 +115,7 @@ struct MenuView: View {
                     Button {
                         showAll = true
                     } label: {
-                        Text(verbatim: moreLabel(sections.hiddenCount))
+                        Text(verbatim: moreLabel(sections.hiddenCount, bundle: language.bundle, locale: language.locale))
                             .font(.system(size: 12))
                             .foregroundStyle(Color(nsColor: .tertiaryLabelColor))
                             .padding(.vertical, 4)
@@ -135,9 +140,9 @@ struct MenuView: View {
         VStack(alignment: .leading, spacing: 4) {
             if let fix = menuNotificationFix(model.notificationPermission) {
                 HStack(spacing: 4) {
-                    Text("Notifications are off \u{00B7}")
+                    Text(verbatim: language.tr("Notifications are off") + " \u{00B7}")
                         .foregroundStyle(.secondary)
-                    Button("Turn on") {
+                    Button(language.tr("Turn on")) {
                         switch fix {
                         case .request:
                             NSApp.activate(ignoringOtherApps: true)
@@ -151,7 +156,7 @@ struct MenuView: View {
                 }
             }
             if model.watchedElsewhere {
-                Text("Watching is done by another process")
+                Text(verbatim: language.tr("Watching is done by another process"))
                     .foregroundStyle(.secondary)
             }
             if let error = model.lastError {

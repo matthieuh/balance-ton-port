@@ -59,6 +59,10 @@ func ltr(_ s: String) -> String {
 final class LanguageModel: ObservableObject {
     static let defaultsKey = "appLanguage"
 
+    /// The one model of the app, which the scenes, the core model and the
+    /// notifier share.
+    static let shared = LanguageModel()
+
     @Published var choice: AppLanguage {
         didSet { defaults.set(choice.rawValue, forKey: Self.defaultsKey) }
     }

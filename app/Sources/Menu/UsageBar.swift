@@ -5,6 +5,7 @@ import SwiftUI
 struct UsageBar: View {
     let memory: MemoryBarFfi
     let servers: [ServerViewFfi]
+    @EnvironmentObject private var language: LanguageModel
 
     var body: some View {
         let seg = usageSegments(memory, servers: servers)
@@ -26,28 +27,23 @@ struct UsageBar: View {
             caption
         }
         .contentShape(Rectangle())
-        .help(usageHelp(memory))
+        .help(usageHelp(memory, bundle: language.bundle, locale: language.locale))
     }
 
     @ViewBuilder private var caption: some View {
-        if let c = usageCaption(memory.line) {
-            HStack(spacing: 4) {
-                Text(verbatim: c.figure)
-                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(.primary)
-                Text(verbatim: c.dev)
-                Spacer(minLength: 8)
-                Text(verbatim: c.apps + " \u{00B7}")
-                Text(verbatim: c.free)
-                    .foregroundStyle(memory.freeLow ? Color.orange : Color.secondary)
-            }
-            .font(.system(size: 11))
-            .foregroundStyle(.secondary)
-            .lineLimit(1)
-        } else {
-            Text(verbatim: memory.line)
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
+        let c = usageCaption(memory, bundle: language.bundle, locale: language.locale)
+        HStack(spacing: 4) {
+            Text(verbatim: c.figure)
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.primary)
+            Text(verbatim: c.dev)
+            Spacer(minLength: 8)
+            Text(verbatim: c.apps + " \u{00B7}")
+            Text(verbatim: c.free)
+                .foregroundStyle(memory.freeLow ? Color.orange : Color.secondary)
         }
+        .font(.system(size: 11))
+        .foregroundStyle(.secondary)
+        .lineLimit(1)
     }
 }

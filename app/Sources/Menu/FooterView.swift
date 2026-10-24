@@ -6,6 +6,7 @@ import SwiftUI
 struct FooterView: View {
     let recentKills: [KillRecordFfi]
     @Environment(\.openSettings) private var openSettings
+    @EnvironmentObject private var language: LanguageModel
     @State private var showStopped = false
 
     var body: some View {
@@ -15,19 +16,19 @@ struct FooterView: View {
                 Button {
                     showStopped.toggle()
                 } label: {
-                    Text(verbatim: recentlyStoppedLabel(recentKills.count))
+                    Text(verbatim: recentlyStoppedLabel(recentKills.count, bundle: language.bundle, locale: language.locale))
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(PressableStyle())
                 .disabled(recentKills.isEmpty)
                 Spacer()
                 Menu {
-                    Button("Settings\u{2026}") {
+                    Button(language.tr("Settings\u{2026}")) {
                         NSApp.activate(ignoringOtherApps: true)
                         openSettings()
                     }
                     Divider()
-                    Button("Quit") { NSApp.terminate(nil) }
+                    Button(language.tr("Quit")) { NSApp.terminate(nil) }
                         .keyboardShortcut("q")
                 } label: {
                     Image(systemName: "gearshape")
@@ -45,8 +46,8 @@ struct FooterView: View {
                         GridRow {
                             Text(verbatim: portLabel(kill.port)).monospacedDigit()
                             Text(verbatim: kill.toolLabel).lineLimit(1)
-                            Text(verbatim: kill.reason).lineLimit(1)
-                            Text(relativeTime(atMs: kill.atMs))
+                            Text(verbatim: killReasonText(kill, bundle: language.bundle, locale: language.locale)).lineLimit(1)
+                            Text(verbatim: relativeTime(atMs: kill.atMs, bundle: language.bundle, locale: language.locale))
                         }
                     }
                 }

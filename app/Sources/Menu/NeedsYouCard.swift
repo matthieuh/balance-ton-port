@@ -11,6 +11,7 @@ struct NeedsYouCard: View {
     var note: RowNote?
     @EnvironmentObject private var model: CoreModel
     @EnvironmentObject private var nav: MenuNavigation
+    @EnvironmentObject private var language: LanguageModel
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
@@ -19,7 +20,7 @@ struct NeedsYouCard: View {
             HStack(spacing: 8) {
                 ServerIcon(server: server, favicon: favicon)
                 ServerTitle(server: server).frame(maxWidth: .infinity, alignment: .leading)
-                Text(verbatim: memoryLabel(server.rssBytes))
+                Text(verbatim: memoryLabel(server.rssBytes, locale: language.locale))
                     .font(.system(size: 12, design: .monospaced))
                     .foregroundStyle(sizeColor(server.health) ?? Color.secondary)
             }
@@ -27,7 +28,7 @@ struct NeedsYouCard: View {
                 .padding(.leading, cardIndent)
                 .padding(.top, 3)
             HStack(spacing: 8) {
-                Text(verbatim: note.map(rowNoteText) ?? card.reason)
+                Text(verbatim: note.map { rowNoteText($0, bundle: language.bundle, locale: language.locale) } ?? reason)
                     .font(.system(size: 12))
                     .foregroundStyle(tint.opacity(scheme == .dark ? 0.85 : 1))
                     .lineLimit(2)
@@ -48,14 +49,21 @@ struct NeedsYouCard: View {
         }
         .contentShape(RoundedRectangle(cornerRadius: cardRadius, style: .continuous))
         .onTapGesture { nav.open(server.id) }
-        .accessibilityAction(named: "Details") { nav.open(server.id) }
+        .accessibilityAction(named: Text(verbatim: language.tr("Details"))) { nav.open(server.id) }
         .help(rowHelp(server))
+    }
+
+    private var reason: String {
+        cardReason(
+            card, leakKind: server.leakKind, agentLabel: server.agentLabel,
+            bundle: language.bundle, locale: language.locale
+        )
     }
 
     private func actionPill(tint: Color) -> some View {
         let prominent = cardActionIsProminent(card)
         return Button(action: perform) {
-            Text(verbatim: cardActionLabel(card))
+            Text(verbatim: cardActionLabel(card, bundle: language.bundle, locale: language.locale))
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(prominent ? Color.black.opacity(0.85) : Color.primary)
                 .padding(.horizontal, 14)

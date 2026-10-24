@@ -8,6 +8,7 @@ struct FactChips: View {
     let resumeCommand: String?
     @State private var copied = false
     @Environment(\.colorScheme) private var scheme
+    @EnvironmentObject private var language: LanguageModel
 
     var body: some View {
         FlowLayout(spacing: 6) {
@@ -20,7 +21,7 @@ struct FactChips: View {
             if let resumeCommand {
                 sessionChip(resumeCommand)
             }
-            chip("\u{25F7} " + uptimeChip(ms: server.uptimeMs))
+            chip("\u{25F7} " + uptimeChip(ms: server.uptimeMs, bundle: language.bundle, locale: language.locale))
         }
     }
 
@@ -45,7 +46,7 @@ struct FactChips: View {
                 copied = false
             }
         } label: {
-            Text(verbatim: copied ? copiedLabel : sessionChipText(server))
+            Text(verbatim: copied ? copiedText(bundle: language.bundle, locale: language.locale) : sessionChipText(server))
                 .font(.system(size: 12))
                 .foregroundStyle(color)
                 .lineLimit(1)
@@ -56,7 +57,7 @@ struct FactChips: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(PressableStyle())
-        .help("Copy: \(command)")
+        .help(language.tr("Copy: \(isolated(command, language.locale))"))
     }
 }
 

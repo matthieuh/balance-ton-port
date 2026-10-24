@@ -23,11 +23,11 @@ private func server(
         toolLabel: toolLabel, worktree: "/Users/me/trees/\(worktree)", worktreeName: worktree,
         locationLabel: "revva \u{203A} \(worktree)", sessionName: sessionName,
         agent: agent, agentLabel: agentLabel,
-        startedMs: 1_700_000_000, startedLabel: "started 4 min ago",
+        startedMs: 1_700_000_000, startedLabel: "started 4 min ago", startedAgeMs: 240_000,
         sessionAlive: sessionAlive, idleMs: idleMs, killInMs: killInMs, state: state,
         managed: true, excluded: false, framework: nil, title: toolLabel, hasIcon: false,
         branch: nil, rssBytes: 0, cpuPct: 0, growthBytes: 0, health: "green", inUse: false,
-        statusText: "idle 0 min", card: nil, leakKind: nil, canRestart: false, postponed: false,
+        statusText: "idle 0 min", status: StatusFfi(kind: "idle", minutes: 0, agentLabel: "", reason: nil), card: nil, leakKind: nil, canRestart: false, postponed: false,
         uptimeMs: 0, processCount: 1
     )
 }
@@ -473,7 +473,7 @@ final class SessionEndedNotificationTests: XCTestCase {
     func testFfiGroupID() {
         let ffi = SessionEndedFfi(
             sessionPid: 50, sessionProcStart: "Thu Oct 22 10:00:00 2026", atMs: 1_800_000_000_123,
-            sessionName: "web", servers: [], body: "b"
+            sessionName: "web", servers: [], body: "b", deadIdleS: 1800
         )
         XCTAssertEqual(ffi.id, group)
     }
@@ -877,6 +877,7 @@ private func detailServer(
     s.killInMs = killInMs
     s.inUse = inUse
     s.statusText = statusText
+    s.status = statusOf(statusText)
     s.state = state
     s.agentLabel = managed ? (agent == "codex" ? "Codex" : "Claude") : "no agent"
     return s
@@ -1209,4 +1210,21 @@ final class RestartHoldTests: XCTestCase {
         let rows = withHeldRestarts([old], held: [HeldRestart(row: old)])
         XCTAssertEqual(rows.map(\.id), [old.id])
     }
+}
+
+/// The structured status for the English sentence a test sets (`kept by
+/// you`, `kept by Claude: "reason"`, `in use`, `idle 34 min`).
+private func statusOf(_ text: String) -> StatusFfi {
+    func status(_ kind: String, _ minutes: UInt64 = 0, _ agent: String = "", _ reason: String? = nil) -> StatusFfi {
+        StatusFfi(kind: kind, minutes: minutes, agentLabel: agent, reason: reason)
+    }
+    if text == "in use" { return status("in_use") }
+    if text == "kept by you" { return status("kept_by_user") }
+    if text.hasPrefix("kept by ") {
+        let rest = text.dropFirst("kept by ".count)
+        guard let colon = rest.range(of: ": \"") else { return status("kept_by_agent", 0, String(rest)) }
+        let reason = rest[colon.upperBound...].dropLast()
+        return status("kept_by_agent", 0, String(rest[..<colon.lowerBound]), String(reason))
+    }
+    return status("idle", UInt64(text.split(separator: " ").dropFirst().first.flatMap { Int($0) } ?? 0))
 }

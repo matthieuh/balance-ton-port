@@ -15,6 +15,8 @@ struct GeneralPane: View {
     /// overwrites the user's file with defaults.
     @State private var loadError: String?
 
+    private func iso(_ s: String) -> String { isolated(s, language.locale) }
+
     var body: some View {
         Form {
             Section {
@@ -27,56 +29,61 @@ struct GeneralPane: View {
                 DelaysSection(draft: binding)
                 Section {
                     if discovered.isEmpty {
-                        Text("None").foregroundStyle(.secondary)
+                        Text(verbatim: language.tr("None")).foregroundStyle(.secondary)
                     }
                     ForEach(discovered, id: \.self) { dir in
-                        Text(dir).lineLimit(1).truncationMode(.middle)
+                        Text(verbatim: dir).lineLimit(1).truncationMode(.middle)
                     }
                 } header: {
-                    Text("Claude config directories: found automatically")
+                    Text(verbatim: language.tr("Claude config directories: found automatically"))
                 } footer: {
-                    Text("~/.claude, CLAUDE_CONFIG_DIR and every ~/.claude-* with a sessions/ folder, re-checked every scan.")
+                    Text(verbatim: language.tr(
+                        "\(iso("~/.claude")), \(iso("CLAUDE_CONFIG_DIR")) and every \(iso("~/.claude-*")) with a \(iso("sessions/")) folder, re-checked every scan."
+                    ))
                 }
                 Section {
                     ListEditor(
                         items: binding.claudeConfigDirs,
                         placeholder: "~/work/.claude",
-                        emptyText: "None"
+                        emptyText: language.tr("None")
                     )
                 } header: {
-                    Text("Also watch")
+                    Text(verbatim: language.tr("Also watch"))
                 } footer: {
-                    Text("Other Claude config directories (each holding a sessions/ folder).")
+                    Text(verbatim: language.tr("Other Claude config directories (each holding a \(iso("sessions/")) folder)."))
                 }
                 Section {
                     ListEditor(
                         items: binding.excludeCommands,
                         placeholder: "redis-server",
-                        emptyText: "None"
+                        emptyText: language.tr("None")
                     )
                 } header: {
-                    Text("Never track or kill commands containing")
+                    Text(verbatim: language.tr("Never track or kill commands containing"))
                 } footer: {
-                    Text("Case-insensitive, anywhere in the command line, paths included.")
+                    Text(verbatim: language.tr("Case-insensitive, anywhere in the command line, paths included."))
                 }
                 Section {
                     PortListEditor(ports: binding.excludePorts)
                 } header: {
-                    Text("Never track or kill ports")
+                    Text(verbatim: language.tr("Never track or kill ports"))
                 } footer: {
-                    Text("A server listening on one of these, itself or through a child process.")
+                    Text(verbatim: language.tr("A server listening on one of these, itself or through a child process."))
                 }
-                ForEach(binding.wrappedValue.validationErrors, id: \.self) { error in
-                    Text(error).foregroundStyle(.red)
+                ForEach(
+                    binding.wrappedValue.validationMessages(bundle: language.bundle, locale: language.locale),
+                    id: \.self
+                ) { error in
+                    Text(verbatim: error).foregroundStyle(.red)
                 }
                 if let error = model.settingsError {
-                    Text("Could not save: \(error)").foregroundStyle(.red)
+                    Text(verbatim: language.tr("Could not save: \(error)")).foregroundStyle(.red)
                 }
             } else if let loadError {
-                Section("Configuration") {
-                    Text(verbatim: "Could not read config.toml: \(loadError)")
+                Section(language.tr("Configuration")) {
+                    Text(verbatim: language.tr("Could not read \(iso("config.toml")): \(iso(loadError))"))
                         .foregroundStyle(.red)
-                    Text("Fix or delete the file; the watcher keeps its last valid settings meanwhile.")
+                    Text(verbatim: language.tr("Fix or delete the file; the watcher keeps its last valid settings meanwhile."))
                         .foregroundStyle(.secondary)
                 }
             } else {
@@ -107,32 +114,33 @@ struct GeneralPane: View {
 /// Whether notifications reach the user, and the one step that fixes it.
 private struct NotificationsSection: View {
     @EnvironmentObject private var model: CoreModel
+    @EnvironmentObject private var language: LanguageModel
     @State private var testResult = TestNotificationResult.none
     @State private var testResetTask: Task<Void, Never>?
 
     var body: some View {
-        Section("Notifications") {
+        Section(language.tr("Notifications")) {
             if let permission = model.notificationPermission {
-                let setup = notificationSetup(permission)
+                let setup = notificationSetup(permission, bundle: language.bundle, locale: language.locale)
                 if setup.isOn {
                     Label {
-                        Text(setup.message)
+                        Text(verbatim: setup.message)
                     } icon: {
                         Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
                     }
                 } else {
-                    Text(setup.message)
+                    Text(verbatim: setup.message)
                 }
                 if let hint = setup.hint {
-                    Text(hint).foregroundStyle(.secondary)
+                    Text(verbatim: hint).foregroundStyle(.secondary)
                 }
                 if setup.button != nil || setup.canSendTest {
                     HStack {
                         if let button = setup.button {
-                            Button(button.title) { perform(button) }
+                            Button(button.title(bundle: language.bundle, locale: language.locale)) { perform(button) }
                         }
                         if setup.canSendTest {
-                            Button(testNotificationButtonTitle(testResult)) { sendTest() }
+                            Button(testNotificationButtonTitle(testResult, bundle: language.bundle, locale: language.locale)) { sendTest() }
                                 .controlSize(.small)
                         }
                     }
@@ -179,21 +187,34 @@ func openNotificationSettings() {
 }
 
 private struct DelaysSection: View {
+    @EnvironmentObject private var language: LanguageModel
     @Binding var draft: SettingsDraft
 
     var body: some View {
-        Section("Delays") {
+        Section(language.tr("Delays")) {
             Stepper(value: $draft.deadSessionIdleMin, in: 1...1440) {
-                LabeledContent("Kill after a dead session idles", value: "\(draft.deadSessionIdleMin) min")
+                LabeledContent(
+                    language.tr("Kill after a dead session idles"),
+                    value: minutes(draft.deadSessionIdleMin, bundle: language.bundle, locale: language.locale)
+                )
             }
             Stepper(value: $draft.alertAfterMin, in: 1...1440) {
-                LabeledContent("Alert after idle", value: "\(draft.alertAfterMin) min")
+                LabeledContent(
+                    language.tr("Alert after idle"),
+                    value: minutes(draft.alertAfterMin, bundle: language.bundle, locale: language.locale)
+                )
             }
             Stepper(value: $draft.killGraceSec, in: 1...300) {
-                LabeledContent("Kill grace (TERM to KILL)", value: "\(draft.killGraceSec) s")
+                LabeledContent(
+                    language.tr("Kill grace (TERM to KILL)"),
+                    value: secondsText(draft.killGraceSec, bundle: language.bundle, locale: language.locale)
+                )
             }
             Stepper(value: $draft.scanIntervalSec, in: 1...600) {
-                LabeledContent("Scan every", value: "\(draft.scanIntervalSec) s")
+                LabeledContent(
+                    language.tr("Scan every"),
+                    value: secondsText(draft.scanIntervalSec, bundle: language.bundle, locale: language.locale)
+                )
             }
         }
     }
@@ -201,6 +222,7 @@ private struct DelaysSection: View {
 
 /// A list with a remove button per row and a field to add one.
 private struct ListEditor: View {
+    @EnvironmentObject private var language: LanguageModel
     @Binding var items: [String]
     let placeholder: String
     let emptyText: String
@@ -208,11 +230,11 @@ private struct ListEditor: View {
 
     var body: some View {
         if items.isEmpty {
-            Text(emptyText).foregroundStyle(.secondary)
+            Text(verbatim: emptyText).foregroundStyle(.secondary)
         }
         ForEach(items, id: \.self) { item in
             HStack {
-                Text(item).lineLimit(1).truncationMode(.middle)
+                Text(verbatim: item).lineLimit(1).truncationMode(.middle)
                 Spacer()
                 Button {
                     items.removeAll { $0 == item }
@@ -221,14 +243,14 @@ private struct ListEditor: View {
                 }
                 .buttonStyle(.borderless)
                 .foregroundStyle(.secondary)
-                .help("Remove")
+                .help(language.tr("Remove"))
             }
         }
         HStack {
-            TextField("Add", text: $newItem, prompt: Text(placeholder))
+            TextField(language.tr("Add"), text: $newItem, prompt: Text(verbatim: placeholder))
                 .labelsHidden()
                 .onSubmit(add)
-            Button("Add", action: add)
+            Button(language.tr("Add"), action: add)
                 .disabled(addingEntry(newItem, to: items) == nil)
         }
     }
@@ -242,12 +264,13 @@ private struct ListEditor: View {
 
 /// The excluded ports, with a remove button per row and a field to add one.
 private struct PortListEditor: View {
+    @EnvironmentObject private var language: LanguageModel
     @Binding var ports: [UInt16]
     @State private var newPort = ""
 
     var body: some View {
         if ports.isEmpty {
-            Text("None").foregroundStyle(.secondary)
+            Text(verbatim: language.tr("None")).foregroundStyle(.secondary)
         }
         ForEach(ports, id: \.self) { port in
             HStack {
@@ -260,14 +283,14 @@ private struct PortListEditor: View {
                 }
                 .buttonStyle(.borderless)
                 .foregroundStyle(.secondary)
-                .help("Remove")
+                .help(language.tr("Remove"))
             }
         }
         HStack {
-            TextField("Add", text: $newPort, prompt: Text(verbatim: "5432"))
+            TextField(language.tr("Add"), text: $newPort, prompt: Text(verbatim: "5432"))
                 .labelsHidden()
                 .onSubmit(add)
-            Button("Add", action: add)
+            Button(language.tr("Add"), action: add)
                 .disabled(addingPort(newPort, to: ports) == nil)
         }
     }
@@ -280,30 +303,31 @@ private struct PortListEditor: View {
 }
 
 private struct LaunchAtLoginSection: View {
+    @EnvironmentObject private var language: LanguageModel
     @State private var status = SMAppService.mainApp.status
     @State private var error: String?
 
     var body: some View {
-        Section("Launch at login") {
-            Toggle("Open Balance ton port at login", isOn: Binding(
+        Section(language.tr("Launch at login")) {
+            Toggle(language.tr("Open Balance ton port at login"), isOn: Binding(
                 get: { status == .enabled || status == .requiresApproval },
                 set: { setEnabled($0) }
             ))
             switch status {
             case .requiresApproval:
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("macOS needs your approval: turn Balance ton port on in System Settings, General, Login Items.")
+                    Text(verbatim: language.tr("macOS needs your approval: turn Balance ton port on in System Settings, General, Login Items."))
                         .foregroundStyle(.secondary)
-                    Button("Open Login Items") { SMAppService.openSystemSettingsLoginItems() }
+                    Button(language.tr("Open Login Items")) { SMAppService.openSystemSettingsLoginItems() }
                 }
             case .notFound:
-                Text("Not available for this copy of the app (move it to Applications).")
+                Text(verbatim: language.tr("Not available for this copy of the app (move it to Applications)."))
                     .foregroundStyle(.secondary)
             default:
                 EmptyView()
             }
             if let error {
-                Text(error).foregroundStyle(.red)
+                Text(verbatim: error).foregroundStyle(.red)
             }
         }
         .onAppear { status = SMAppService.mainApp.status }

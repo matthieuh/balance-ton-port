@@ -7,11 +7,12 @@ import SwiftUI
 struct ServerSubtitle: View {
     let server: ServerViewFfi
     var status: String?
+    @EnvironmentObject private var language: LanguageModel
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
-        let p = subtitleParts(server)
-        let badge = agentBadge(server)
+        let p = subtitleParts(server, bundle: language.bundle, locale: language.locale)
+        let badge = agentBadge(server, bundle: language.bundle, locale: language.locale)
         let sep = " \u{00B7} "
         let port = Text(verbatim: p.port)
             .font(.system(size: 12, design: .monospaced))
@@ -61,6 +62,7 @@ struct ServerRowView: View {
     let notificationsOff: Bool
     var note: RowNote?
     @EnvironmentObject private var nav: MenuNavigation
+    @EnvironmentObject private var language: LanguageModel
     @State private var hovering = false
 
     var body: some View {
@@ -70,7 +72,8 @@ struct ServerRowView: View {
                 ServerTitle(server: server)
                 ServerSubtitle(
                     server: server,
-                    status: note.map(rowNoteText) ?? rowStatus(server, notificationsOff: notificationsOff)
+                    status: note.map { rowNoteText($0, bundle: language.bundle, locale: language.locale) }
+                        ?? rowStatus(server, notificationsOff: notificationsOff, bundle: language.bundle, locale: language.locale)
                 )
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -78,7 +81,7 @@ struct ServerRowView: View {
                 RowCapsule(server: server)
             } else {
                 gauge
-                Text(verbatim: memoryLabel(server.rssBytes))
+                Text(verbatim: memoryLabel(server.rssBytes, locale: language.locale))
                     .font(.system(size: 12, design: .monospaced))
                     .foregroundStyle(sizeColor(server.health) ?? Color.secondary)
                     .frame(width: 54, alignment: .trailing)
@@ -93,7 +96,7 @@ struct ServerRowView: View {
         )
         .contentShape(Rectangle())
         .onTapGesture { nav.open(server.id) }
-        .accessibilityAction(named: "Details") { nav.open(server.id) }
+        .accessibilityAction(named: Text(verbatim: language.tr("Details"))) { nav.open(server.id) }
         .onHover { hovering = $0 }
         .help(rowHelp(server))
     }

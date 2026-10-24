@@ -92,6 +92,7 @@ struct DetailContent: View {
     let moreOnImage: AnyView
     let perform: (DetailButton) -> Void
     @Environment(\.colorScheme) private var scheme
+    @EnvironmentObject private var language: LanguageModel
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -139,7 +140,7 @@ struct DetailContent: View {
                 Button {
                     withAnimation(.easeOut(duration: 0.15)) { showProcesses.toggle() }
                 } label: {
-                    Text(verbatim: processesLabel(Int(server.processCount)))
+                    Text(verbatim: processesLabel(Int(server.processCount), bundle: language.bundle, locale: language.locale))
                         .frame(minHeight: minHitHeight)
                         .contentShape(Rectangle())
                 }
@@ -158,7 +159,7 @@ struct DetailContent: View {
             ForEach(Array(all.enumerated()), id: \.element) { index, b in
                 let main = index == 0
                 Button { perform(b) } label: {
-                    Text(verbatim: b.title)
+                    Text(verbatim: b.title(bundle: language.bundle, locale: language.locale))
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(main ? Color(nsColor: .windowBackgroundColor) : stopTextColor(dark: scheme == .dark))
                         .padding(.horizontal, 16)

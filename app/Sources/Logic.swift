@@ -16,17 +16,6 @@ extension ServerViewFfi {
 
 // MARK: - Menu labels
 
-/// `active`, `idle 12 min`, or `session dead · kill in 18 min`.
-func stateLabel(_ s: ServerViewFfi) -> String {
-    if let killIn = s.killInMs {
-        return "session dead \u{00B7} kill in \(durationLabel(ms: killIn))"
-    }
-    if s.state == "idle" {
-        return "idle \(durationLabel(ms: s.idleMs))"
-    }
-    return s.state
-}
-
 /// The menu panel's width and padding, and the indent of a card's second
 /// and third lines (past the 22 pt icon and its 8 pt gap).
 let panelWidth: CGFloat = 420
@@ -49,47 +38,9 @@ func truncatedSessionName(_ name: String) -> String {
     return String(name.prefix(sessionNameMaxLength - 1)) + "\u{2026}"
 }
 
-/// The row's third line. Alive session:
-/// `Claude session "revva-b8" · active · started 4 min ago`; due an alert
-/// that could not be shown (`notificationsOff`):
-/// `Claude session "revva-b8" · idle 31 min, notifications off`; dead
-/// session: `Session ended · idle 12 min · kill in 8 min` (`kill soon` under
-/// a minute).
-func sessionLine(_ s: ServerViewFfi, notificationsOff: Bool = false) -> String {
-    var parts: [String]
-    if s.sessionAlive {
-        let name = "\(s.agentLabel) session \"\(truncatedSessionName(s.sessionName))\""
-        let idle = "idle \(durationLabel(ms: s.idleMs))"
-        if notificationsOff {
-            parts = [name, "\(idle), notifications off"]
-        } else {
-            parts = [name, s.state == "idle" ? idle : "active", s.startedLabel]
-        }
-    } else {
-        parts = ["Session ended", "idle \(durationLabel(ms: s.idleMs))"]
-    }
-    if let killIn = s.killInMs {
-        parts.append(killIn < 60_000 ? "kill soon" : "kill in \(durationLabel(ms: killIn))")
-    }
-    return parts.joined(separator: " \u{00B7} ")
-}
-
 /// The row tooltip: full command line, pid and full worktree path.
 func rowHelp(_ s: ServerViewFfi) -> String {
     "\(s.command)\npid \(s.pid)\n\(s.worktree)"
-}
-
-/// `just now`, `12 min ago`, `2 h ago`, `yesterday`, `3 days ago`.
-func relativeTime(atMs: UInt64, now: Date = Date()) -> String {
-    let nowMs = UInt64(max(0, now.timeIntervalSince1970 * 1000))
-    let min = nowMs > atMs ? (nowMs - atMs) / 60_000 : 0
-    switch min {
-    case 0: return "just now"
-    case 1..<60: return "\(min) min ago"
-    case 60..<(24 * 60): return "\(min / 60) h ago"
-    case (24 * 60)..<(48 * 60): return "yesterday"
-    default: return "\(min / (24 * 60)) days ago"
-    }
 }
 
 // MARK: - Menu (decision first)
@@ -158,15 +109,6 @@ private func cardRank(_ kind: String?) -> Int {
     }
 }
 
-/// The pill on a card: `Restart`, `Postpone 1 h` or `Stop`.
-func cardActionLabel(_ card: CardFfi) -> String {
-    switch card.action {
-    case "restart": return "Restart"
-    case "postpone": return "Postpone 1 h"
-    default: return "Stop"
-    }
-}
-
 /// A card's pill is filled (amber) only for Restart, the fix for a leak.
 func cardActionIsProminent(_ card: CardFfi) -> Bool {
     card.action == "restart"
@@ -188,15 +130,6 @@ func portHue(_ port: UInt16) -> Double {
     (Double(port) * 0.618_033_988_75).truncatingRemainder(dividingBy: 1)
 }
 
-/// `✳ Claude`, `◎ Codex`, or `no agent`.
-func agentBadgeText(_ s: ServerViewFfi) -> String {
-    switch s.agent {
-    case "claude_code": return "\u{2733} Claude"
-    case "codex": return "\u{25CE} Codex"
-    default: return "no agent"
-    }
-}
-
 /// The parts of a row's second line, so each can take its own color and
 /// its own truncation.
 struct SubtitleParts: Equatable {
@@ -209,19 +142,20 @@ struct SubtitleParts: Equatable {
     let badge: String
 }
 
-func subtitleParts(_ s: ServerViewFfi) -> SubtitleParts {
+func subtitleParts(_ s: ServerViewFfi, bundle: Bundle = copyBundle, locale: Locale = copyLocale) -> SubtitleParts {
     let others = s.ports.filter { $0 != s.port }
     var extra: String?
     if let first = others.first {
         extra = "+" + String(first) + (others.count > 1 ? " +\(others.count - 1)" : "")
     }
     let place = [s.branch ?? "", s.worktreeName].first { !$0.isEmpty }
-    return SubtitleParts(port: portLabel(s.port), otherPorts: extra, place: place, badge: agentBadgeText(s))
+    return SubtitleParts(port: portLabel(s.port), otherPorts: extra, place: place,
+                         badge: agentBadgeText(s, bundle: bundle, locale: locale))
 }
 
 /// `:3010 +9229 · roadbook-explore · ✳ Claude`.
-func rowSubtitle(_ s: ServerViewFfi) -> String {
-    let p = subtitleParts(s)
+func rowSubtitle(_ s: ServerViewFfi, bundle: Bundle = copyBundle, locale: Locale = copyLocale) -> String {
+    let p = subtitleParts(s, bundle: bundle, locale: locale)
     let port = [p.port, p.otherPorts].compactMap { $0 }.joined(separator: " ")
     return [port, p.place, p.badge].compactMap { $0 }.joined(separator: " \u{00B7} ")
 }
@@ -234,42 +168,6 @@ func titleParts(_ s: ServerViewFfi) -> (title: String, framework: String?) {
         return (title, nil)
     }
     return (title, f)
-}
-
-/// A row's status after its badge: the core's text, plus `notifications
-/// off` when its alert is due but could not be shown.
-func rowStatus(_ s: ServerViewFfi, notificationsOff: Bool = false) -> String {
-    notificationsOff ? "\(s.statusText), notifications off" : s.statusText
-}
-
-/// `NEEDS YOU · 2`, `ALL GOOD · 5`.
-func sectionTitle(_ kind: String, count: Int) -> String {
-    "\(kind.uppercased()) \u{00B7} \(count)"
-}
-
-let nothingToDecide = "Nothing to decide"
-
-/// The fold under "All good": `+ 2 more ▸`.
-func moreLabel(_ n: Int) -> String {
-    "+ \(n) more \u{25B8}"
-}
-
-/// `Recently stopped (1)`.
-func recentlyStoppedLabel(_ n: Int) -> String {
-    "Recently stopped (\(n))"
-}
-
-/// `7 servers`, `1 server`.
-func headerCount(_ n: Int) -> String {
-    n == 1 ? "1 server" : "\(n) servers"
-}
-
-/// The `90 MB` / `2.3 GB` size label (same rounding as the core).
-func memoryLabel(_ bytes: UInt64) -> String {
-    let mbUnit: UInt64 = 1_048_576
-    let mb = (bytes + mbUnit / 2) / mbUnit
-    if mb < 1024 { return "\(mb) MB" }
-    return String(format: "%.1f GB", Double(bytes) / Double(mbUnit * 1024))
 }
 
 /// How full a row's memory gauge is: the share of 2 GB (the red line),
@@ -321,12 +219,6 @@ func usageCaption(_ line: String) -> UsageCaption? {
     return UsageCaption(figure: "\(words[0]) \(words[1])", dev: words[2], apps: halves[1], free: halves[2])
 }
 
-/// The usage bar's tooltip: exact figures in MB.
-func usageHelp(_ m: MemoryBarFfi) -> String {
-    let mb = { (b: UInt64) in "\(b / 1_048_576) MB" }
-    return "Dev servers \(mb(m.devBytes))\nOther apps \(mb(m.appsBytes))\nFree \(mb(m.freeBytes)) of \(mb(m.totalBytes))"
-}
-
 // MARK: - Menu actions
 
 /// What a ⋯ menu item does; `separator` is the line before Stop.
@@ -356,22 +248,6 @@ func canRestartNow(_ s: ServerViewFfi, restarting: Bool) -> Bool {
     s.canRestart && !restarting
 }
 
-/// The ⋯ menu, the same everywhere. Restart only when the core can restart
-/// it, Keep for agent servers, Ignore this alert with an alert card, Stop
-/// unless excluded; neither Restart nor Stop while a Restart runs.
-/// Details… opens the detail view (not offered from the detail itself).
-func moreMenuItems(_ s: ServerViewFfi, restarting: Bool = false, inDetail: Bool = false) -> [MenuItem] {
-    [
-        MenuItem(kind: .open, title: "\u{2197} Open in browser", enabled: true),
-        MenuItem(kind: .restart, title: "\u{27F3} Restart", enabled: canRestartNow(s, restarting: restarting)),
-        MenuItem(kind: .keep, title: "\u{23F8} Keep (no alerts)", enabled: s.managed),
-        MenuItem(kind: .ignoreAlert, title: "\u{2298} Ignore this alert", enabled: hasAlertCard(s)),
-        MenuItem(kind: .details, title: "\u{24D8} Details\u{2026}", enabled: !inDetail),
-        MenuItem(kind: .separator, title: "", enabled: false),
-        MenuItem(kind: .stop, title: "\u{25A0} Stop", enabled: canStopNow(s, restarting: restarting)),
-    ]
-}
-
 /// The hover capsule's buttons. Restart is never one of them.
 enum CapsuleButton: Hashable, Sendable {
     case open, stop, more
@@ -395,16 +271,6 @@ func needsConfirmation(_ s: ServerViewFfi) -> Bool {
     !s.managed
 }
 
-/// `Stop client-portal :3000?`, why it asks, and the button.
-func confirmationText(_ s: ServerViewFfi, action: ConfirmAction) -> (title: String, message: String, button: String) {
-    let verb = action == .stop ? "Stop" : "Restart"
-    return (
-        "\(verb) \(titleParts(s).title) \(portLabel(s.port))?",
-        "No agent started it. Balance ton port never stops it on its own.",
-        verb
-    )
-}
-
 /// What the row shows in place of its status while a Restart runs, and
 /// after one that was refused (for `blockedNoteDuration`).
 enum RowNote: Equatable, Sendable {
@@ -413,13 +279,6 @@ enum RowNote: Equatable, Sendable {
 }
 
 let blockedNoteDuration: TimeInterval = 4
-
-func rowNoteText(_ note: RowNote) -> String {
-    switch note {
-    case .restarting: return "restarting\u{2026}"
-    case .blocked(let copy): return copy
-    }
-}
 
 /// A Restart running or just done, with the row as it was. The core
 /// returns once the new process is started, not once it listens, so the row
@@ -463,6 +322,7 @@ func postponedView(_ s: ServerViewFfi) -> ServerViewFfi {
     v.killInMs = 3_600_000
     v.postponed = true
     v.statusText = "stops in 60 min"
+    v.status = StatusFfi(kind: "stops_in", minutes: 60, agentLabel: "", reason: nil)
     if v.card?.kind == "about_to_stop" { v.card = nil }
     return v
 }
@@ -473,6 +333,7 @@ func keptView(_ s: ServerViewFfi) -> ServerViewFfi {
     var v = s
     v.killInMs = nil
     v.statusText = "kept by you"
+    v.status = StatusFfi(kind: "kept_by_user", minutes: 0, agentLabel: "", reason: nil)
     if v.card?.kind != "leak" && v.card?.kind != "session_ended_open" { v.card = nil }
     return v
 }
@@ -489,49 +350,6 @@ func alertIgnoredView(_ s: ServerViewFfi) -> ServerViewFfi {
 /// A button of the detail view: the two at the bottom and the status card's.
 enum DetailButton: Hashable, Sendable {
     case open, stop, restart, postpone, stopNow
-
-    var title: String {
-        switch self {
-        case .open: return "Open"
-        case .stop: return "Stop"
-        case .restart: return "Restart"
-        case .postpone: return "Postpone 1 h"
-        case .stopNow: return "Stop now"
-        }
-    }
-}
-
-/// The detail's one sentence: what is going on with this server and why.
-/// A leak first, then in use, a server no agent started, kept, its
-/// session's state. Built from the row's fields; Keep and a keep note have
-/// no field of their own in the FFI, so they are read from `statusText`
-/// (`kept by you`, `kept by Claude: "<reason>"`).
-func statusSentence(_ s: ServerViewFfi) -> String {
-    if s.card?.kind == "leak" {
-        if s.leakKind == "growth" {
-            return "Growing fast: +\(memoryLabel(UInt64(max(0, s.growthBytes)))) in 10 min."
-        }
-        return "Using \(memoryLabel(s.rssBytes))."
-    }
-    if s.inUse { return "In use: a browser is connected." }
-    if !s.managed { return "Not started by an agent. Balance ton port never stops it on its own." }
-    if s.statusText.hasPrefix("kept by ") {
-        return "K" + s.statusText.dropFirst() + ". No alerts."
-    }
-    let idle = durationLabel(ms: s.idleMs)
-    if !s.sessionAlive {
-        return "Its \(s.agentLabel) session ended and nothing has connected for \(idle)."
-    }
-    if s.card?.kind == "idle_alert" {
-        return "Its \(s.agentLabel) session has been idle \(idle). Nothing stops it while the session is open."
-    }
-    return "Its \(s.agentLabel) session is open."
-}
-
-/// The status card's bold line when a stop is scheduled: `Stops in 8 min`.
-func statusTitle(_ s: ServerViewFfi) -> String? {
-    guard let killIn = s.killInMs else { return nil }
-    return killIn < 60_000 ? "Stops soon" : "Stops in \(durationLabel(ms: killIn))"
 }
 
 /// How much of the countdown is left, 0 to 1; `nil` when no stop is
@@ -578,48 +396,24 @@ func detailButtonEnabled(_ b: DetailButton, _ s: ServerViewFfi, restarting: Bool
     }
 }
 
-/// `up 5 h`.
-func uptimeChip(ms: UInt64) -> String {
-    "up \(durationLabel(ms: ms))"
-}
-
-/// `3 processes ›`.
-func processesLabel(_ n: Int) -> String {
-    (n == 1 ? "1 process" : "\(n) processes") + " \u{203A}"
-}
-
-/// `CPU 4%`, rounded.
-func cpuLabel(_ pct: Float) -> String {
-    "CPU \(Int(pct.rounded()))%"
-}
-
 /// The session chip: `✳ "revva-b8" ↗`. A click copies the resume command.
 func sessionChipText(_ s: ServerViewFfi) -> String {
     let glyph = s.agent == "codex" ? "\u{25CE}" : "\u{2733}"
     return "\(glyph) \"\(truncatedSessionName(s.sessionName))\" \u{2197}"
 }
 
-/// What the session chip says for a moment after the copy.
-let copiedLabel = "Copied"
+/// How long the session chip says "Copied".
 let copiedDuration: TimeInterval = 1.5
 
 /// The hero's second line: the framework (else the tool, when it is not
 /// the title), then the ports.
-func heroSubtitle(_ s: ServerViewFfi) -> (kind: String?, port: String, otherPorts: String?) {
+func heroSubtitle(
+    _ s: ServerViewFfi, bundle: Bundle = copyBundle, locale: Locale = copyLocale
+) -> (kind: String?, port: String, otherPorts: String?) {
     let t = titleParts(s)
     let kind = t.framework ?? (s.toolLabel.lowercased() == t.title.lowercased() ? nil : s.toolLabel)
-    let p = subtitleParts(s)
+    let p = subtitleParts(s, bundle: bundle, locale: locale)
     return (kind, p.port, p.otherPorts)
-}
-
-/// An event's label under the chart: `✳ started` for an agent start, else
-/// the core's label.
-func eventChartLabel(_ e: EventFfi) -> String {
-    switch (e.kind, e.label) {
-    case ("started", "started by Claude"): return "\u{2733} started"
-    case ("started", "started by Codex"): return "\u{25CE} started"
-    default: return e.label
-    }
 }
 
 /// Which event labels fit under the chart: `positions` are 0 to 1 across
@@ -641,12 +435,6 @@ func chartScale(maxBytes: UInt64, lineBytes: UInt64) -> (upper: Double, lineOnSc
     let line = Double(lineBytes)
     guard line <= upper * 2 else { return (upper, false) }
     return (max(upper, line * 1.1), true)
-}
-
-/// `2 GB`, `1.5 GB`: the leak line's label.
-func leakLineLabel(_ bytes: UInt64) -> String {
-    let gb = Double(bytes) / Double(1024 * 1_048_576)
-    return gb.rounded() == gb ? "\(Int(gb)) GB" : String(format: "%.1f GB", gb)
 }
 
 /// The tallest the detail may be on a screen whose visible height is
@@ -756,24 +544,6 @@ func previewContentRules(port: UInt16) -> String {
 }
 
 // MARK: - Notifications
-
-/// "Astro on port 4322 (revva \u{203A} web) hasn't been used for 30 min."
-/// Only the tool label, the port and the location: the raw command line
-/// (flags, tokens) never reaches the lock screen. Minutes are rounded down.
-func notificationBody(_ s: ServerViewFfi) -> String {
-    let minutes = s.idleMs / 60_000
-    return "\(s.toolLabel) on port \(String(s.port)) (\(s.locationLabel)) hasn't been used for \(minutes) min."
-}
-
-/// `Revva web :3010 is using 2.3 GB`, or `Vite :5173 grew 600 MB in 10 min`
-/// when the core says the leak is the growth (`leakKind`).
-func leakNotificationBody(_ s: ServerViewFfi) -> String {
-    let name = "\(titleParts(s).title) \(portLabel(s.port))"
-    if s.leakKind == "growth" {
-        return "\(name) grew \(memoryLabel(UInt64(max(0, s.growthBytes)))) in 10 min"
-    }
-    return "\(name) is using \(memoryLabel(s.rssBytes))"
-}
 
 /// The leak notification's identifier: a repeat replaces the earlier one.
 func leakRequestID(_ id: ServerID) -> String {
@@ -929,13 +699,6 @@ enum NotificationPermission: Equatable, Sendable {
 enum NotificationSetupButton: Equatable, Sendable {
     case turnOn
     case openSettings
-
-    var title: String {
-        switch self {
-        case .turnOn: return "Turn on notifications"
-        case .openSettings: return "Open Notification Settings"
-        }
-    }
 }
 
 /// The Notifications section's content for a permission.
@@ -948,32 +711,6 @@ struct NotificationSetup: Equatable, Sendable {
     let button: NotificationSetupButton?
     /// "Send a test notification" is offered.
     let canSendTest: Bool
-}
-
-func notificationSetup(_ permission: NotificationPermission) -> NotificationSetup {
-    switch permission {
-    case .notAsked:
-        return NotificationSetup(
-            message: "Get a notification for servers that sit idle and for sessions that end with servers still running, with buttons to stop or keep them.",
-            isOn: false, hint: nil, button: .turnOn, canSendTest: false
-        )
-    case .allowed(let bannersOff):
-        return NotificationSetup(
-            message: "Notifications are on",
-            isOn: true,
-            hint: bannersOff ? "Banners are off: choose Banners or Alerts in System Settings" : nil,
-            button: bannersOff ? .openSettings : nil,
-            canSendTest: true
-        )
-    case .denied:
-        return NotificationSetup(
-            message: "Notifications are off for Balance ton port.",
-            isOn: false,
-            hint: "Turn on Allow notifications, then come back here.",
-            button: .openSettings,
-            canSendTest: false
-        )
-    }
 }
 
 /// What "Turn on" in the menu does; `nil` when the menu shows no line.
@@ -999,10 +736,6 @@ func notificationSettingsURLs(bundleID: String) -> [URL] {
     return [URL(string: "\(base)?id=\(bundleID)"), URL(string: base)].compactMap { $0 }
 }
 
-/// The test notification's body: a made-up idle server.
-let sampleNotificationBody =
-    "Test: Vite on port 5173 (my-project \u{203A} web) hasn't been used for 30 min."
-
 /// The test notification's userInfo: no pid nor start time, so
 /// `serverID(fromUserInfo:)` finds no server and its Kill and Keep do nothing.
 func sampleNotificationUserInfo() -> [String: Any] {
@@ -1026,33 +759,8 @@ enum TestNotificationResult: Equatable, Sendable {
     }
 }
 
-/// The test button's title: "Test sent" only once the notification was added.
-func testNotificationButtonTitle(_ result: TestNotificationResult) -> String {
-    switch result {
-    case .none: return "Send a test notification"
-    case .sent: return "Test sent"
-    case .failed: return "Could not send the test"
-    }
-}
-
 /// Seconds before the test button's title goes back to "Send a test notification".
 let testNotificationResetDelay: TimeInterval = 4
-
-/// The menu's note after a manual kill that found nothing for `id`. From a
-/// notification: the server changed since it was posted (merged into the
-/// server that started it, restarted, or gone). From the menu: "already
-/// gone" only when no tracked server has that pid; `nil` while one does (its
-/// row stays).
-func missedKillNotice(_ id: ServerID, tracked: [ServerID], fromNotification: Bool) -> String? {
-    if fromNotification {
-        return "Nothing to kill: this server changed since the notification"
-    }
-    return tracked.contains { $0.pid == id.pid } ? nil : "That server was already gone."
-}
-
-/// The menu's note when a leak notification's Restart finds its server
-/// gone from the last pass.
-let missedRestartNotice = "Nothing to restart: this server changed since the notification"
 
 // MARK: - Settings
 
@@ -1128,14 +836,7 @@ struct SettingsDraft: Equatable, Sendable {
 
     /// Empty when the draft can be saved: minute delays at least 1 min,
     /// second delays at least 1 s.
-    var validationErrors: [String] {
-        var errors: [String] = []
-        if deadSessionIdleS < 60 { errors.append("Dead session delay must be at least 1 min.") }
-        if alertAfterS < 60 { errors.append("Alert delay must be at least 1 min.") }
-        if killGraceS < 1 { errors.append("Kill grace must be at least 1 s.") }
-        if scanIntervalS < 1 { errors.append("Scan interval must be at least 1 s.") }
-        return errors
-    }
+    var validationErrors: [String] { validationMessages() }
 
     var isValid: Bool { validationErrors.isEmpty }
 }
