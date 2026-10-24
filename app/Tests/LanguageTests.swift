@@ -54,9 +54,19 @@ final class LanguageTests: XCTestCase {
         XCTAssertEqual(AppLanguage.system.name(model), "System default")
     }
 
+    /// Every language is in the catalog now, so the missing one is missing
+    /// from a bundle holding only `en.lproj` and `fr.lproj`.
     @MainActor
     func testMissingLanguageFallsBackToEnglish() throws {
-        let model = try testModel()
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("btp-lang-\(UUID().uuidString)")
+        let tables = ["en": ["Language": "Language", "About": "About"], "fr": ["Language": "Langue", "About": "À propos"]]
+        for (code, table) in tables {
+            let lproj = dir.appendingPathComponent("\(code).lproj")
+            try FileManager.default.createDirectory(at: lproj, withIntermediateDirectories: true)
+            try (table as NSDictionary).write(to: lproj.appendingPathComponent("Localizable.strings"))
+        }
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "btp-lang-\(UUID().uuidString)"))
+        let model = LanguageModel(defaults: defaults, base: try XCTUnwrap(Bundle(path: dir.path)))
         model.choice = .ja
         XCTAssertEqual(model.tr("Language"), "Language")
         XCTAssertEqual(model.tr("About"), "About")
