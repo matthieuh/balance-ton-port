@@ -30,21 +30,19 @@ done
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC="$ROOT/packaging/homebrew"
-ZERO="0000000000000000000000000000000000000000000000000000000000000000"
 mkdir -p "$OUT"
 
-# Formula: the version only appears in the url (v0.0.0 and btp-0.0.0-...).
-sed -e "s/0\.0\.0/$VERSION/g" -e "s/$ZERO/$BTP_SHA/" \
-    "$SRC/btp.rb" >"$OUT/btp.rb"
-# Cask: the url interpolates #{version}.
-sed -e "s/^  version \"0\.0\.0\"$/  version \"$VERSION\"/" -e "s/$ZERO/$APP_SHA/" \
-    "$SRC/balance-ton-port.rb" >"$OUT/balance-ton-port.rb"
-
-for f in "$OUT/btp.rb" "$OUT/balance-ton-port.rb"; do
-    if grep -q -e "$ZERO" -e '0\.0\.0' "$f"; then
-        echo "error: placeholder left in $f" >&2
+render() { # render TEMPLATE OUTPUT SED-ARGS...
+    local src="$1" dst="$2"
+    shift 2
+    sed "$@" "$src" >"$dst"
+    if grep -q '@[A-Z_0-9]*@' "$dst"; then
+        echo "error: token left in $dst" >&2
         exit 1
     fi
-done
+}
+
+render "$SRC/btp.rb" "$OUT/btp.rb" -e "s/@VERSION@/$VERSION/g" -e "s/@SHA_MACOS@/$BTP_SHA/g"
+render "$SRC/balance-ton-port.rb" "$OUT/balance-ton-port.rb" -e "s/@VERSION@/$VERSION/g" -e "s/@SHA_DMG@/$APP_SHA/g"
 echo "$OUT/btp.rb"
 echo "$OUT/balance-ton-port.rb"

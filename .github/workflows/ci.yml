@@ -71,6 +71,10 @@ jobs:
           command -v shellcheck >/dev/null || brew install shellcheck
           scripts/test-plugin.sh
 
+      # render-homebrew.sh and the formula/cask templates (fixtures, no network).
+      - name: Release script tests
+        run: bash scripts/test-release-scripts.sh
+
       - name: Build xcframework
         run: scripts/build-xcframework.sh
 
