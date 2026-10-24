@@ -11,6 +11,7 @@ Balance ton port cleans up automatically and asks only when it cannot be sure. I
 - Never kill a server someone is still using.
 - Never stop automatically anything an agent did not start: a Metro started in a plain terminal, Postgres, Docker, system services. The app lists such servers (section 9), but only you can stop them, one at a time, after a confirmation.
 - Cost next to nothing while idle: no subprocesses, no `lsof` loop, only direct system calls once per scan.
+- Stay off the network: the only call besides localhost is the Sparkle update check against the appcast on GitHub releases (daily, no system profile sent).
 
 It ships as a macOS menu bar app and a `btp` CLI, both built on one Rust core, plus an agent skill that teaches coding agents to use `btp` instead of `lsof | xargs kill`.
 
@@ -130,6 +131,8 @@ The menu has a "Needs you" list with one card per server that needs a decision, 
 **Idle alert.** It re-arms only when the idle value the alert rule uses (section 5, trigger 5) drops below the threshold, so a long-lived connection during an idle session does not cause a new notification on every pass. Its card stays until you choose Ignore this alert or the server is used again.
 
 **Leaks.** A server leaks when its memory (the whole tree) is above `leak_memory_mb` (default 2048), or has grown by more than `leak_growth_mb` (default 500) in the last 10 minutes. The minimums are 100 and 50. Health is green below 500 MB, amber from 500 MB, red when it leaks. A leak raises one notification per leak episode. Ignore this alert dismisses the current alert only; it re-arms when memory grows another 500 MB. The leak state resets after 10 minutes without a leak, so a leak that flaps does not notify twice in a row. The leak state lives in memory: a relaunch of the app can notify an ongoing leak once more. Observed servers can leak too.
+
+**Updates.** The app checks for a new version once a day through Sparkle and, when automatic updates are on (the default), downloads and installs it in the background. This feed is the only network call besides localhost. Updates are signed with an EdDSA key and the app with Developer ID, and the download comes from the GitHub release.
 
 ## 12. History and probes
 

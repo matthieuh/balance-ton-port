@@ -4,6 +4,7 @@ import SwiftUI
 struct BalanceTonPortApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var model = CoreModel()
+    @StateObject private var updates = UpdateController()
 
     var body: some Scene {
         // MenuIcon is a pig snout template image (Assets.xcassets), so it
@@ -17,6 +18,7 @@ struct BalanceTonPortApp: App {
         Settings {
             SettingsView()
                 .environmentObject(model)
+                .environmentObject(updates)
         }
     }
 }
