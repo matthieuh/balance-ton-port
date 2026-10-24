@@ -11,7 +11,7 @@ Balance ton port cleans up automatically and asks only when it cannot be sure. I
 - Never kill a server someone is still using.
 - Never stop automatically anything an agent did not start: a Metro started in a plain terminal, Postgres, Docker, system services. The app lists such servers (section 9), but only you can stop them, one at a time, after a confirmation.
 - Cost next to nothing while idle: no subprocesses, no `lsof` loop, only direct system calls once per scan.
-- Stay off the network: the only call besides localhost is the Sparkle update check against the appcast on GitHub releases (daily, no system profile sent).
+- Stay off the network: the only calls besides localhost are the daily Sparkle update check and the download of an update, both from GitHub (no system profile sent).
 
 It ships as a macOS menu bar app and a `btp` CLI, both built on one Rust core, plus an agent skill that teaches coding agents to use `btp` instead of `lsof | xargs kill`.
 

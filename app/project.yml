@@ -17,6 +17,7 @@ settings:
 packages:
   Sparkle:
     url: https://github.com/sparkle-project/Sparkle
+    # exactVersion is the lock: Package.resolved lives in the generated project.
     exactVersion: 2.10.0
 targets:
   BalanceTonPort:

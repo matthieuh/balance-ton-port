@@ -17,9 +17,17 @@ final class UpdateController: ObservableObject {
     }
 
     init() {
-        automatic = controller.updater.automaticallyChecksForUpdates
-            && controller.updater.automaticallyDownloadsUpdates
+        let updater = controller.updater
+        let both = Self.reconciled(
+            checks: updater.automaticallyChecksForUpdates, downloads: updater.automaticallyDownloadsUpdates)
+        automatic = both
+        // didSet does not run inside init: when the switches disagreed, align them.
+        updater.automaticallyChecksForUpdates = both
+        updater.automaticallyDownloadsUpdates = both
     }
+
+    /// Automatic updates are on only when Sparkle both checks and downloads.
+    nonisolated static func reconciled(checks: Bool, downloads: Bool) -> Bool { checks && downloads }
 
     var canCheck: Bool { controller.updater.canCheckForUpdates }
 

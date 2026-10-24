@@ -15,6 +15,8 @@ final class UpdatesTests: XCTestCase {
         let key = try XCTUnwrap(info["SUPublicEDKey"] as? String)
         XCTAssertEqual(key.count, 44)
         XCTAssertNotNil(Data(base64Encoded: key))
+        XCTAssertEqual(info["SUEnableAutomaticChecks"] as? Bool, true)
+        XCTAssertEqual(info["SUAutomaticallyUpdate"] as? Bool, true)
         XCTAssertEqual(info["SUScheduledCheckInterval"] as? Int, 86400)
         XCTAssertEqual(info["SUEnableSystemProfiling"] as? Bool, false)
     }
@@ -23,5 +25,12 @@ final class UpdatesTests: XCTestCase {
         XCTAssertEqual(
             UpdateController.appVersion(["CFBundleShortVersionString": "0.5.0", "CFBundleVersion": "7"]),
             "0.5.0 (7)")
+    }
+
+    func testAutomaticReconcilesDisagreeingSwitches() {
+        XCTAssertTrue(UpdateController.reconciled(checks: true, downloads: true))
+        XCTAssertFalse(UpdateController.reconciled(checks: true, downloads: false))
+        XCTAssertFalse(UpdateController.reconciled(checks: false, downloads: true))
+        XCTAssertFalse(UpdateController.reconciled(checks: false, downloads: false))
     }
 }
