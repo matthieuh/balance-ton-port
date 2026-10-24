@@ -231,17 +231,39 @@ jobs:
             "$BTP_TGZ" "$BTP_TGZ.sha256" "$APP_DMG" "$APP_DMG.sha256" \
             homebrew/btp.rb homebrew/balance-ton-port.rb
 
-      - name: Update Homebrew tap
-        # Final releases only: a prerelease leaves the tap untouched.
-        if: ${{ !contains(github.ref_name, '-') }}
-        env:
-          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      - name: Clean up keychain
+        if: always()
         run: |
+          if [ -n "${KEYCHAIN:-}" ] && [ -f "$KEYCHAIN" ]; then
+            security delete-keychain "$KEYCHAIN" || true
+          fi
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+  # Its own job so a failed tap update can be rerun alone once the release exists.
+  tap:
+    # Final releases only: a prerelease leaves the tap untouched.
+    if: ${{ !contains(github.ref_name, '-') }}
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update Homebrew tap
+        env:
+          RELEASE_TOKEN: ${{ github.token }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir "$RUNNER_TEMP/rendered"
+          GH_TOKEN="$RELEASE_TOKEN" gh release download "$GITHUB_REF_NAME" \
+            -R "$GITHUB_REPOSITORY" -D "$RUNNER_TEMP/rendered" \
+            -p btp.rb -p balance-ton-port.rb
+          # The clone and the push both authenticate with the tap token.
+          export GH_TOKEN="$TAP_TOKEN"
+          gh auth setup-git
           TAP="$RUNNER_TEMP/homebrew-tap"
           gh repo clone matthieuh/homebrew-tap "$TAP"
           mkdir -p "$TAP/Formula" "$TAP/Casks"
-          cp "$DIST/homebrew/btp.rb" "$TAP/Formula/btp.rb"
-          cp "$DIST/homebrew/balance-ton-port.rb" "$TAP/Casks/balance-ton-port.rb"
+          cp "$RUNNER_TEMP/rendered/btp.rb" "$TAP/Formula/btp.rb"
+          cp "$RUNNER_TEMP/rendered/balance-ton-port.rb" "$TAP/Casks/balance-ton-port.rb"
           cd "$TAP"
           git add Formula Casks
           if git diff --cached --quiet; then
@@ -251,12 +273,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -m "btp, balance-ton-port $VERSION"
+          git pull --rebase origin HEAD
           git push origin HEAD
-
-      - name: Clean up keychain
-        if: always()
-        run: |
-          if [ -n "${KEYCHAIN:-}" ] && [ -f "$KEYCHAIN" ]; then
-            security delete-keychain "$KEYCHAIN" || true
-          fi
-          rm -f "$RUNNER_TEMP/cert.p12"
