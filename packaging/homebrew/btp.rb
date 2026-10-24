@@ -2,10 +2,10 @@
 # (real version in the url, real sha256) and attaches the result to the
 # GitHub release; copy that file to matthieuh/homebrew-tap as Formula/btp.rb.
 class Btp < Formula
-  desc "Kill dev servers left behind by Claude Code sessions"
+  desc "Kill dev servers left behind by coding-agent sessions"
   homepage "https://github.com/matthieuh/balance-ton-port"
-  url "https://github.com/matthieuh/balance-ton-port/releases/download/v0.0.0/btp-0.0.0-macos-universal.tar.gz"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  url "https://github.com/matthieuh/balance-ton-port/releases/download/v@VERSION@/btp-@VERSION@-macos-universal.tar.gz"
+  sha256 "@SHA_MACOS@"
   license "MIT"
 
   # The binary is built with MACOSX_DEPLOYMENT_TARGET=14.0.
