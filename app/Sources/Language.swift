@@ -6,10 +6,11 @@ enum AppLanguage: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
-    /// Each language in its own tongue, never translated; only `system` is localized.
-    var nativeName: String {
+    /// Each language in its own tongue, never translated; only `system` follows the chosen app language.
+    @MainActor
+    func name(_ language: LanguageModel) -> String {
         switch self {
-        case .system: String(localized: "System default")
+        case .system: language.tr("System default")
         case .en: "English"
         case .de: "Deutsch"
         case .fr: "Français"
@@ -75,9 +76,14 @@ final class LanguageModel: ObservableObject {
 
     var locale: Locale { Locale(identifier: code) }
 
-    /// The `<code>.lproj` sub-bundle, else the base bundle.
+    /// The `<code>.lproj` sub-bundle, else English's, else the base bundle.
     var bundle: Bundle {
-        base.path(forResource: code, ofType: "lproj").flatMap(Bundle.init(path:)) ?? base
+        for candidate in [code, AppLanguage.en.rawValue] {
+            if let path = base.path(forResource: candidate, ofType: "lproj"), let found = Bundle(path: path) {
+                return found
+            }
+        }
+        return base
     }
 
     /// Resolves a key in the chosen language, for text outside SwiftUI views

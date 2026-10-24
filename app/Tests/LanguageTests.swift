@@ -30,11 +30,42 @@ final class LanguageTests: XCTestCase {
         XCTAssertEqual(ltr(""), "")
     }
 
-    func testNativeNamesAreNotTranslated() {
-        XCTAssertEqual(AppLanguage.fr.nativeName, "Français")
-        XCTAssertEqual(AppLanguage.zhHans.nativeName, "简体中文")
-        XCTAssertEqual(AppLanguage.he.nativeName, "עברית")
-        XCTAssertEqual(AppLanguage.uk.nativeName, "Українська")
+    @MainActor
+    func testNativeNamesAreNotTranslated() throws {
+        let model = try testModel()
+        let names: [AppLanguage: String] = [
+            .en: "English", .de: "Deutsch", .fr: "Français", .es: "Español",
+            .zhHans: "简体中文", .he: "עברית", .ja: "日本語", .uk: "Українська",
+        ]
+        for choice in [AppLanguage.en, .fr, .he] {
+            model.choice = choice
+            for (language, name) in names { XCTAssertEqual(language.name(model), name) }
+        }
+    }
+
+    @MainActor
+    func testSystemNameFollowsChosenLanguage() throws {
+        let model = try testModel()
+        model.choice = .fr
+        XCTAssertEqual(AppLanguage.system.name(model), "Langue du système")
+        model.choice = .he
+        XCTAssertEqual(AppLanguage.system.name(model), "ברירת מחדל של המערכת")
+        model.choice = .en
+        XCTAssertEqual(AppLanguage.system.name(model), "System default")
+    }
+
+    @MainActor
+    func testMissingLanguageFallsBackToEnglish() throws {
+        let model = try testModel()
+        model.choice = .ja
+        XCTAssertEqual(model.tr("Language"), "Language")
+        XCTAssertEqual(model.tr("About"), "About")
+    }
+
+    @MainActor
+    private func testModel() throws -> LanguageModel {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "btp-lang-\(UUID().uuidString)"))
+        return LanguageModel(defaults: defaults, base: Bundle(for: LanguageTests.self))
     }
 
     @MainActor
