@@ -85,7 +85,7 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         return NotificationPermission(status: settings.authorizationStatus, alertStyle: settings.alertStyle)
     }
 
-    /// A made-up idle-server notification with the real Kill and Keep
+    /// A made-up idle-server notification with the real Stop and Keep
     /// buttons. Its userInfo names no server, so both buttons do nothing.
     /// `true` once Notification Center accepted it.
     func postSample() async -> Bool {
@@ -158,7 +158,7 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     }
 
     /// One notification per ended session ("Session ended: 2 servers kept
-    /// running, ..."), with Stop now and Keep; returns the groups whose
+    /// running, ..."), with Stop all and Keep; returns the groups whose
     /// notification was added. Nothing is posted when notifications are not
     /// allowed.
     func postSessionEnded(_ groups: [SessionEndedFfi]) async -> [SessionEndedID] {

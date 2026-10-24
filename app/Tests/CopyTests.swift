@@ -178,6 +178,88 @@ final class CopyTests: XCTestCase {
         XCTAssertEqual(body, "Astro sur le port 4322 (my-project \u{203A} web) inutilisé depuis 30 min.")
     }
 
+    func testPostponedRowKeepsItsEnglish() {
+        var s = row()
+        s.killInMs = 8 * 60_000
+        s.statusText = "stops in 8 min"
+        s.status = status("stops_in", 8)
+        let p = postponedView(s)
+        XCTAssertEqual(p.statusText, "stops in 60 min")
+        XCTAssertEqual(rowStatus(p), "stops in 60 min")
+        XCTAssertEqual(rowStatus(p, notificationsOff: true), "stops in 60 min, notifications off")
+        XCTAssertEqual(statusText(status("stops_in", 60)), "stops in 1 h", "a pass words 60 minutes as the core does")
+    }
+
+    func testSessionEndedDelaySaturates() {
+        let g = SessionEndedFfi(
+            sessionPid: 1, sessionProcStart: "s", atMs: 2, sessionName: "w", servers: [], body: "", deadIdleS: .max
+        )
+        XCTAssertTrue(sessionEndedBody(g).contains("Stopped after "))
+    }
+
+    /// Every key the sources look up (`L("...")`, `tr("...")`) is in the catalog.
+    func testEveryLookedUpKeyIsInTheCatalog() throws {
+        let sources = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources")
+        let catalog = try JSONSerialization.jsonObject(with: Data(contentsOf: sources.appendingPathComponent("Localizable.xcstrings"))) as? [String: Any]
+        let strings = try XCTUnwrap(catalog?["strings"] as? [String: Any])
+        func shape(_ key: String) -> String {
+            key.replacingOccurrences(of: "%@", with: "\u{0}").replacingOccurrences(of: "%lld", with: "\u{0}")
+                .replacingOccurrences(of: "%%", with: "%")
+        }
+        let known = Set(strings.keys.map(shape))
+        var found = 0
+        let files = try XCTUnwrap(FileManager.default.enumerator(at: sources, includingPropertiesForKeys: nil))
+        for case let url as URL in files where url.pathExtension == "swift" && !url.path.contains("/Generated/") {
+            let text = Array(try String(contentsOf: url, encoding: .utf8))
+            var i = 0
+            while i < text.count {
+                guard let key = lookupKey(in: text, from: &i) else { i += 1; continue }
+                found += 1
+                XCTAssertTrue(known.contains(key), "\(url.lastPathComponent): missing catalog key \(key.debugDescription)")
+            }
+        }
+        XCTAssertGreaterThan(found, 100)
+    }
+
+    /// The literal of a `L("` or `tr("` call starting at `i`, interpolations
+    /// as NUL, escapes resolved; moves `i` past it. `nil` when none starts there.
+    private func lookupKey(in t: [Character], from i: inout Int) -> String? {
+        let heads: [[Character]] = [Array("L(\""), Array("tr(\"")]
+        guard let head = heads.first(where: { h in Array(t[i...].prefix(h.count)) == h }) else { return nil }
+        if i > 0, t[i - 1].isLetter || t[i - 1].isNumber || t[i - 1] == "_" { return nil }
+        var j = i + head.count
+        var out = ""
+        while j < t.count, t[j] != "\"" {
+            if t[j] == "\\" {
+                let n = t[j + 1]
+                if n == "(" {
+                    var depth = 1
+                    j += 2
+                    while depth > 0 {
+                        if t[j] == "\"" { j += 1; while t[j] != "\"" { if t[j] == "\\" { j += 1 }; j += 1 } }
+                        else if t[j] == "(" { depth += 1 } else if t[j] == ")" { depth -= 1 }
+                        j += 1
+                    }
+                    out += "\u{0}"
+                } else if n == "u" {
+                    var k = j + 3
+                    var hex = ""
+                    while t[k] != "}" { hex.append(t[k]); k += 1 }
+                    out.unicodeScalars.append(Unicode.Scalar(UInt32(hex, radix: 16)!)!)
+                    j = k + 1
+                } else {
+                    out.append(["n": "\n", "\"": "\"", "\\": "\\", "t": "\t"][n] ?? n)
+                    j += 2
+                }
+            } else {
+                out.append(t[j]); j += 1
+            }
+        }
+        i = j + 1
+        return out
+    }
+
     func testCatalogHasEveryEnglishKeyUsed() throws {
         // Each key resolves to itself (formatted) in English, so none is missing
         // from the catalog: a missing key would also look like itself, so read
