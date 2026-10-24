@@ -15,6 +15,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const HELPER_ENV: &str = "BTP_TEST_HELPER";
+/// What the `alloc` helper allocates and touches.
+const ALLOC_BYTES: usize = 64 * 1024 * 1024;
 
 /// Spawned helper process. Killed (SIGKILL) and reaped on drop.
 struct Helper {
@@ -104,6 +106,16 @@ fn zz_helper() {
             std::thread::sleep(Duration::from_secs(1));
         }
     }
+    // Held for the helper's whole life: every page written, so it is counted.
+    let _ballast: Vec<u8> = if mode == "alloc" {
+        let mut v = vec![0u8; ALLOC_BYTES];
+        for (i, b) in v.iter_mut().enumerate() {
+            *b = i as u8 | 1;
+        }
+        std::hint::black_box(v)
+    } else {
+        Vec::new()
+    };
     let v4 = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = v4.local_addr().unwrap().port();
     // Same port on IPv6 too, to check that listeners() reports it once.
@@ -382,6 +394,17 @@ fn proc_resources_of_self_is_nonzero() {
         .expect("own process is inspectable");
     assert!(r.rss_bytes > 0 && r.cpu_time_ns > 0, "{r:?}");
     assert_eq!(MacOs.proc_resources(999_999), None);
+}
+
+#[test]
+fn proc_resources_counts_the_memory_a_child_touched() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = spawn_helper("alloc", dir.path());
+    // The helper reports its port only after touching every page.
+    let r = MacOs
+        .proc_resources(h.pid())
+        .expect("own child is inspectable");
+    assert!(r.rss_bytes >= ALLOC_BYTES as u64, "{r:?}");
 }
 
 #[test]

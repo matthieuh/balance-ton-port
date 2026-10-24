@@ -28,9 +28,12 @@ pub struct ProcInfo {
     pub command: String,
 }
 
-/// Resident memory and accumulated CPU time of one process.
+/// Memory and accumulated CPU time of one process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ProcResources {
+    /// Physical footprint, as Activity Monitor's "Memory" column (resident
+    /// size when the footprint cannot be read). Kept as `rss_bytes` for the
+    /// callers and the FFI.
     pub rss_bytes: u64,
     /// User + system CPU time since the process started, nanoseconds.
     pub cpu_time_ns: u64,
@@ -65,7 +68,7 @@ pub trait Platform {
     fn open_paths(&self, pid: i32) -> Vec<PathBuf>;
     /// Current-user pids whose process name equals `name`.
     fn pids_named(&self, name: &str) -> Vec<i32>;
-    /// Resident memory and CPU time of `pid`, `None` when gone or not ours.
+    /// Memory (physical footprint) and CPU time of `pid`, `None` when gone or not ours.
     fn proc_resources(&self, pid: i32) -> Option<ProcResources>;
     /// Total and used memory of the machine.
     fn machine_memory(&self) -> Option<MachineMemory>;

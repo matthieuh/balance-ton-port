@@ -133,7 +133,7 @@ The menu has a "Needs you" list with one card per server that needs a decision, 
 
 ## 12. History and probes
 
-**History.** Each pass samples the memory and CPU of every server's whole process tree. The samples, and the lifecycle events (started, browser connected or closed, session ended, alert, restarted, postponed), are kept in memory for 2 hours and never written to disk. They feed the growth rule and the chart of the detail view.
+**History.** Each pass samples the memory and CPU of every server's whole process tree. Memory is each process's physical footprint, the figure Activity Monitor shows: unlike the resident size it keeps counting pages macOS compressed, so a leak stays visible (the resident size is the fallback when the footprint cannot be read). The samples, and the lifecycle events (started, browser connected or closed, session ended, alert, restarted, postponed), are kept in memory for 2 hours and never written to disk. They feed the growth rule and the chart of the detail view.
 
 **Probes.** To show a title and a favicon, the app fetches the page of a server over http at `127.0.0.1` or `::1`, on the server's own port only. A probe has one deadline of 800 ms. A probe is never counted as use: the app's own connections to a port are ignored when measuring activity (dual-stack aware). A port that answers with something other than HTTP is probed once and never again while the server lives; a timeout or a refusal is retried later. Excluded servers are never probed.
 
