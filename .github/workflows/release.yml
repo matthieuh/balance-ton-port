@@ -219,7 +219,9 @@ jobs:
           } > notes.md
           PRERELEASE=()
           # A tag with a hyphen (v0.2.0-beta.1) is a prerelease.
-          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+          # shellcheck source=scripts/release-lib.sh
+          . "$GITHUB_WORKSPACE/scripts/release-lib.sh"
+          if is_prerelease "$GITHUB_REF_NAME"; then
             PRERELEASE=(--prerelease)
           fi
           # --generate-notes appends the generated changelog to notes.md.
@@ -228,6 +230,28 @@ jobs:
             --verify-tag ${PRERELEASE[@]+"${PRERELEASE[@]}"} \
             "$BTP_TGZ" "$BTP_TGZ.sha256" "$APP_DMG" "$APP_DMG.sha256" \
             homebrew/btp.rb homebrew/balance-ton-port.rb
+
+      - name: Update Homebrew tap
+        # Final releases only: a prerelease leaves the tap untouched.
+        if: ${{ !contains(github.ref_name, '-') }}
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          TAP="$RUNNER_TEMP/homebrew-tap"
+          gh repo clone matthieuh/homebrew-tap "$TAP"
+          mkdir -p "$TAP/Formula" "$TAP/Casks"
+          cp "$DIST/homebrew/btp.rb" "$TAP/Formula/btp.rb"
+          cp "$DIST/homebrew/balance-ton-port.rb" "$TAP/Casks/balance-ton-port.rb"
+          cd "$TAP"
+          git add Formula Casks
+          if git diff --cached --quiet; then
+            echo "tap already at $VERSION"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "btp, balance-ton-port $VERSION"
+          git push origin HEAD
 
       - name: Clean up keychain
         if: always()

@@ -78,5 +78,18 @@ else
   printf 'skip render: brew style passes (brew not installed)\n'
 fi
 
+# --- release-lib.sh ------------------------------------------------------
+lib="$repo/scripts/release-lib.sh"
+for tag in v0.4.0-beta.1 v1.0.0-rc.2; do
+  check "is_prerelease: $tag is a prerelease" bash -c '. "$1" && is_prerelease "$2"' _ "$lib" "$tag"
+done
+for tag in v0.4.0 v10.2.3; do
+  if bash -c '. "$1" && is_prerelease "$2"' _ "$lib" "$tag" 2>/dev/null; then
+    ko "is_prerelease: $tag is final"
+  else
+    ok "is_prerelease: $tag is final"
+  fi
+done
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
