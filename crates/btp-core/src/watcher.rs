@@ -983,8 +983,14 @@ impl<P: Platform> Watcher<P> {
         tracked: &HashSet<i32>,
         cfg: &Config,
     ) -> Vec<ObservedServer> {
-        let found =
-            observed_servers_cached(&self.platform, listeners, tracked, cfg, &mut self.system);
+        let found = observed_servers_cached(
+            &self.platform,
+            listeners,
+            tracked,
+            &self.ignored_peers,
+            cfg,
+            &mut self.system,
+        );
         self.system
             .retain(&listeners.iter().map(|l| l.pid).collect());
         found
@@ -3495,9 +3501,11 @@ mod tests {
             f.p().add_listener(pid, 10_000 + i as u16);
         }
         // The tracked server is never looked up: it is in a tracked tree.
+        // The shell all 200 share as parent is read once (the app helper
+        // rule).
         f.w.tick(T0).unwrap();
         let first = f.p().exe_calls();
-        assert_eq!(first, 200);
+        assert_eq!(first, 201);
         let r = f.w.tick(T0 + 1000).unwrap();
         assert_eq!(r.observed.len(), 200);
         assert_eq!(f.p().exe_calls(), first, "no new process, no new read");
