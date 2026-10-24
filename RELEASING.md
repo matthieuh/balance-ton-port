@@ -36,7 +36,7 @@ The plugin (`plugin/`) is installed from the repo's default branch, not from a r
 
 The tap lives in `matthieuh/homebrew-tap` (a public repo with that exact name, so `brew` finds it as `matthieuh/tap`). The templates are in `packaging/homebrew/`; `scripts/render-homebrew.sh` fills them with the release's version and sha256, and each release attaches the result.
 
-For a final release (no hyphen in the tag) the "Update Homebrew tap" step of the release workflow commits `Formula/btp.rb` and `Casks/balance-ton-port.rb` to the tap's default branch with the `HOMEBREW_TAP_TOKEN` secret. A prerelease tag leaves the tap untouched. If that step fails after the release is published (an expired token, for instance), fix the cause and rerun only that job from the Actions page, or do it by hand, which stays the fallback:
+For a final release (no hyphen in the tag) the `tap` job of the release workflow (after the `release` job) commits `Formula/btp.rb` and `Casks/balance-ton-port.rb` to the tap's default branch with the `HOMEBREW_TAP_TOKEN` secret. A prerelease tag leaves the tap untouched. If that step fails after the release is published (an expired token, for instance), fix the cause and rerun only the `tap` job from the Actions page, or do it by hand, which stays the fallback:
 
 ```bash
 gh release download v0.1.0 -R matthieuh/balance-ton-port -p btp.rb -p balance-ton-port.rb
