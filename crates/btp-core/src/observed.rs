@@ -55,9 +55,13 @@ fn in_app_bundle(exe: &Path) -> bool {
 
 /// Whether each process is a system one, by (pid, start time), so a pass
 /// reads the executable path of a process only the first time it listens.
+/// Same for the parents of listeners: siblings started by one shell share a
+/// single read.
 #[derive(Debug, Default)]
 pub struct SystemCache {
     system: HashMap<(i32, u64), bool>,
+    app_parent: HashMap<(i32, u64), bool>,
+    parents_seen: HashSet<i32>,
 }
 
 impl SystemCache {
@@ -69,22 +73,50 @@ impl SystemCache {
             .or_insert_with(|| p.exe_path(info.pid).is_none_or(|e| is_system_process(&e)))
     }
 
-    /// Forgets every process that is not among `pids`.
+    /// Whether the direct parent of `info` runs from an application bundle
+    /// (an app's helper, like a bundled node runtime). An unreadable parent
+    /// does not count.
+    fn has_app_parent(&mut self, p: &dyn Platform, info: &ProcInfo) -> bool {
+        let Some(parent) = p.proc_info(info.ppid) else {
+            return false;
+        };
+        self.parents_seen.insert(parent.pid);
+        *self
+            .app_parent
+            .entry((parent.pid, parent.start_time))
+            .or_insert_with(|| p.exe_path(parent.pid).is_some_and(|e| in_app_bundle(&e)))
+    }
+
+    /// Forgets every process that is not among `pids`, and every parent not
+    /// looked at since the last call.
     pub fn retain(&mut self, pids: &HashSet<i32>) {
         self.system.retain(|(pid, _), _| pids.contains(pid));
+        let seen = std::mem::take(&mut self.parents_seen);
+        self.app_parent.retain(|(pid, _), _| seen.contains(pid));
     }
 }
 
 /// The observed servers among `listeners`: every listener outside the
-/// tracked trees (`tracked_pids`) that is neither an agent CLI nor a system
-/// process, grouped under its topmost listening ancestor. Sorted by port.
+/// tracked trees (`tracked_pids`) that is neither an agent CLI, nor a system
+/// process, nor the helper of an application (its direct parent runs from an
+/// app bundle), grouped under its topmost listening ancestor. Sorted by port.
+/// A server whose parent is this process or one of `own_pids` (the menu bar
+/// app, which restarts observed servers) is shown.
 pub fn observed_servers(
     p: &dyn Platform,
     listeners: &[Listener],
     tracked_pids: &HashSet<i32>,
+    own_pids: &[i32],
     cfg: &Config,
 ) -> Vec<ObservedServer> {
-    observed_servers_cached(p, listeners, tracked_pids, cfg, &mut SystemCache::default())
+    observed_servers_cached(
+        p,
+        listeners,
+        tracked_pids,
+        own_pids,
+        cfg,
+        &mut SystemCache::default(),
+    )
 }
 
 /// `observed_servers` with the system check cached across passes.
@@ -92,9 +124,12 @@ pub fn observed_servers_cached(
     p: &dyn Platform,
     listeners: &[Listener],
     tracked_pids: &HashSet<i32>,
+    own_pids: &[i32],
     cfg: &Config,
     cache: &mut SystemCache,
 ) -> Vec<ObservedServer> {
+    let me = std::process::id() as i32;
+    let ours = |pid: i32| pid == me || own_pids.contains(&pid);
     let mut found: BTreeMap<i32, (ProcInfo, Vec<u16>)> = BTreeMap::new();
     let mut rejected = HashSet::new();
     for l in listeners {
@@ -109,7 +144,10 @@ pub fn observed_servers_cached(
             rejected.insert(l.pid);
             continue;
         };
-        if is_agent_cli(&info.command).is_some() || cache.is_system(p, &info) {
+        if is_agent_cli(&info.command).is_some()
+            || cache.is_system(p, &info)
+            || (!ours(info.ppid) && cache.has_app_parent(p, &info))
+        {
             rejected.insert(l.pid);
             continue;
         }
@@ -189,7 +227,7 @@ mod tests {
 
     fn scan(p: &FakePlatform, tracked: &[i32]) -> Vec<ObservedServer> {
         let tracked = tracked.iter().copied().collect();
-        observed_servers(p, &p.listeners(), &tracked, &cfg())
+        observed_servers(p, &p.listeners(), &tracked, &[], &cfg())
     }
 
     #[test]
@@ -270,18 +308,86 @@ mod tests {
     #[test]
     fn a_system_parent_does_not_absorb_its_child() {
         let p = base();
-        listen(
-            &p,
-            20,
-            10,
-            "Docker",
-            "/Applications/Docker.app/Contents/MacOS/x",
-            2375,
-        );
+        // A daemon outside any app bundle: an app bundle parent would hide
+        // the child altogether (see `an_app_helper_is_hidden`).
+        listen(&p, 20, 10, "daemon", "/usr/libexec/daemon", 2375);
         listen(&p, 21, 20, "node app.js", NODE, 3000);
         let o = scan(&p, &[]);
         assert_eq!(o.len(), 1);
         assert_eq!(o[0].key.pid, 21);
+    }
+
+    const RAYCAST: &str = "/Applications/Raycast.app/Contents/MacOS/Raycast";
+    const BUNDLED_NODE: &str =
+        "/Users/me/Library/Application Support/com.raycast.macos/node/runtime/22/bin/node";
+
+    #[test]
+    fn an_app_helper_is_hidden() {
+        let p = base();
+        // The app itself (not listening) runs a bundled node outside the
+        // bundle: that helper listener is the app's, not a dev server.
+        p.spawn(20, 1, 20, "Raycast", "/");
+        p.set_exe(20, RAYCAST);
+        listen(&p, 21, 20, "Raycast Backend", BUNDLED_NODE, 7265);
+        // The same runtime started from a terminal is a dev server.
+        listen(&p, 22, 10, "node server.js", BUNDLED_NODE, 3000);
+        let o = scan(&p, &[]);
+        let pids: Vec<i32> = o.iter().map(|o| o.key.pid).collect();
+        assert_eq!(pids, [22]);
+    }
+
+    #[test]
+    fn a_framework_python_parent_is_not_an_app() {
+        let p = base();
+        let python = "/Library/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python";
+        p.spawn(20, 10, 20, "python3 manage.py runserver", "/w");
+        p.set_exe(20, python);
+        listen(&p, 21, 20, "python3 manage.py runserver", python, 8000);
+        let o = scan(&p, &[]);
+        assert_eq!(o.len(), 1, "{o:?}");
+        assert_eq!(o[0].port, 8000);
+    }
+
+    #[test]
+    fn a_server_restarted_by_the_menu_bar_app_is_shown() {
+        // The app restarts an observed server as its own child; the app runs
+        // from its bundle, yet that server must stay visible.
+        let me = std::process::id() as i32;
+        for (app, own) in [(me, vec![]), (50, vec![50])] {
+            let p = base();
+            p.spawn(app, 1, 5, "Balance ton port", "/");
+            p.set_exe(
+                app,
+                "/Applications/Balance ton port.app/Contents/MacOS/Balance ton port",
+            );
+            listen(&p, 60, app, "node server.js", NODE, 3000);
+            let tracked = HashSet::new();
+            let o = observed_servers(&p, &p.listeners(), &tracked, &own, &cfg());
+            assert_eq!(o.len(), 1, "app {app}: {o:?}");
+            assert_eq!(o[0].key.pid, 60);
+        }
+    }
+
+    #[test]
+    fn a_reparented_helper_is_checked_again() {
+        let p = base();
+        p.spawn(20, 1, 20, "Raycast", "/");
+        p.set_exe(20, RAYCAST);
+        listen(&p, 21, 20, "Raycast Backend", BUNDLED_NODE, 7265);
+        let mut cache = SystemCache::default();
+        let tracked = HashSet::new();
+        let run = |cache: &mut SystemCache| {
+            observed_servers_cached(&p, &p.listeners(), &tracked, &[], &cfg(), cache)
+        };
+        assert!(run(&mut cache).is_empty());
+        // The app quit and launchd adopted the listener: now it is a stray
+        // listener of the user like any other.
+        p.remove_proc(20);
+        p.remove_proc(21);
+        p.spawn(21, 1, 21, "Raycast Backend", "/w");
+        p.set_exe(21, BUNDLED_NODE);
+        p.add_listener(21, 7265);
+        assert_eq!(run(&mut cache).len(), 1);
     }
 
     #[test]
@@ -315,7 +421,7 @@ mod tests {
             exclude_ports: vec![4000],
             ..Config::default()
         };
-        let o = observed_servers(&p, &p.listeners(), &tracked, &c);
+        let o = observed_servers(&p, &p.listeners(), &tracked, &[], &c);
         let excluded: Vec<(u16, bool)> = o.iter().map(|o| (o.port, o.excluded)).collect();
         assert_eq!(excluded, [(3000, false), (4000, true), (5432, true)]);
     }
@@ -327,7 +433,7 @@ mod tests {
         let mut cache = SystemCache::default();
         let tracked = HashSet::new();
         let run = |cache: &mut SystemCache| {
-            observed_servers_cached(&p, &p.listeners(), &tracked, &cfg(), cache)
+            observed_servers_cached(&p, &p.listeners(), &tracked, &[], &cfg(), cache)
         };
         assert_eq!(run(&mut cache).len(), 1);
         p.remove_proc(20);
