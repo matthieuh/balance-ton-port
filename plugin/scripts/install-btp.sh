@@ -120,8 +120,14 @@ if [ -n "$use_brew" ]; then
     fi
     exit 0
   fi
-  say "Homebrew could not install it ($(grep -v '^[[:space:]]*$' "$brew_err" | tail -n 1)); using the signed download instead"
+  brew_last="$(grep -v '^[[:space:]]*$' "$brew_err" | tail -n 1 || true)"
   rm -f "$brew_err"
+  detail=""
+  [ -z "$brew_last" ] || detail=" ($brew_last)"
+  if [ "$verb" = upgrade ]; then
+    refuse "Homebrew could not upgrade btp$detail; try brew upgrade $FORMULA"
+  fi
+  say "Homebrew could not install it$detail; using the signed download instead"
   if brew_owns_btp; then
     refuse "btp is installed with Homebrew; update it with brew upgrade $FORMULA"
   fi

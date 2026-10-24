@@ -389,9 +389,14 @@ cat >"$brewbin/brew" <<'BREWEOF'
 #!/bin/bash
 echo "$*" >>"$FAKE_BREW_LOG"
 case "${1:-}" in
-  list) exit "${FAKE_BREW_LIST:-1}" ;;
+  list)
+    # FAKE_BREW_LIST_LATER, when set, answers every call after the first.
+    n=$(($(grep -c '^list' "$FAKE_BREW_LOG")))
+    if [ "$n" -gt 1 ] && [ -n "${FAKE_BREW_LIST_LATER:-}" ]; then exit "$FAKE_BREW_LIST_LATER"; fi
+    exit "${FAKE_BREW_LIST:-1}"
+    ;;
   install | upgrade)
-    if [ "${FAKE_BREW_FAIL:-0}" != 0 ]; then
+    if [ "${FAKE_BREW_FAIL:-0}" != 0 ] && [ -z "${FAKE_BREW_QUIET:-}" ]; then
       printf 'Warning: noise\nError: formula exploded\n' >&2
     fi
     exit "${FAKE_BREW_FAIL:-0}"
@@ -556,7 +561,21 @@ check "brew failure says why with the last stderr line" grep -q "Homebrew could 
 check "brew failure: the download was verified" test -s "$rel/codesign.log"
 
 make_release "$v"
+FAKE_BREW_FAIL=2 FAKE_BREW_QUIET=1 brew_install
+check "brew failure with empty stderr: no empty parentheses" bash -c 'grep -q "Homebrew could not install it; using the signed download instead" <<<"$1" && ! grep -q "()" <<<"$1"' _ "$out"
+
+make_release "$v"
 FAKE_BREW_LIST=0 FAKE_BREW_FAIL=1 brew_install
+check "brew upgrade failure refuses directly" test "$code" != 0
+check "brew upgrade failure says why" grep -q "Homebrew could not upgrade btp (Error: formula exploded); try brew upgrade matthieuh/tap/btp" <<<"$out"
+check "brew upgrade failure: no download line, nothing fetched" bash -c '! grep -q "signed download" <<<"$1" && [ ! -e "$2/curl.log" ]' _ "$out" "$rel"
+
+make_release "$v"
+FAKE_BREW_LIST=0 FAKE_BREW_FAIL=2 FAKE_BREW_QUIET=1 brew_install
+check "brew upgrade failure with empty stderr: no empty parentheses" bash -c 'grep -q "Homebrew could not upgrade btp; try" <<<"$1"' _ "$out"
+
+make_release "$v"
+FAKE_BREW_LIST_LATER=0 FAKE_BREW_FAIL=1 brew_install
 check "download refuses when brew owns btp" test "$code" != 0 -a ! -e "$ihome/.local/bin/btp"
 check "download refuses: ... says why" grep -q "btp is installed with Homebrew; update it with brew upgrade matthieuh/tap/btp" <<<"$out"
 
