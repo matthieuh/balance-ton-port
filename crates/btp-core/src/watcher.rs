@@ -3501,11 +3501,9 @@ mod tests {
             f.p().add_listener(pid, 10_000 + i as u16);
         }
         // The tracked server is never looked up: it is in a tracked tree.
-        // The shell all 200 share as parent is read once (the app helper
-        // rule).
         f.w.tick(T0).unwrap();
         let first = f.p().exe_calls();
-        assert_eq!(first, 201);
+        assert_eq!(first, 200);
         let r = f.w.tick(T0 + 1000).unwrap();
         assert_eq!(r.observed.len(), 200);
         assert_eq!(f.p().exe_calls(), first, "no new process, no new read");

@@ -96,10 +96,16 @@ impl SystemCache {
     }
 }
 
+/// Started in `/`, or nowhere readable: an app's helper, not a project's
+/// server (an IDE's run button starts one in the project folder).
+fn outside_a_project(info: &ProcInfo) -> bool {
+    info.cwd.as_deref().is_none_or(|c| c == Path::new("/"))
+}
+
 /// The observed servers among `listeners`: every listener outside the
 /// tracked trees (`tracked_pids`) that is neither an agent CLI, nor a system
 /// process, nor the helper of an application (its direct parent runs from an
-/// app bundle), grouped under its topmost listening ancestor. Sorted by port.
+/// app bundle and it runs in `/` or an unreadable folder), grouped under its topmost listening ancestor. Sorted by port.
 /// A server whose parent is this process or one of `own_pids` (the menu bar
 /// app, which restarts observed servers) is shown.
 pub fn observed_servers(
@@ -146,7 +152,7 @@ pub fn observed_servers_cached(
         };
         if is_agent_cli(&info.command).is_some()
             || cache.is_system(p, &info)
-            || (!ours(info.ppid) && cache.has_app_parent(p, &info))
+            || (!ours(info.ppid) && outside_a_project(&info) && cache.has_app_parent(p, &info))
         {
             rejected.insert(l.pid);
             continue;
@@ -220,7 +226,20 @@ mod tests {
     }
 
     fn listen(p: &FakePlatform, pid: i32, ppid: i32, command: &str, exe: &str, port: u16) {
-        p.spawn(pid, ppid, pid as u64, command, "/w");
+        listen_in(p, pid, ppid, command, exe, port, "/w");
+    }
+
+    /// `listen` with the process's working directory.
+    fn listen_in(
+        p: &FakePlatform,
+        pid: i32,
+        ppid: i32,
+        command: &str,
+        exe: &str,
+        port: u16,
+        cwd: &str,
+    ) {
+        p.spawn(pid, ppid, pid as u64, command, cwd);
         p.set_exe(pid, exe);
         p.add_listener(pid, port);
     }
@@ -308,9 +327,14 @@ mod tests {
     #[test]
     fn a_system_parent_does_not_absorb_its_child() {
         let p = base();
-        // A daemon outside any app bundle: an app bundle parent would hide
-        // the child altogether (see `an_app_helper_is_hidden`).
-        listen(&p, 20, 10, "daemon", "/usr/libexec/daemon", 2375);
+        listen(
+            &p,
+            20,
+            10,
+            "Docker",
+            "/Applications/Docker.app/Contents/MacOS/x",
+            2375,
+        );
         listen(&p, 21, 20, "node app.js", NODE, 3000);
         let o = scan(&p, &[]);
         assert_eq!(o.len(), 1);
@@ -325,15 +349,49 @@ mod tests {
     fn an_app_helper_is_hidden() {
         let p = base();
         // The app itself (not listening) runs a bundled node outside the
-        // bundle: that helper listener is the app's, not a dev server.
+        // bundle, in `/`: that helper listener is the app's, not a dev server.
         p.spawn(20, 1, 20, "Raycast", "/");
         p.set_exe(20, RAYCAST);
-        listen(&p, 21, 20, "Raycast Backend", BUNDLED_NODE, 7265);
+        listen_in(&p, 21, 20, "Raycast Backend", BUNDLED_NODE, 7265, "/");
+        // No readable folder: a helper too.
+        p.add_proc(ProcInfo {
+            pid: 23,
+            ppid: 20,
+            start_time: 23,
+            cwd: None,
+            command: "Raycast Helper".into(),
+        });
+        p.set_exe(23, BUNDLED_NODE);
+        p.add_listener(23, 7266);
         // The same runtime started from a terminal is a dev server.
-        listen(&p, 22, 10, "node server.js", BUNDLED_NODE, 3000);
+        listen_in(&p, 22, 10, "node server.js", BUNDLED_NODE, 3000, "/");
         let o = scan(&p, &[]);
         let pids: Vec<i32> = o.iter().map(|o| o.key.pid).collect();
         assert_eq!(pids, [22]);
+    }
+
+    #[test]
+    fn a_server_an_app_starts_in_a_project_is_shown() {
+        // An IDE's run button: the IDE (in its bundle) execs node directly,
+        // in the project folder.
+        let p = base();
+        p.spawn(20, 1, 20, "Code", "/");
+        p.set_exe(
+            20,
+            "/Applications/Visual Studio Code.app/Contents/MacOS/Electron",
+        );
+        listen_in(
+            &p,
+            21,
+            20,
+            "node server.js",
+            NODE,
+            3000,
+            "/Users/me/trees/web",
+        );
+        let o = scan(&p, &[]);
+        assert_eq!(o.len(), 1, "{o:?}");
+        assert_eq!(o[0].key.pid, 21);
     }
 
     #[test]
@@ -342,7 +400,7 @@ mod tests {
         let python = "/Library/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python";
         p.spawn(20, 10, 20, "python3 manage.py runserver", "/w");
         p.set_exe(20, python);
-        listen(&p, 21, 20, "python3 manage.py runserver", python, 8000);
+        listen_in(&p, 21, 20, "python3 manage.py runserver", python, 8000, "/");
         let o = scan(&p, &[]);
         assert_eq!(o.len(), 1, "{o:?}");
         assert_eq!(o[0].port, 8000);
@@ -360,7 +418,7 @@ mod tests {
                 app,
                 "/Applications/Balance ton port.app/Contents/MacOS/Balance ton port",
             );
-            listen(&p, 60, app, "node server.js", NODE, 3000);
+            listen_in(&p, 60, app, "node server.js", NODE, 3000, "/");
             let tracked = HashSet::new();
             let o = observed_servers(&p, &p.listeners(), &tracked, &own, &cfg());
             assert_eq!(o.len(), 1, "app {app}: {o:?}");
@@ -373,7 +431,7 @@ mod tests {
         let p = base();
         p.spawn(20, 1, 20, "Raycast", "/");
         p.set_exe(20, RAYCAST);
-        listen(&p, 21, 20, "Raycast Backend", BUNDLED_NODE, 7265);
+        listen_in(&p, 21, 20, "Raycast Backend", BUNDLED_NODE, 7265, "/");
         let mut cache = SystemCache::default();
         let tracked = HashSet::new();
         let run = |cache: &mut SystemCache| {
@@ -384,7 +442,7 @@ mod tests {
         // listener of the user like any other.
         p.remove_proc(20);
         p.remove_proc(21);
-        p.spawn(21, 1, 21, "Raycast Backend", "/w");
+        p.spawn(21, 1, 21, "Raycast Backend", "/");
         p.set_exe(21, BUNDLED_NODE);
         p.add_listener(21, 7265);
         assert_eq!(run(&mut cache).len(), 1);
