@@ -20,3 +20,25 @@ bundle_version_increases() {
 appcast_version() {
   sed -n 's|.*<sparkle:version>\([0-9]*\)</sparkle:version>.*|\1|p' "$1" | head -1
 }
+
+# previous_feed_version HTTP_CODE FILE: the version published in the fetched feed.
+# A 404 means no feed yet (prints nothing, succeeds); a 200 must carry a
+# sparkle:version; any other answer fails.
+previous_feed_version() {
+  local code="$1" file="$2" version
+  case "$code" in
+    404) return 0 ;;
+    200)
+      version="$(appcast_version "$file")"
+      if [ -z "$version" ]; then
+        echo "::error::published appcast has no sparkle:version" >&2
+        return 1
+      fi
+      echo "$version"
+      ;;
+    *)
+      echo "::error::fetching the published appcast returned HTTP $code" >&2
+      return 1
+      ;;
+  esac
+}

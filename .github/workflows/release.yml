@@ -215,12 +215,8 @@ jobs:
           FEED="$RUNNER_TEMP/feed.xml"
           FEED_URL="https://github.com/$GITHUB_REPOSITORY/releases/latest/download/appcast.xml"
           CODE="$(curl -sSL -o "$FEED" -w '%{http_code}' "$FEED_URL")"
-          PREVIOUS=""
-          case "$CODE" in
-            200) PREVIOUS="$(appcast_version "$FEED")" ;;
-            404) echo "no published appcast yet, first Sparkle release" ;;
-            *) echo "::error::fetching $FEED_URL returned HTTP $CODE"; exit 1 ;;
-          esac
+          # A 404 is the first Sparkle release; an unreadable feed fails the release.
+          PREVIOUS="$(previous_feed_version "$CODE" "$FEED")"
           if ! bundle_version_increases "$BUNDLE" "$PREVIOUS"; then
             echo "::error::CFBundleVersion $BUNDLE is not above the published $PREVIOUS"
             exit 1
@@ -231,11 +227,13 @@ jobs:
           curl -fsSL -o "$TOOLS/Sparkle.tar.xz" \
             "https://github.com/sparkle-project/Sparkle/releases/download/$SPARKLE_VERSION/Sparkle-$SPARKLE_VERSION.tar.xz"
           echo "$SPARKLE_SHA256  $TOOLS/Sparkle.tar.xz" | shasum -a 256 -c -
-          tar -xJf "$TOOLS/Sparkle.tar.xz" -C "$TOOLS" ./bin/sign_update
+          tar -xJf "$TOOLS/Sparkle.tar.xz" -C "$TOOLS"
+          SIGN_UPDATE="$TOOLS/bin/sign_update"
+          test -x "$SIGN_UPDATE" || { echo "::error::bin/sign_update missing from the Sparkle tarball"; exit 1; }
           # The key never reaches a log; the cleanup step removes the file.
           (umask 077 && printf '%s' "$SPARKLE_ED_PRIVATE_KEY" > "$RUNNER_TEMP/sparkle.key")
           DMG_PATH="$DIST/$APP_DMG"
-          SIGNATURE="$("$TOOLS/bin/sign_update" --ed-key-file "$RUNNER_TEMP/sparkle.key" -p "$DMG_PATH")"
+          SIGNATURE="$("$SIGN_UPDATE" --ed-key-file "$RUNNER_TEMP/sparkle.key" -p "$DMG_PATH")"
           LENGTH="$(stat -f%z "$DMG_PATH")"
           "$GITHUB_WORKSPACE/scripts/render-appcast.sh" "$VERSION" "$BUNDLE" "$APP_DMG" \
             "$LENGTH" "$SIGNATURE" "$(LC_ALL=C date -u '+%a, %d %b %Y %H:%M:%S +0000')" "$DIST/appcast.xml"
