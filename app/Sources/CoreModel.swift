@@ -291,7 +291,8 @@ final class CoreModel: ObservableObject {
         }
     }
 
-    /// Postpone 1 h: the row says `stops in 60 min` at once.
+    /// Postpone 1 h: the row says `stops in 60 min` at once (`postponedView`),
+    /// then `stops in 1 h` from the next pass, as the core words 60 minutes.
     func postpone(_ server: ServerViewFfi) {
         let id = server.id
         applyOptimistic(id, postponedView)

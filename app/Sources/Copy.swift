@@ -94,6 +94,11 @@ func statusText(_ s: StatusFfi, bundle: Bundle = copyBundle, locale: Locale = co
         guard let reason = s.reason, !reason.isEmpty else { return L("kept by \(agent)", bundle, locale) }
         return L("kept by \(agent): \"\(reason)\"", bundle, locale)
     case "kept_by_user": return L("kept by you", bundle, locale)
+    case "stops_in_min":
+        // The row right after Postpone 1 h (`postponedView`): the minutes as
+        // counted, `stops in 60 min`, until the next pass words it from the
+        // core's own figure.
+        return L("stops in \(minutes(Int(clamping: s.minutes), bundle: bundle, locale: locale))", bundle, locale)
     case "stops_in":
         return L("stops in \(durationText(minutes: s.minutes, bundle: bundle, locale: locale))", bundle, locale)
     case "excluded": return L("excluded", bundle, locale)
@@ -516,7 +521,7 @@ func sessionEndedBody(
         names = L("\(names) and \(g.servers.count - 4) more", bundle, locale)
     }
     let servers = headerCount(g.servers.count, bundle: bundle, locale: locale)
-    let delay = durationText(ms: g.deadIdleS.multipliedReportingOverflow(by: 1000).partialValue, bundle: bundle, locale: locale)
+    let delay = durationText(ms: g.deadIdleS.multipliedReportingOverflow(by: 1000).overflow ? UInt64.max : g.deadIdleS * 1000, bundle: bundle, locale: locale)
     return L(
         "Session ended: \(servers) kept running: \(names). Stopped after \(delay) unused, once no session works in that folder.",
         bundle, locale

@@ -322,7 +322,7 @@ func postponedView(_ s: ServerViewFfi) -> ServerViewFfi {
     v.killInMs = 3_600_000
     v.postponed = true
     v.statusText = "stops in 60 min"
-    v.status = StatusFfi(kind: "stops_in", minutes: 60, agentLabel: "", reason: nil)
+    v.status = StatusFfi(kind: "stops_in_min", minutes: 60, agentLabel: "", reason: nil)
     if v.card?.kind == "about_to_stop" { v.card = nil }
     return v
 }
@@ -737,7 +737,7 @@ func notificationSettingsURLs(bundleID: String) -> [URL] {
 }
 
 /// The test notification's userInfo: no pid nor start time, so
-/// `serverID(fromUserInfo:)` finds no server and its Kill and Keep do nothing.
+/// `serverID(fromUserInfo:)` finds no server and its Stop and Keep do nothing.
 func sampleNotificationUserInfo() -> [String: Any] {
     ["sample": true]
 }
