@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+  <channel>
+    <title>Balance ton port</title>
+    <item>
+      <title>Version 1.2.3</title>
+      <pubDate>Fri, 23 Oct 2026 10:00:00 +0000</pubDate>
+      <sparkle:version>8</sparkle:version>
+      <sparkle:shortVersionString>1.2.3</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <enclosure url="https://github.com/matthieuh/balance-ton-port/releases/download/v1.2.3/BalanceTonPort-1.2.3.dmg" length="4567890" type="application/octet-stream" sparkle:edSignature="QUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDAA=="/>
+    </item>
+  </channel>
+</rss>

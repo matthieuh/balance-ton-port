@@ -14,10 +14,11 @@ Settings > Secrets and variables > Actions, or `gh secret set NAME`:
 | `APPLE_ID` | The Apple ID email of a member of that team, used by `notarytool` | |
 | `APPLE_APP_PASSWORD` | An app-specific password for that Apple ID | account.apple.com, Sign-In and Security, App-Specific Passwords, generate one named for example `btp-notarytool` |
 | `HOMEBREW_TAP_TOKEN` | A fine-grained personal access token that lets the release push to `matthieuh/homebrew-tap` | github.com/settings/personal-access-tokens, repository access: only `matthieuh/homebrew-tap`, permission Contents: read and write. Then `gh secret set HOMEBREW_TAP_TOKEN -R matthieuh/balance-ton-port`. It expires on 2027-10-24: before then, create a new token the same way and set the secret again |
+| `SPARKLE_ED_PRIVATE_KEY` | The EdDSA private key that signs every update dmg (the public half is `SUPublicEDKey` in `app/project.yml`) | Exported with Sparkle's `generate_keys -x <file>` and set with `gh secret set SPARKLE_ED_PRIVATE_KEY < <file>`. Keep a backup in the password manager and delete the exported file. If the key is lost, installed apps reject every future update signed with another key: users must reinstall by hand |
 
 ### Cutting a release
 
-1. Bump the version in `crates/btp-cli/Cargo.toml` and in `app/project.yml` (`CFBundleShortVersionString`, also bump `CFBundleVersion`), then `(cd app && xcodegen generate)` to refresh `app/Info.plist`, and commit. The release fails if the tag does not match both.
+1. Bump the version in `crates/btp-cli/Cargo.toml` and in `app/project.yml` (`CFBundleShortVersionString`; `CFBundleVersion` must also increase on every final release, the release fails otherwise because Sparkle only offers a higher build number), then `(cd app && xcodegen generate)` to refresh `app/Info.plist`, and commit. The release fails if the tag does not match both.
 2. Tag and push:
 
    ```bash
