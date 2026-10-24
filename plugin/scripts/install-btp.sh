@@ -3,9 +3,12 @@
 #
 #   install-btp.sh [--data-dir DIR] [--clear-decline]
 #
-# Downloads the latest GitHub release of btp, checks its sha256 and its
-# Developer ID signature (Apple's chain, team 47P2KJ2HF3), and installs it
-# to ~/.local/bin/btp. Refuses on any mismatch. Never uses sudo. Replaces
+# With Homebrew on PATH it installs (or upgrades) matthieuh/tap/btp instead,
+# and removes the copy this script put in ~/.local/bin earlier. BTP_NO_BREW=1
+# skips Homebrew. Otherwise, or when brew fails, it downloads the latest
+# GitHub release of btp, checks its sha256 and its Developer ID signature
+# (Apple's chain, team 47P2KJ2HF3), and installs it to ~/.local/bin/btp.
+# Refuses on any mismatch. Never uses sudo. Replaces
 # only a btp this script installed (a marker next to it holds its sha256).
 #
 # --data-dir is the plugin's data dir. A release refused as too old is
@@ -90,6 +93,39 @@ dest="$dest_dir/btp"
 marker="$dest_dir/$BTP_MARKER_NAME"
 
 sha256_of() { shasum -a 256 "$1" | cut -d' ' -f1; }
+
+FORMULA="matthieuh/tap/btp"
+use_brew=""
+if [ -z "${BTP_NO_BREW:-}" ] && command -v brew >/dev/null 2>&1; then
+  use_brew=1
+fi
+brew_owns_btp() { brew list --formula "$FORMULA" >/dev/null 2>&1; }
+
+if [ -n "$use_brew" ]; then
+  if brew_owns_btp; then verb=upgrade; else verb=install; fi
+  brew_err="$(mktemp "${TMPDIR:-/tmp}/btp-brew.XXXXXX")"
+  say "brew $verb $FORMULA"
+  if brew "$verb" "$FORMULA" 2>"$brew_err"; then
+    rm -f "$brew_err"
+    # The copy this script installed is superseded; one it did not install stays.
+    if [ -f "$dest" ] && [ ! -L "$dest" ] && [ -f "$marker" ] && [ "$(cat "$marker")" = "$(sha256_of "$dest")" ]; then
+      rm -f "$dest" "$marker"
+      say "removed the copy this plugin installed in ~/.local/bin; Homebrew's btp is used now"
+    fi
+    forget install-declined install-refused
+    say "installed btp with Homebrew ($FORMULA)"
+    first="$(command -v btp 2>/dev/null || true)"
+    if [ -n "$first" ] && [ "$first" = "$dest" ]; then
+      say "note: another btp comes first on your PATH: $first"
+    fi
+    exit 0
+  fi
+  say "Homebrew could not install it ($(grep -v '^[[:space:]]*$' "$brew_err" | tail -n 1)); using the signed download instead"
+  rm -f "$brew_err"
+  if brew_owns_btp; then
+    refuse "btp is installed with Homebrew; update it with brew upgrade $FORMULA"
+  fi
+fi
 
 # Only a btp this script installed, unchanged since, may be replaced.
 if [ -L "$dest" ]; then
