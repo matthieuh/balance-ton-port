@@ -61,9 +61,8 @@ final class CoreModel: ObservableObject {
     private var passCount = 0
     /// Restarts running, with the row as it was: it stays in the menu, saying
     /// "restarting…", even when a pass taken meanwhile no longer lists the
-    /// old process. `doneAt` is `passCount` when the core returned; the first
-    /// pass enqueued after that lets it go.
-    private var restarts: [ServerID: (row: ServerViewFfi, doneAt: Int?)] = [:] {
+    /// old process, until a pass lists the new one (`releasesRestart`).
+    private var restarts: [ServerID: HeldRestart] = [:] {
         didSet { restartingIDs = Set(restarts.keys) }
     }
     /// The servers being restarted: their Stop and Restart are disabled.
@@ -213,8 +212,8 @@ final class CoreModel: ObservableObject {
     /// "restarting…" at once; the core call blocks for the kill grace plus
     /// up to 5 s, on the action queue, while passes go on. A refused Restart
     /// (`Already restarting` included) shows its reason in the row for
-    /// `blockedNoteDuration`; a done one keeps the row until the next pass,
-    /// which lists the new process instead.
+    /// `blockedNoteDuration`; a done one keeps the row until a pass lists
+    /// the new process instead (it may take a while to listen).
     func restart(_ server: ServerViewFfi) {
         guard canRestartNow(server, restarting: isRestarting(server.id)) else { return }
         guard needsConfirmation(server) else {
@@ -255,8 +254,9 @@ final class CoreModel: ObservableObject {
         let id = server.id
         // Checked again here: a confirmation may have waited on screen.
         guard !isRestarting(id) else { return }
-        restarts[id] = (server, nil)
+        restarts[id] = HeldRestart(row: server)
         rowNotes[id] = .restarting
+        publish()
         Task {
             do {
                 let blocked = try await onActionQueue { core in
@@ -267,7 +267,7 @@ final class CoreModel: ObservableObject {
                     showBlocked(blocked, for: id)
                     publish()
                 } else {
-                    restarts[id]?.doneAt = passCount
+                    restarts[id]?.done = (passCount, Date())
                 }
             } catch {
                 restarts[id] = nil
@@ -384,9 +384,7 @@ final class CoreModel: ObservableObject {
     /// The rows the menu shows: the last pass, without the servers stopped
     /// by hand, with the changes the core has not confirmed yet.
     private func publish() {
-        let listed = Set(lastPassServers.map(\.id))
-        let held = restarts.filter { !listed.contains($0.key) }.map(\.value.row)
-        servers = (lastPassServers + held)
+        servers = withHeldRestarts(lastPassServers, held: Array(restarts.values))
             .filter { killedByHand[$0.id] == nil }
             .map { optimistic[$0.id]?.apply($0) ?? $0 }
     }
@@ -484,7 +482,7 @@ final class CoreModel: ObservableObject {
             // This pass was enqueued after those actions: it shows them.
             optimistic = optimistic.filter { $0.value.since >= generation }
             for (id, restart) in restarts {
-                if let done = restart.doneAt, generation > done {
+                if releasesRestart(restart, generation: generation, now: now, servers: result.servers) {
                     restarts[id] = nil
                     if rowNotes[id] == .restarting { rowNotes[id] = nil }
                 }

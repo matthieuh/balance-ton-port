@@ -1135,3 +1135,78 @@ final class DetailTests: XCTestCase {
         }
     }
 }
+
+final class RestartHoldTests: XCTestCase {
+    private let t0 = Date(timeIntervalSince1970: 1_700_000_000)
+
+    /// The card being restarted, and the process its Restart started.
+    private func pair() -> (old: ServerViewFfi, new: ServerViewFfi) {
+        let old = menuServer(port: 3000, card: "idle_alert")
+        var new = menuServer(port: 3000)
+        new.pid = 9001
+        new.startTime = old.startTime + 1
+        return (old, new)
+    }
+
+    /// The menu's rows after a pass, the way `CoreModel.pass` applies it.
+    private func land(
+        _ held: inout [ServerID: HeldRestart], generation: Int, at now: Date, servers: [ServerViewFfi]
+    ) -> [ServerViewFfi] {
+        for (id, h) in held where releasesRestart(h, generation: generation, now: now, servers: servers) {
+            held[id] = nil
+        }
+        return withHeldRestarts(servers, held: Array(held.values))
+    }
+
+    /// The manual check: the core returns as soon as the new process is
+    /// started, and the next pass does not list it yet (it is not listening),
+    /// so the row must stay, card and all, until a pass lists the new one.
+    func testTheRowStaysUntilThePassThatListsTheNewProcess() {
+        let (old, new) = pair()
+        var held: [ServerID: HeldRestart] = [old.id: HeldRestart(row: old)]
+        // A pass while the core call blocks: the old process is gone.
+        var rows = land(&held, generation: 2, at: t0, servers: [])
+        XCTAssertEqual(rows.map(\.id), [old.id])
+        XCTAssertNotNil(menuSections(rows).needsYou.first?.card, "still a card")
+        // The core returned during pass 2.
+        held[old.id]?.done = (2, t0.addingTimeInterval(1))
+        rows = land(&held, generation: 3, at: t0.addingTimeInterval(5), servers: [])
+        XCTAssertEqual(rows.map(\.id), [old.id], "the new process does not listen yet")
+        rows = land(&held, generation: 4, at: t0.addingTimeInterval(10), servers: [new])
+        XCTAssertEqual(rows.map(\.id), [new.id], "replaced, not doubled")
+        XCTAssertTrue(held.isEmpty)
+    }
+
+    func testAPassEnqueuedBeforeTheCoreReturnedNeverReleases() {
+        let (old, new) = pair()
+        let h = HeldRestart(row: old, done: (5, t0))
+        XCTAssertFalse(releasesRestart(h, generation: 5, now: t0.addingTimeInterval(999), servers: [new]))
+        XCTAssertFalse(releasesRestart(HeldRestart(row: old), generation: 9, now: t0, servers: [new]))
+        XCTAssertTrue(releasesRestart(h, generation: 6, now: t0, servers: [new]))
+    }
+
+    func testANewProcessThatNeverListensLetsGoAfterTheLimit() {
+        let (old, _) = pair()
+        let h = HeldRestart(row: old, done: (1, t0))
+        XCTAssertFalse(releasesRestart(h, generation: 2, now: t0.addingTimeInterval(restartHoldLimit - 1), servers: []))
+        XCTAssertTrue(releasesRestart(h, generation: 2, now: t0.addingTimeInterval(restartHoldLimit), servers: []))
+    }
+
+    func testReplacementIsAnotherProcessOnThePortOrTheSameCommandInTheFolder() {
+        let (old, new) = pair()
+        XCTAssertTrue(isReplacement(new, of: old))
+        XCTAssertFalse(isReplacement(old, of: old), "the old process itself")
+        var moved = new
+        moved.port = 3001
+        XCTAssertTrue(isReplacement(moved, of: old), "same command, same folder")
+        var other = menuServer(port: 4000, worktree: "api")
+        other.command = "node api.js"
+        XCTAssertFalse(isReplacement(other, of: old))
+    }
+
+    func testAListedRowIsNotDoubled() {
+        let (old, _) = pair()
+        let rows = withHeldRestarts([old], held: [HeldRestart(row: old)])
+        XCTAssertEqual(rows.map(\.id), [old.id])
+    }
+}

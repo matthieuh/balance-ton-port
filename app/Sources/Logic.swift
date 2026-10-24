@@ -421,6 +421,41 @@ func rowNoteText(_ note: RowNote) -> String {
     }
 }
 
+/// A Restart running or just done, with the row as it was. The core
+/// returns once the new process is started, not once it listens, so the row
+/// is held, saying "restarting…", until a pass lists its replacement.
+struct HeldRestart: Sendable {
+    let row: ServerViewFfi
+    /// The pass count and time when the core returned; `nil` while it runs.
+    var done: (pass: Int, at: Date)?
+}
+
+/// How long a done Restart's row waits for its replacement (a new process
+/// that never listens, or one the core no longer links).
+let restartHoldLimit: TimeInterval = 60
+
+/// Whether `server` is the process a Restart of `row` started: another
+/// process on the same port, or with the same command in the same folder.
+func isReplacement(_ server: ServerViewFfi, of row: ServerViewFfi) -> Bool {
+    server.id != row.id
+        && (server.port == row.port || (server.command == row.command && server.worktree == row.worktree))
+}
+
+/// Whether the pass `generation`, landing at `now` with `servers`, lets a
+/// held Restart row go: only a pass enqueued after the core returned, once
+/// it lists the replacement or `restartHoldLimit` passed.
+func releasesRestart(_ held: HeldRestart, generation: Int, now: Date, servers: [ServerViewFfi]) -> Bool {
+    guard let done = held.done, generation > done.pass else { return false }
+    return servers.contains { isReplacement($0, of: held.row) }
+        || now.timeIntervalSince(done.at) >= restartHoldLimit
+}
+
+/// The pass's rows plus the held Restart rows it no longer lists.
+func withHeldRestarts(_ servers: [ServerViewFfi], held: [HeldRestart]) -> [ServerViewFfi] {
+    let listed = Set(servers.map(\.id))
+    return servers + held.map(\.row).filter { !listed.contains($0.id) }
+}
+
 /// The row right after "Postpone 1 h", until the next pass: one hour left,
 /// and no "about to stop" card any more.
 func postponedView(_ s: ServerViewFfi) -> ServerViewFfi {
