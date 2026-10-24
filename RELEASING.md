@@ -13,6 +13,7 @@ Settings > Secrets and variables > Actions, or `gh secret set NAME`:
 | `APPLE_TEAM_ID` | The 10 character team id of HAPPYSOLVERS SAS | developer.apple.com/account, Membership details, or the `(XXXXXXXXXX)` suffix of the certificate name |
 | `APPLE_ID` | The Apple ID email of a member of that team, used by `notarytool` | |
 | `APPLE_APP_PASSWORD` | An app-specific password for that Apple ID | account.apple.com, Sign-In and Security, App-Specific Passwords, generate one named for example `btp-notarytool` |
+| `HOMEBREW_TAP_TOKEN` | A fine-grained personal access token that lets the release push to `matthieuh/homebrew-tap` | github.com/settings/personal-access-tokens, repository access: only `matthieuh/homebrew-tap`, permission Contents: read and write. Then `gh secret set HOMEBREW_TAP_TOKEN -R matthieuh/balance-ton-port`. It expires on 2027-10-24: before then, create a new token the same way and set the secret again |
 
 ### Cutting a release
 
@@ -33,7 +34,9 @@ The plugin (`plugin/`) is installed from the repo's default branch, not from a r
 
 ### Publishing to Homebrew
 
-The tap lives in `matthieuh/homebrew-tap` (a public repo with that exact name, so `brew` finds it as `matthieuh/tap`). The templates are in `packaging/homebrew/`; each release attaches them already filled with its version and sha256 (`scripts/render-homebrew.sh` does it):
+The tap lives in `matthieuh/homebrew-tap` (a public repo with that exact name, so `brew` finds it as `matthieuh/tap`). The templates are in `packaging/homebrew/`; `scripts/render-homebrew.sh` fills them with the release's version and sha256, and each release attaches the result.
+
+For a final release (no hyphen in the tag) the "Update Homebrew tap" step of the release workflow commits `Formula/btp.rb` and `Casks/balance-ton-port.rb` to the tap's default branch with the `HOMEBREW_TAP_TOKEN` secret. A prerelease tag leaves the tap untouched. If that step fails after the release is published (an expired token, for instance), fix the cause and rerun only that job from the Actions page, or do it by hand, which stays the fallback:
 
 ```bash
 gh release download v0.1.0 -R matthieuh/balance-ton-port -p btp.rb -p balance-ton-port.rb
