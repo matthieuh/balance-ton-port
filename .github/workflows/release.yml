@@ -119,8 +119,24 @@ jobs:
           codesign --force --options runtime --timestamp \
             --keychain "$KEYCHAIN" --sign "$IDENTITY" \
             --identifier com.matthieuh.btp "$DIST/btp"
-          # No nested code in the bundle (the Rust core is a static library),
-          # so one signature covers it; no entitlements are needed.
+          # Sparkle's nested code is signed inside out, then the framework, then the
+          # app (never --deep when signing); the app is not sandboxed, so the XPC
+          # services and helpers take no entitlements. Downloader.xpc is only there
+          # for sandboxed apps, so it is signed if the package ships it.
+          SPARKLE="$DIST/$APP_NAME.app/Contents/Frameworks/Sparkle.framework"
+          for nested in \
+            "$SPARKLE/Versions/B/XPCServices/Installer.xpc" \
+            "$SPARKLE/Versions/B/XPCServices/Downloader.xpc" \
+            "$SPARKLE/Versions/B/Autoupdate" \
+            "$SPARKLE/Versions/B/Updater.app" \
+            "$SPARKLE"; do
+            if [ -e "$nested" ]; then
+              codesign --force --options runtime --timestamp \
+                --keychain "$KEYCHAIN" --sign "$IDENTITY" "$nested"
+            elif [ "${nested##*/}" != "Downloader.xpc" ]; then
+              echo "::error::missing $nested"; exit 1
+            fi
+          done
           codesign --force --options runtime --timestamp \
             --keychain "$KEYCHAIN" --sign "$IDENTITY" "$DIST/$APP_NAME.app"
           codesign --verify --strict --verbose=2 "$DIST/btp"

@@ -14,6 +14,10 @@ settings:
     SWIFT_VERSION: "6.0"
     SWIFT_STRICT_CONCURRENCY: complete
     MACOSX_DEPLOYMENT_TARGET: "14.0"
+packages:
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    exactVersion: 2.10.0
 targets:
   BalanceTonPort:
     type: application
@@ -24,6 +28,7 @@ targets:
     dependencies:
       - framework: Frameworks/BtpCore.xcframework
         embed: false
+      - package: Sparkle
     info:
       path: Info.plist
       properties:
@@ -34,6 +39,12 @@ targets:
         LSUIElement: true
         LSMinimumSystemVersion: "14.0"
         NSHumanReadableCopyright: ""
+        SUFeedURL: https://github.com/matthieuh/balance-ton-port/releases/latest/download/appcast.xml
+        SUPublicEDKey: GMOe9MiovBuX8INutMlSoqZFrBeHWKR2tg2RH2rb8yE=
+        SUEnableAutomaticChecks: true
+        SUScheduledCheckInterval: 86400
+        SUAutomaticallyUpdate: true
+        SUEnableSystemProfiling: false
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.matthieuh.balancetonport
@@ -52,10 +63,12 @@ targets:
       - path: Tests
       - path: Sources/Logic.swift
       - path: Sources/Menu/MenuStyle.swift
+      - path: Sources/Updates.swift
       - path: Sources/Generated
     dependencies:
       - framework: Frameworks/BtpCore.xcframework
         embed: false
+      - package: Sparkle
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.matthieuh.balancetonport.tests

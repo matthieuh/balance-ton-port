@@ -26,5 +26,17 @@
 	<true/>
 	<key>NSHumanReadableCopyright</key>
 	<string></string>
+	<key>SUAutomaticallyUpdate</key>
+	<true/>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUEnableSystemProfiling</key>
+	<false/>
+	<key>SUFeedURL</key>
+	<string>https://github.com/matthieuh/balance-ton-port/releases/latest/download/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>GMOe9MiovBuX8INutMlSoqZFrBeHWKR2tg2RH2rb8yE=</string>
+	<key>SUScheduledCheckInterval</key>
+	<integer>86400</integer>
 </dict>
 </plist>
