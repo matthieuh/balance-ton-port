@@ -125,5 +125,28 @@ check "appcast_version ignores later items" bash -c \
   '. "$1" && [ "$(appcast_version "$2")" = "8" ]' _ "$lib" "$two"
 check "appcast: fixture is well-formed XML" xmllint --noout "$repo/scripts/fixtures/appcast-expected.xml"
 
+# previous_feed_version HTTP_CODE FILE: the published version, or empty on a 404.
+pfv() { bash -c '. "$1" && previous_feed_version "$2" "$3"' _ "$lib" "$@" 2>/dev/null; }
+check "previous_feed_version: 404 is empty and ok" bash -c \
+  'out="$("$@" 2>/dev/null)" && [ -z "$out" ]' _ bash -c '. "$1" && previous_feed_version 404 "$2"' _ "$lib" "$work/none.xml"
+check "previous_feed_version: 200 gives the version" bash -c \
+  '[ "$("$@")" = "8" ]' _ bash -c '. "$1" && previous_feed_version 200 "$2"' _ "$lib" "$work/appcast/appcast.xml"
+printf '<html>not a feed</html>\n' >"$work/page.html"
+printf '<sparkle:version>abc</sparkle:version>\n' >"$work/nonnum.xml"
+for f in "$work/page.html" "$work/nonnum.xml" "$work/none.xml"; do
+  if pfv 200 "$f" >/dev/null; then
+    ko "previous_feed_version: 200 without a version fails ($(basename "$f"))"
+  else
+    ok "previous_feed_version: 200 without a version fails ($(basename "$f"))"
+  fi
+done
+for code in 500 403 000; do
+  if pfv "$code" "$work/appcast/appcast.xml" >/dev/null; then
+    ko "previous_feed_version: HTTP $code fails"
+  else
+    ok "previous_feed_version: HTTP $code fails"
+  fi
+done
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
