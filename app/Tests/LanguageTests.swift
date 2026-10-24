@@ -59,13 +59,18 @@ final class LanguageTests: XCTestCase {
     @MainActor
     func testMissingLanguageFallsBackToEnglish() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("btp-lang-\(UUID().uuidString)")
+        let suite = "btp-lang-\(UUID().uuidString)"
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: dir)
+            UserDefaults().removePersistentDomain(forName: suite)
+        }
         let tables = ["en": ["Language": "Language", "About": "About"], "fr": ["Language": "Langue", "About": "À propos"]]
         for (code, table) in tables {
             let lproj = dir.appendingPathComponent("\(code).lproj")
             try FileManager.default.createDirectory(at: lproj, withIntermediateDirectories: true)
             try (table as NSDictionary).write(to: lproj.appendingPathComponent("Localizable.strings"))
         }
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: "btp-lang-\(UUID().uuidString)"))
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         let model = LanguageModel(defaults: defaults, base: try XCTUnwrap(Bundle(path: dir.path)))
         model.choice = .ja
         XCTAssertEqual(model.tr("Language"), "Language")
