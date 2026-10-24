@@ -53,6 +53,19 @@ must keep the state `needs_review` in the catalog.
 `CatalogTests` (in `app/Tests`) checks the placeholders, the technical parts,
 the plural forms and the em dash.
 
+### To verify on a Mac in that language
+
+These name macOS controls and were written without a Mac set to the language:
+
+- Ukrainian: `Елементи входу` (Login Items), `Попередження` (the Alerts
+  notification style), `Системні параметри` (System Settings).
+- Hebrew: `פריטי התחברות` (Login Items), `אפשר עדכונים` (the Allow
+  notifications switch), `באנרים` and `התראות` (the Banners and Alerts
+  notification styles; macOS may name the Alerts style differently, since it
+  calls notifications `עדכונים`).
+- Spanish: `Ítems de inicio de sesión`. French: `Ouverture`. German: `Hinweise`
+  (Alerts style). Japanese: `通知パネル` (Alerts style).
+
 ## How to review a language
 
 1. Open `app/Sources/Localizable.xcstrings` in Xcode and pick the language in

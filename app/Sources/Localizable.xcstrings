@@ -1686,7 +1686,7 @@
         "he": {
           "stringUnit": {
             "state": "needs_review",
-            "value": "נשמר על ידך"
+            "value": "נשמר על ידיכם"
           }
         },
         "ja": {
@@ -2368,7 +2368,7 @@
         "ja": {
           "stringUnit": {
             "state": "needs_review",
-            "value": "セッション終了 · %@後に終了"
+            "value": "セッション終了 · %@後に停止"
           }
         },
         "uk": {
@@ -2628,7 +2628,7 @@
         "ja": {
           "stringUnit": {
             "state": "needs_review",
-            "value": "まもなく終了"
+            "value": "まもなく停止"
           }
         },
         "uk": {
@@ -2680,7 +2680,7 @@
         "ja": {
           "stringUnit": {
             "state": "needs_review",
-            "value": "%@後に終了"
+            "value": "%@後に停止"
           }
         },
         "uk": {
@@ -3320,7 +3320,7 @@
         "de": {
           "stringUnit": {
             "state": "needs_review",
-            "value": "Sitzung beendet + inaktiv %@"
+            "value": "Sitzung beendet + inaktiv seit %@"
           }
         },
         "en": {
@@ -3332,7 +3332,7 @@
         "es": {
           "stringUnit": {
             "state": "needs_review",
-            "value": "sesión terminada + inactivo %@"
+            "value": "sesión terminada + inactivo desde hace %@"
           }
         },
         "fr": {
@@ -5578,7 +5578,7 @@
         "he": {
           "stringUnit": {
             "state": "needs_review",
-            "value": "נשמר על ידך. ללא התראות."
+            "value": "נשמר על ידיכם. ללא התראות."
           }
         },
         "ja": {
@@ -6472,7 +6472,7 @@
         "uk": {
           "stringUnit": {
             "state": "needs_review",
-            "value": "Сеанс завершено: досі працюють %@: %@. Зупинка після %@ без використання, коли в цій папці не залишиться жодного сеансу."
+            "value": "Сеанс завершено: досі запущено %@: %@. Зупинка після %@ без використання, коли в цій папці не залишиться жодного сеансу."
           }
         },
         "zh-Hans": {
@@ -7032,7 +7032,7 @@
         "he": {
           "stringUnit": {
             "state": "needs_review",
-            "value": "הפעילו את \"אפשר התראות\" וחזרו לכאן."
+            "value": "הפעילו את \"אפשר עדכונים\" וחזרו לכאן."
           }
         },
         "ja": {
@@ -8684,7 +8684,7 @@
         "es": {
           "stringUnit": {
             "state": "needs_review",
-            "value": "macOS necesita tu aprobación: activa Balance ton port en Ajustes del Sistema, General, Ítems de inicio."
+            "value": "macOS necesita tu aprobación: activa Balance ton port en Ajustes del Sistema, General, Ítems de inicio de sesión."
           }
         },
         "fr": {
@@ -8696,7 +8696,7 @@
         "he": {
           "stringUnit": {
             "state": "needs_review",
-            "value": "macOS צריך את אישורך: הפעילו את Balance ton port בהגדרות המערכת, כללי, פריטי התחברות."
+            "value": "macOS מבקש אישור: הפעילו את Balance ton port בהגדרות המערכת, כללי, פריטי התחברות."
           }
         },
         "ja": {
@@ -8736,7 +8736,7 @@
         "es": {
           "stringUnit": {
             "state": "needs_review",
-            "value": "Abrir Ítems de inicio"
+            "value": "Abrir Ítems de inicio de sesión"
           }
         },
         "fr": {
