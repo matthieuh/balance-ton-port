@@ -373,9 +373,27 @@ fn resources(pid: i32) -> Option<ProcResources> {
     let (numer, denom) = timebase();
     let ticks = info.pti_total_user.saturating_add(info.pti_total_system);
     Some(ProcResources {
-        rss_bytes: info.pti_resident_size,
+        rss_bytes: phys_footprint(pid).unwrap_or(info.pti_resident_size),
         cpu_time_ns: (u128::from(ticks) * u128::from(numer) / u128::from(denom)) as u64,
     })
+}
+
+/// Physical footprint of `pid` (what Activity Monitor shows as Memory). Unlike
+/// the resident size it keeps counting pages macOS compressed or swapped, so a
+/// leak does not hide behind the compressor.
+fn phys_footprint(pid: i32) -> Option<u64> {
+    // SAFETY: rusage_info_v2 is plain old data, so all-zero is valid.
+    let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+    // SAFETY: RUSAGE_INFO_V2 makes the kernel write exactly one
+    // rusage_info_v2 into the buffer, which is that struct.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            pid,
+            libc::RUSAGE_INFO_V2,
+            (&mut info as *mut libc::rusage_info_v2).cast::<libc::rusage_info_t>(),
+        )
+    };
+    (rc == 0 && info.ri_phys_footprint > 0).then_some(info.ri_phys_footprint)
 }
 
 /// `hw.memsize` through sysctl.
