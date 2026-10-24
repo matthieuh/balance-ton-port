@@ -376,10 +376,32 @@ run_install() {
     mkdir -p "$ihome"
   fi
   [ $# -gt 0 ] || set -- --data-dir "$ihome/data"
-  out="$(env HOME="$ihome" PATH="$fix/bin:$BASE_PATH" FAKE_RELEASE_DIR="$rel" \
+  out="$(env HOME="$ihome" PATH="${EXTRA_PATH:+$EXTRA_PATH:}$fix/bin:$BASE_PATH" FAKE_RELEASE_DIR="$rel" \
     "$plugin/scripts/install-btp.sh" "$@" 2>&1)"
   code=$?
 }
+# A fake brew, first on PATH only when EXTRA_PATH says so: logs its args to
+# $FAKE_BREW_LOG; `list` exits FAKE_BREW_LIST (default 1, not installed);
+# install and upgrade exit FAKE_BREW_FAIL (default 0).
+brewbin="$work/brewbin"
+mkdir -p "$brewbin"
+cat >"$brewbin/brew" <<'BREWEOF'
+#!/bin/bash
+echo "$*" >>"$FAKE_BREW_LOG"
+case "${1:-}" in
+  list) exit "${FAKE_BREW_LIST:-1}" ;;
+  install | upgrade)
+    if [ "${FAKE_BREW_FAIL:-0}" != 0 ]; then
+      printf 'Warning: noise\nError: formula exploded\n' >&2
+    fi
+    exit "${FAKE_BREW_FAIL:-0}"
+    ;;
+esac
+BREWEOF
+chmod +x "$brewbin/brew"
+export FAKE_BREW_LOG="$work/brew.log"
+: >"$FAKE_BREW_LOG"
+check "install tests: no real brew reachable on the test PATH" bash -c 'PATH="$1"; ! command -v brew' _ "$fix/bin:$BASE_PATH"
 not_installed() { ! test -e "$ihome/.local/bin/btp"; }
 declined_at() { mkdir -p "$1" && touch "$1/install-declined"; }
 
@@ -477,6 +499,70 @@ KEEP_HOME=1 run_install --data-dir "" --clear-decline
 check "install: no data dir given: clears the no in Claude Code's data dirs" \
   test "$code" = 0 -a ! -e "$ihome/.claude-perso/plugins/data/balance-ton-port-balance-ton-port/install-declined"
 check "install: ... and in the hooks' fallback dir" test ! -e "$ihome/.local/share/balance-ton-port-plugin/install-declined"
+
+# --- install-btp.sh with Homebrew -------------------------------------------
+
+# brew_install [ARGS...]: run_install with the fake brew first on PATH.
+brew_install() {
+  : >"$FAKE_BREW_LOG"
+  EXTRA_PATH="$brewbin" run_install "$@"
+}
+marked_copy() { # marked_copy HOME: a btp this plugin installed in HOME/.local/bin
+  mkdir -p "$1/.local/bin"
+  printf '#!/bin/bash\necho old\n' >"$1/.local/bin/btp"
+  chmod +x "$1/.local/bin/btp"
+  shasum -a 256 "$1/.local/bin/btp" | cut -d' ' -f1 >"$1/.local/bin/.btp-installed-by-balance-ton-port"
+}
+
+make_release "$v"
+brew_install
+check "brew present: installs with brew" test "$code:$(cat "$FAKE_BREW_LOG")" = "0:list --formula matthieuh/tap/btp
+install matthieuh/tap/btp"
+check "brew present: nothing downloaded or put in ~/.local/bin" bash -c '[ ! -e "$1/.local/bin/btp" ] && [ ! -e "$2/curl.log" ]' _ "$ihome" "$rel"
+
+make_release "$v"
+FAKE_BREW_LIST=0 brew_install
+check "brew present and formula installed: upgrades" test "$code:$(cat "$FAKE_BREW_LOG")" = "0:list --formula matthieuh/tap/btp
+upgrade matthieuh/tap/btp"
+
+make_release "$v"
+ihome="$work/ihome-brewmarked"
+marked_copy "$ihome"
+KEEP_HOME=1 brew_install --data-dir "$ihome/data"
+check "brew install removes the plugin copy and its marker" test "$code" = 0 -a ! -e "$ihome/.local/bin/btp" -a ! -e "$ihome/.local/bin/.btp-installed-by-balance-ton-port"
+check "brew install says it removed the copy" grep -q "removed the copy this plugin installed in ~/.local/bin; Homebrew's btp is used now" <<<"$out"
+
+make_release "$v"
+ihome="$work/ihome-brewforeign"
+mkdir -p "$ihome/.local/bin"
+printf '#!/bin/bash\necho mine\n' >"$ihome/.local/bin/btp"
+chmod +x "$ihome/.local/bin/btp"
+KEEP_HOME=1 EXTRA_PATH="$ihome/.local/bin:$brewbin" run_install --data-dir "$ihome/data"
+check "brew install leaves a btp the plugin did not install" test "$code" = 0 -a "$("$ihome/.local/bin/btp")" = mine
+check "brew install: ... and notes that another btp comes first" grep -q "another btp comes first" <<<"$out"
+
+make_release "$v"
+ihome="$work/ihome-brewclear"
+declined_at "$ihome/data"
+KEEP_HOME=1 brew_install --data-dir "$ihome/data"
+check "brew install clears the earlier no" test "$code" = 0 -a ! -e "$ihome/data/install-declined"
+
+make_release "$v"
+ihome="$work/ihome-brewfail"
+marked_copy "$ihome"
+KEEP_HOME=1 FAKE_BREW_FAIL=1 brew_install --data-dir "$ihome/data"
+check "brew failure falls back to download" test "$code" = 0 -a "$("$ihome/.local/bin/btp" --version)" = "btp $v"
+check "brew failure says why with the last stderr line" grep -q "Homebrew could not install it (Error: formula exploded); using the signed download instead" <<<"$out"
+check "brew failure: the download was verified" test -s "$rel/codesign.log"
+
+make_release "$v"
+FAKE_BREW_LIST=0 FAKE_BREW_FAIL=1 brew_install
+check "download refuses when brew owns btp" test "$code" != 0 -a ! -e "$ihome/.local/bin/btp"
+check "download refuses: ... says why" grep -q "btp is installed with Homebrew; update it with brew upgrade matthieuh/tap/btp" <<<"$out"
+
+make_release "$v"
+FAKE_BREW_LIST=0 BTP_NO_BREW=1 brew_install
+check "BTP_NO_BREW skips brew" test "$code" = 0 -a ! -s "$FAKE_BREW_LOG" -a "$("$ihome/.local/bin/btp" --version)" = "btp $v"
 
 # --- no em dash -------------------------------------------------------------
 
