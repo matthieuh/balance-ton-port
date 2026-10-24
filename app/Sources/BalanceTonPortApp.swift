@@ -5,6 +5,7 @@ struct BalanceTonPortApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var model = CoreModel()
     @StateObject private var updates = UpdateController()
+    @StateObject private var language = LanguageModel()
 
     var body: some Scene {
         // MenuIcon is a pig snout template image (Assets.xcassets), so it
@@ -12,6 +13,7 @@ struct BalanceTonPortApp: App {
         MenuBarExtra("Balance ton port", image: "MenuIcon") {
             MenuView()
                 .environmentObject(model)
+                .languaged(language)
         }
         .menuBarExtraStyle(.window)
 
@@ -19,6 +21,7 @@ struct BalanceTonPortApp: App {
             SettingsView()
                 .environmentObject(model)
                 .environmentObject(updates)
+                .languaged(language)
         }
     }
 }
@@ -28,5 +31,15 @@ struct BalanceTonPortApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillFinishLaunching(_ notification: Notification) {
         _ = Notifier.shared
+    }
+}
+
+extension View {
+    /// Applies the chosen language: locale, layout direction, and a re-render on change.
+    func languaged(_ language: LanguageModel) -> some View {
+        environmentObject(language)
+            .environment(\.locale, language.locale)
+            .environment(\.layoutDirection, layoutDirection(for: language.code))
+            .id(language.code)
     }
 }

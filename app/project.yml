@@ -9,6 +9,7 @@ options:
   deploymentTarget:
     macOS: "14.0"
   createIntermediateGroups: true
+  developmentLanguage: en
 settings:
   base:
     SWIFT_VERSION: "6.0"
@@ -65,6 +66,8 @@ targets:
       - path: Sources/Logic.swift
       - path: Sources/Menu/MenuStyle.swift
       - path: Sources/Updates.swift
+      - path: Sources/Language.swift
+      - path: Sources/Localizable.xcstrings
       - path: Sources/Generated
     dependencies:
       - framework: Frameworks/BtpCore.xcframework
