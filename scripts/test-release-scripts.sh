@@ -91,5 +91,39 @@ for tag in v0.4.0 v10.2.3; do
   fi
 done
 
+# --- release-lib.sh: appcast helpers ---------------------------------------
+increases() { bash -c '. "$1" && bundle_version_increases "$2" "$3"' _ "$lib" "$@" 2>/dev/null; }
+check "bundle_version_must_increase: 8 over 7" increases 8 7
+check "bundle_version_must_increase: 10 over 9 (numeric, not text)" increases 10 9
+check "bundle_version_must_increase: first release (no previous)" increases 8 ""
+for pair in "7 7" "6 7" "x 7" "8 x" "0 0" ""; do
+  # shellcheck disable=SC2086
+  if increases ${pair:-"" ""}; then
+    ko "bundle_version_must_increase: rejects '$pair'"
+  else
+    ok "bundle_version_must_increase: rejects '$pair'"
+  fi
+done
+
+# --- render-appcast.sh -----------------------------------------------------
+appcast="$repo/scripts/render-appcast.sh"
+SIG="$(printf 'QUJD%.0s' {1..21})AA=="
+mkdir -p "$work/appcast"
+"$appcast" 1.2.3 8 BalanceTonPort-1.2.3.dmg 4567890 "$SIG" "Fri, 23 Oct 2026 10:00:00 +0000" "$work/appcast/appcast.xml" >/dev/null 2>&1
+check "appcast: matches the fixture" diff "$repo/scripts/fixtures/appcast-expected.xml" "$work/appcast/appcast.xml"
+appcast_rejects() { ! "$appcast" "$@" "Fri, 23 Oct 2026 10:00:00 +0000" "$work/appcast/bad.xml" >/dev/null 2>&1; }
+check "appcast: rejects a non-integer length" appcast_rejects 1.2.3 8 BalanceTonPort-1.2.3.dmg 12abc "$SIG"
+check "appcast: rejects a bad signature" appcast_rejects 1.2.3 8 BalanceTonPort-1.2.3.dmg 100 "not base64!"
+check "appcast: rejects a bad bundle version" appcast_rejects 1.2.3 1.2 BalanceTonPort-1.2.3.dmg 100 "$SIG"
+check "appcast: rejects a bad short version" appcast_rejects v1 8 BalanceTonPort-1.2.3.dmg 100 "$SIG"
+check "appcast: rejects a dmg name with a slash" appcast_rejects 1.2.3 8 ../x.dmg 100 "$SIG"
+check "appcast_version reads the first item" bash -c \
+  '. "$1" && [ "$(appcast_version "$2")" = "8" ]' _ "$lib" "$work/appcast/appcast.xml"
+two="$work/appcast/two.xml"
+sed 's|</channel>|<item><sparkle:version>99</sparkle:version></item></channel>|' "$work/appcast/appcast.xml" >"$two"
+check "appcast_version ignores later items" bash -c \
+  '. "$1" && [ "$(appcast_version "$2")" = "8" ]' _ "$lib" "$two"
+check "appcast: fixture is well-formed XML" xmllint --noout "$repo/scripts/fixtures/appcast-expected.xml"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
