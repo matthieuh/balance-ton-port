@@ -3,18 +3,19 @@ import SwiftUI
 /// The About tab: version and updates.
 struct AboutPane: View {
     @EnvironmentObject private var updates: UpdateController
+    @EnvironmentObject private var language: LanguageModel
 
     var body: some View {
         Form {
             Section {
-                LabeledContent("Balance ton port", value: UpdateController.appVersion(Bundle.main.infoDictionary ?? [:]))
+                LabeledContent(String("Balance ton port"), value: UpdateController.appVersion(Bundle.main.infoDictionary ?? [:]))
             }
             Section {
-                Button("Check for Updates…") { updates.checkNow() }
+                Button(language.tr("Check for Updates…")) { updates.checkNow() }
                     .disabled(!updates.canCheck)
-                Toggle("Update automatically", isOn: $updates.automatic)
+                Toggle(language.tr("Update automatically"), isOn: $updates.automatic)
             } footer: {
-                Text("Updates are signed and downloaded from GitHub.")
+                Text(verbatim: language.tr("Updates are signed and downloaded from GitHub."))
             }
         }
         .formStyle(.grouped)

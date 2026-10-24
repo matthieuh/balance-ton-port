@@ -18,8 +18,8 @@ struct GeneralPane: View {
     var body: some View {
         Form {
             Section {
-                Picker("Language", selection: $language.choice) {
-                    ForEach(AppLanguage.allCases) { Text($0.nativeName).tag($0) }
+                Picker(language.tr("Language"), selection: $language.choice) {
+                    ForEach(AppLanguage.allCases) { Text(verbatim: $0.name(language)).tag($0) }
                 }
             }
             NotificationsSection()
