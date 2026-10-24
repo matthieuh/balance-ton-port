@@ -1,0 +1,13 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "Language" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Language" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Langue" } },
+        "he" : { "stringUnit" : { "state" : "translated", "value" : "שפה" } }
+      }
+    }
+  },
+  "version" : "1.0"
+}
