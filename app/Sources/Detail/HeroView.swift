@@ -13,6 +13,7 @@ struct HeroView: View {
     let onBack: () -> Void
     let more: AnyView
     @Environment(\.colorScheme) private var scheme
+    @EnvironmentObject private var language: LanguageModel
 
     var body: some View {
         ZStack(alignment: .bottomLeading) {
@@ -33,7 +34,7 @@ struct HeroView: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(PressableStyle())
-            .help("Back")
+            .help(language.tr("Back"))
             .padding(.leading, 6)
             .padding(.top, 6)
         }
@@ -86,7 +87,7 @@ struct HeroView: View {
     }
 
     private var identity: some View {
-        let sub = heroSubtitle(server)
+        let sub = heroSubtitle(server, bundle: language.bundle, locale: language.locale)
         let title = titleParts(server).title
         return HStack(spacing: 10) {
             ServerIcon(server: server, favicon: favicon, size: 40)

@@ -12,6 +12,7 @@ struct StatusCard: View {
     let restarting: Bool
     let perform: (DetailButton) -> Void
     @Environment(\.colorScheme) private var scheme
+    @EnvironmentObject private var language: LanguageModel
 
     var body: some View {
         let tint = server.card.map(cardTint) ?? Color.secondary
@@ -30,12 +31,12 @@ struct StatusCard: View {
                 .padding(2)
             }
             VStack(alignment: .leading, spacing: 2) {
-                if let title = statusTitle(server) {
+                if let title = statusTitle(server, bundle: language.bundle, locale: language.locale) {
                     Text(verbatim: title)
                         .font(.system(size: 13, weight: .bold))
                         .foregroundStyle(text ?? Color.primary)
                 }
-                Text(verbatim: note.map(rowNoteText) ?? statusSentence(server))
+                Text(verbatim: note.map { rowNoteText($0, bundle: language.bundle, locale: language.locale) } ?? statusSentence(server, bundle: language.bundle, locale: language.locale))
                     .font(.system(size: 12))
                     .foregroundStyle(text.map { $0.opacity(0.9) } ?? Color.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -43,7 +44,7 @@ struct StatusCard: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             if let action = statusCardAction(server) {
                 Button { perform(action) } label: {
-                    Text(verbatim: action.title)
+                    Text(verbatim: action.title(bundle: language.bundle, locale: language.locale))
                         .font(.system(size: 12, weight: .semibold))
                         .padding(.horizontal, 14)
                         .frame(height: detailButtonHeight)

@@ -11,10 +11,17 @@ struct MoreMenu: View {
     var onImage = false
     @EnvironmentObject private var model: CoreModel
     @EnvironmentObject private var nav: MenuNavigation
+    @EnvironmentObject private var language: LanguageModel
 
     var body: some View {
         Menu {
-            ForEach(moreMenuItems(server, restarting: model.isRestarting(server.id), inDetail: inDetail), id: \.kind) { item in
+            ForEach(
+                moreMenuItems(
+                    server, restarting: model.isRestarting(server.id), inDetail: inDetail,
+                    bundle: language.bundle, locale: language.locale
+                ),
+                id: \.kind
+            ) { item in
                 if item.kind == .separator {
                     Divider()
                 } else {

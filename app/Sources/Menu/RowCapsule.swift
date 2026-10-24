@@ -6,15 +6,16 @@ import SwiftUI
 struct RowCapsule: View {
     let server: ServerViewFfi
     @EnvironmentObject private var model: CoreModel
+    @EnvironmentObject private var language: LanguageModel
 
     var body: some View {
         HStack(spacing: 2) {
             ForEach(capsuleButtons(server), id: \.self) { button in
                 switch button {
                 case .open:
-                    pill("\u{2197} Open", color: .primary.opacity(0.8)) { model.open(server) }
+                    pill("\u{2197} " + language.tr("Open"), color: .primary.opacity(0.8)) { model.open(server) }
                 case .stop:
-                    pill("\u{25A0} Stop", color: .red) { model.stop(server) }
+                    pill("\u{25A0} " + language.tr("Stop"), color: .red) { model.stop(server) }
                         .disabled(!canStopNow(server, restarting: model.isRestarting(server.id)))
                 case .more:
                     MoreMenu(server: server, bare: true)

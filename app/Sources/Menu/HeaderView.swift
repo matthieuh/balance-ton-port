@@ -5,6 +5,7 @@ struct HeaderView: View {
     let count: Int
     let memory: MemoryBarFfi?
     let servers: [ServerViewFfi]
+    @EnvironmentObject private var language: LanguageModel
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -14,9 +15,9 @@ struct HeaderView: View {
                     .resizable()
                     .scaledToFit()
                     .frame(width: 16, height: 16)
-                Text("Balance ton port").fontWeight(.semibold)
+                Text(verbatim: language.tr("Balance ton port")).fontWeight(.semibold)
                 Spacer()
-                Text(verbatim: headerCount(count))
+                Text(verbatim: headerCount(count, bundle: language.bundle, locale: language.locale))
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
             }

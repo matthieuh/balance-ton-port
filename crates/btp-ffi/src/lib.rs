@@ -53,6 +53,17 @@ pub struct CardFfi {
     pub reason: String,
     /// `restart`, `postpone` or `stop`.
     pub action: String,
+    /// The memory a leak card is about (0 for any other card); the app words
+    /// the reason itself, so it can translate it.
+    pub rss_bytes: u64,
+    /// The growth in 10 minutes of a leak card (0 for any other card).
+    pub growth_bytes: i64,
+    /// When an about-to-stop card's stop is due, in milliseconds (0 for any
+    /// other card).
+    pub in_ms: u64,
+    /// How long an idle-alert card's session has been idle, in milliseconds
+    /// (0 for any other card).
+    pub idle_ms: u64,
 }
 
 impl From<&NeedsYou> for CardFfi {
@@ -68,10 +79,83 @@ impl From<&NeedsYou> for CardFfi {
             SuggestedAction::Postpone => "postpone",
             SuggestedAction::Stop => "stop",
         };
+        let (mut rss_bytes, mut growth_bytes, mut in_ms, mut idle_ms) = (0, 0, 0, 0);
+        match n {
+            NeedsYou::Leak {
+                rss_bytes: r,
+                growth_bytes: g,
+                ..
+            } => (rss_bytes, growth_bytes) = (*r, *g),
+            NeedsYou::AboutToStop { in_ms: m } => in_ms = *m,
+            NeedsYou::IdleAlert { idle_ms: m, .. } => idle_ms = *m,
+            NeedsYou::SessionEndedOpen => {}
+        }
         CardFfi {
             kind: kind.to_string(),
             reason: card_reason(n),
             action: action.to_string(),
+            rss_bytes,
+            growth_bytes,
+            in_ms,
+            idle_ms,
+        }
+    }
+}
+
+/// What a row says about a server's situation, as fields the app words
+/// itself (`status_text` is the English sentence, for the CLI and logs).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct StatusFfi {
+    /// `in_use`, `kept_by_agent`, `kept_by_user`, `stops_in`, `excluded` or
+    /// `idle`.
+    pub kind: String,
+    /// Whole minutes until the stop (`stops_in`) or since the last use
+    /// (`idle`); 0 for any other kind.
+    pub minutes: u64,
+    /// `Claude` or `Codex` for `kept_by_agent`, else empty.
+    pub agent_label: String,
+    /// The keep note of `kept_by_agent`, `None` when it has none.
+    pub reason: Option<String>,
+}
+
+impl StatusFfi {
+    fn of(kind: &str, minutes: u64) -> Self {
+        StatusFfi {
+            kind: kind.to_string(),
+            minutes,
+            agent_label: String::new(),
+            reason: None,
+        }
+    }
+
+    /// The status of a tracked server, in the order `status_text` reads it.
+    fn tracked(v: &ServerView) -> Self {
+        if v.in_use {
+            Self::of("in_use", 0)
+        } else if let Some(reason) = &v.note_reason {
+            StatusFfi {
+                agent_label: v.agent.label().to_string(),
+                reason: Some(reason.clone()).filter(|r| !r.is_empty()),
+                ..Self::of("kept_by_agent", 0)
+            }
+        } else if v.kept_by_user {
+            Self::of("kept_by_user", 0)
+        } else if let Some(ms) = v.kill_in_ms {
+            Self::of("stops_in", ms / 60_000)
+        } else {
+            Self::of("idle", v.idle_ms / 60_000)
+        }
+    }
+
+    /// The status of an observed server, in the order `status_text_observed`
+    /// reads it.
+    fn observed(excluded: bool, in_use: bool, idle_ms: u64) -> Self {
+        if excluded {
+            Self::of("excluded", 0)
+        } else if in_use {
+            Self::of("in_use", 0)
+        } else {
+            Self::of("idle", idle_ms / 60_000)
         }
     }
 }
@@ -105,6 +189,8 @@ pub struct ServerViewFfi {
     pub started_ms: u64,
     /// `started 4 min ago`, as of the pass that produced this view.
     pub started_label: String,
+    /// How long ago it started, in milliseconds, as of that pass.
+    pub started_age_ms: u64,
     /// Always `false` for an observed server, which has no session.
     pub session_alive: bool,
     pub idle_ms: u64,
@@ -136,6 +222,8 @@ pub struct ServerViewFfi {
     /// `in use`, `kept by Claude: "<reason>"`, `kept by you`, `stops in N
     /// min`, `excluded`, else `idle N min`.
     pub status_text: String,
+    /// The same status as fields, which the app words in its language.
+    pub status: StatusFfi,
     pub card: Option<CardFfi>,
     /// The leak its card shows: `size` (above the memory threshold) or
     /// `growth` (grew past the growth threshold in 10 min); `None` without
@@ -210,6 +298,12 @@ pub struct KillRecordFfi {
     pub worktree_name: String,
     /// `worktree deleted`, `dead session + idle 23 min` or `manual`.
     pub reason: String,
+    /// `worktree_deleted`, `dead_session_idle`, `manual`, `session_ended` or
+    /// `other`: the reason as a kind the app words itself.
+    pub reason_kind: String,
+    /// How long the session had idled, in milliseconds, for
+    /// `dead_session_idle` (0 otherwise).
+    pub idle_ms: u64,
     pub at_ms: u64,
 }
 
@@ -321,6 +415,51 @@ pub fn restart_blocked_label(b: RestartBlocked) -> &'static str {
     }
 }
 
+/// Why a restart did not happen, for the app to word in its language
+/// (`restart_blocked_label` is the English text).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum RestartBlockedFfi {
+    Gone,
+    CwdGone,
+    EnvUnreadable,
+    ArgvUnreadable,
+    PortStillTaken,
+    Excluded,
+    SpawnFailed,
+    Busy,
+}
+
+impl From<RestartBlocked> for RestartBlockedFfi {
+    fn from(b: RestartBlocked) -> Self {
+        match b {
+            RestartBlocked::Gone => Self::Gone,
+            RestartBlocked::CwdGone => Self::CwdGone,
+            RestartBlocked::EnvUnreadable => Self::EnvUnreadable,
+            RestartBlocked::ArgvUnreadable => Self::ArgvUnreadable,
+            RestartBlocked::PortStillTaken => Self::PortStillTaken,
+            RestartBlocked::Excluded => Self::Excluded,
+            RestartBlocked::SpawnFailed => Self::SpawnFailed,
+            RestartBlocked::Busy => Self::Busy,
+        }
+    }
+}
+
+impl RestartBlockedFfi {
+    /// The English text of the row, as `restart_blocked_label` words it.
+    pub fn label(self) -> &'static str {
+        restart_blocked_label(match self {
+            Self::Gone => RestartBlocked::Gone,
+            Self::CwdGone => RestartBlocked::CwdGone,
+            Self::EnvUnreadable => RestartBlocked::EnvUnreadable,
+            Self::ArgvUnreadable => RestartBlocked::ArgvUnreadable,
+            Self::PortStillTaken => RestartBlocked::PortStillTaken,
+            Self::Excluded => RestartBlocked::Excluded,
+            Self::SpawnFailed => RestartBlocked::SpawnFailed,
+            Self::Busy => RestartBlocked::Busy,
+        })
+    }
+}
+
 /// `cd '<folder>' && claude --resume <id>` (Codex: `codex resume <id>`),
 /// single quotes in the folder escaped. `None` for an empty id, or one with
 /// characters a shell would read (it is pasted into a terminal).
@@ -374,8 +513,11 @@ pub struct SessionEndedFfi {
     pub session_name: String,
     /// The kept servers still tracked.
     pub servers: Vec<GroupServerFfi>,
-    /// The notification body, the same text the hook posts.
+    /// The notification body, the same text the hook posts (English).
     pub body: String,
+    /// The dead-session delay in seconds, which the body's last sentence
+    /// names; the app words the body itself from the fields above.
+    pub dead_idle_s: u64,
 }
 
 impl SessionEndedFfi {
@@ -398,6 +540,7 @@ impl SessionEndedFfi {
                 })
                 .collect(),
             body: session_ended_body(g, dead_idle_s),
+            dead_idle_s,
         }
     }
 }
@@ -412,6 +555,16 @@ pub fn reason_label(r: &KillReason) -> String {
         KillReason::Manual => "manual".to_string(),
         KillReason::SessionEnded => "session ended".to_string(),
         KillReason::Other => "other".to_string(),
+    }
+}
+
+fn reason_kind(r: &KillReason) -> &'static str {
+    match r {
+        KillReason::WorktreeDeleted => "worktree_deleted",
+        KillReason::DeadSessionIdle { .. } => "dead_session_idle",
+        KillReason::Manual => "manual",
+        KillReason::SessionEnded => "session_ended",
+        KillReason::Other => "other",
     }
 }
 
@@ -455,6 +608,7 @@ impl ServerViewFfi {
             agent_label: v.agent.label().to_string(),
             started_ms: v.started_ms,
             started_label: started_label(v.started_ms, now_ms),
+            started_age_ms: now_ms.saturating_sub(v.started_ms),
             session_alive: v.session_alive,
             idle_ms: v.idle_ms,
             kill_in_ms: v.kill_in_ms,
@@ -471,6 +625,7 @@ impl ServerViewFfi {
             health: health_id(l.health).to_string(),
             in_use: v.in_use,
             status_text: status_text(v),
+            status: StatusFfi::tracked(v),
             card: l.card.clone(),
             leak_kind: l.leak_kind.clone(),
             can_restart: l.can_restart,
@@ -506,6 +661,7 @@ impl ServerViewFfi {
             agent_label: "no agent".to_string(),
             started_ms,
             started_label: started_label(started_ms, now_ms),
+            started_age_ms: now_ms.saturating_sub(started_ms),
             session_alive: false,
             idle_ms,
             kill_in_ms: None,
@@ -527,6 +683,7 @@ impl ServerViewFfi {
             health: health_id(l.health).to_string(),
             in_use,
             status_text: status_text_observed(o, in_use, idle_ms),
+            status: StatusFfi::observed(o.excluded, in_use, idle_ms),
             card: l.card.clone(),
             leak_kind: l.leak_kind.clone(),
             can_restart: l.can_restart && !o.excluded,
@@ -546,6 +703,11 @@ impl From<&KillRecord> for KillRecordFfi {
             worktree: r.worktree.display().to_string(),
             worktree_name: file_name(&r.worktree),
             reason: reason_label(&r.reason),
+            reason_kind: reason_kind(&r.reason).to_string(),
+            idle_ms: match r.reason {
+                KillReason::DeadSessionIdle { idle_ms } => idle_ms,
+                _ => 0,
+            },
             at_ms: r.at_ms,
         }
     }
@@ -943,12 +1105,14 @@ impl Core {
 
     /// Stops the server and starts it again with the same command, folder
     /// and environment; a tracked server keeps its session, note, Keep and
-    /// Postpone. `nil` once started, else why not, as the row shows it (`The
-    /// folder no longer exists`, `Cannot read its environment`, `The port is
-    /// still taken`, `It matches an exclusion now`, `Already restarting`,
-    /// `Could not start it again`). Blocks for the kill grace plus up to 5 s
+    /// Postpone. `nil` once started, else why not (the app words each case
+    /// in its language; `restart_blocked_label` is the English text). Blocks for the kill grace plus up to 5 s
     /// while the port frees: never call it on the main thread.
-    pub fn restart(&self, pid: i32, start_time: u64) -> Result<Option<String>, BtpError> {
+    pub fn restart(
+        &self,
+        pid: i32,
+        start_time: u64,
+    ) -> Result<Option<RestartBlockedFfi>, BtpError> {
         // Checked and planned under the lock; the stop, the port wait and
         // the start run without it, so passes go on meanwhile.
         let (job, platform) = {
@@ -960,7 +1124,7 @@ impl Core {
             Ok(job) => job.run(&platform)?,
             Err(blocked) => Err(blocked),
         };
-        Ok(r.err().map(|b| restart_blocked_label(b).to_string()))
+        Ok(r.err().map(RestartBlockedFfi::from))
     }
 
     /// Stops an observed server (no agent started it), once the user
@@ -1504,7 +1668,7 @@ mod tests {
         core.mark_leak_notified(me, 1);
         assert_eq!(core.stop_observed(me, 1).unwrap(), None);
         assert_eq!(
-            core.restart(me, 1).unwrap().as_deref(),
+            core.restart(me, 1).unwrap().map(RestartBlockedFfi::label),
             Some("Could not start it again")
         );
     }
@@ -1711,7 +1875,7 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         assert_eq!(
-            blocked.unwrap().as_deref(),
+            blocked.unwrap().map(RestartBlockedFfi::label),
             Some("Could not start it again")
         );
         assert!(observed, "observe() returned while the restart was waiting");
@@ -1762,13 +1926,18 @@ mod tests {
         let _ = new.kill();
         let _ = new.wait();
         assert_eq!(first.unwrap(), None, "started");
-        assert_eq!(second.unwrap().as_deref(), Some("Already restarting"));
+        assert_eq!(
+            second.unwrap().map(RestartBlockedFfi::label),
+            Some("Already restarting")
+        );
         assert_eq!(spawns, 1);
         assert_eq!(pending.len(), 1);
         assert_eq!((pending[0].child_pid, pending[0].from), (new_pid, key));
         // Released: a later restart is judged on its own (`nc` is gone).
         assert_eq!(
-            core.restart(key.pid, key.start_time).unwrap().as_deref(),
+            core.restart(key.pid, key.start_time)
+                .unwrap()
+                .map(RestartBlockedFfi::label),
             Some("Could not start it again")
         );
     }
@@ -2100,5 +2269,140 @@ mod tests {
         );
         drop(a);
         assert!(b.acquire_watch().unwrap());
+    }
+
+    #[test]
+    fn status_kind_for_each_case() {
+        let status = |v: &ServerView| ServerViewFfi::tracked(v, &Live::default(), 0).status;
+        let kind = |v: &ServerView| status(v).kind;
+        let mut v = view();
+        v.kill_in_ms = Some(8 * 60_000 + 59_999);
+        assert_eq!(kind(&v), "stops_in");
+        assert_eq!(status(&v).minutes, 8);
+        v.kill_in_ms = None;
+        v.idle_ms = 34 * 60_000;
+        let idle = status(&v);
+        assert_eq!((idle.kind.as_str(), idle.minutes), ("idle", 34));
+        v.kept_by_user = true;
+        assert_eq!(kind(&v), "kept_by_user");
+        v.note_reason = Some("watching the build".into());
+        let kept = status(&v);
+        assert_eq!(kept.kind, "kept_by_agent");
+        assert_eq!(kept.agent_label, "Claude");
+        assert_eq!(kept.reason.as_deref(), Some("watching the build"));
+        v.note_reason = Some(String::new());
+        assert_eq!(status(&v).reason, None, "an empty note has no reason");
+        v.in_use = true;
+        assert_eq!(kind(&v), "in_use");
+        assert_eq!(status(&v).reason, None);
+        let o = ObservedServer {
+            key: ServerKey {
+                pid: 77,
+                start_time: 2_000_000,
+            },
+            port: 5432,
+            ports: vec![5432],
+            command: "postgres".into(),
+            cwd: None,
+            excluded: false,
+        };
+        let observed = |o: &ObservedServer, in_use, idle_ms| {
+            ServerViewFfi::observed(o, &Live::default(), in_use, idle_ms, 0).status
+        };
+        let s = observed(&o, false, 5 * 60_000);
+        assert_eq!((s.kind.as_str(), s.minutes), ("idle", 5));
+        assert_eq!(observed(&o, true, 0).kind, "in_use");
+        let excluded = ObservedServer {
+            excluded: true,
+            ..o
+        };
+        assert_eq!(observed(&excluded, true, 0).kind, "excluded");
+    }
+
+    #[test]
+    fn started_age_is_in_milliseconds() {
+        let f = ServerViewFfi::tracked(&view(), &Live::default(), 241_000);
+        assert_eq!(f.started_age_ms, 240_000);
+        assert_eq!(f.started_label, "started 4 min ago");
+    }
+
+    #[test]
+    fn card_carries_its_numbers() {
+        use btp_core::history::MB;
+        let leak = CardFfi::from(&NeedsYou::Leak {
+            rss_bytes: 900 * MB,
+            growth_bytes: -5,
+            cause: LeakCause::Size,
+        });
+        assert_eq!((leak.rss_bytes, leak.growth_bytes), (900 * MB, -5));
+        let stop = CardFfi::from(&NeedsYou::AboutToStop { in_ms: 8 * 60_000 });
+        assert_eq!(stop.in_ms, 8 * 60_000);
+        let idle = CardFfi::from(&NeedsYou::IdleAlert {
+            idle_ms: 40 * 60_000,
+            agent: AgentKind::Codex,
+        });
+        assert_eq!(idle.idle_ms, 40 * 60_000);
+        let open = CardFfi::from(&NeedsYou::SessionEndedOpen);
+        assert_eq!((open.in_ms, open.idle_ms, open.rss_bytes), (0, 0, 0));
+    }
+
+    #[test]
+    fn restart_blocked_maps_each_case() {
+        use RestartBlocked as B;
+        use RestartBlockedFfi as F;
+        let cases = [
+            (B::Gone, F::Gone),
+            (B::CwdGone, F::CwdGone),
+            (B::EnvUnreadable, F::EnvUnreadable),
+            (B::ArgvUnreadable, F::ArgvUnreadable),
+            (B::PortStillTaken, F::PortStillTaken),
+            (B::Excluded, F::Excluded),
+            (B::SpawnFailed, F::SpawnFailed),
+            (B::Busy, F::Busy),
+        ];
+        for (b, f) in cases {
+            assert_eq!(RestartBlockedFfi::from(b), f);
+        }
+    }
+
+    #[test]
+    fn kill_record_carries_the_reason_kind() {
+        use std::path::PathBuf;
+        let record = |reason| KillRecord {
+            port: 3000,
+            command: "vite".into(),
+            worktree: PathBuf::from("/repo/app"),
+            reason,
+            at_ms: 9,
+        };
+        let r = KillRecordFfi::from(&record(KillReason::DeadSessionIdle {
+            idle_ms: 23 * 60_000,
+        }));
+        assert_eq!(
+            (r.reason_kind.as_str(), r.idle_ms),
+            ("dead_session_idle", 23 * 60_000)
+        );
+        let kinds = [
+            (KillReason::WorktreeDeleted, "worktree_deleted"),
+            (KillReason::Manual, "manual"),
+            (KillReason::SessionEnded, "session_ended"),
+            (KillReason::Other, "other"),
+        ];
+        for (reason, kind) in kinds {
+            let r = KillRecordFfi::from(&record(reason));
+            assert_eq!((r.reason_kind.as_str(), r.idle_ms), (kind, 0));
+        }
+    }
+
+    #[test]
+    fn session_ended_carries_the_delay() {
+        let d = tempfile::tempdir().unwrap();
+        let core = Core::at(d.path().to_path_buf(), Vec::new);
+        seed_group(d.path());
+        let mut c = core.config().unwrap();
+        c.dead_session_idle_s = 1800;
+        core.set_config(c).unwrap();
+        let pending = core.claim_session_ended().unwrap();
+        assert_eq!(pending[0].dead_idle_s, 1800);
     }
 }

@@ -5,7 +5,7 @@ struct BalanceTonPortApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var model = CoreModel()
     @StateObject private var updates = UpdateController()
-    @StateObject private var language = LanguageModel()
+    @StateObject private var language = LanguageModel.shared
 
     var body: some Scene {
         // MenuIcon is a pig snout template image (Assets.xcassets), so it

@@ -16,6 +16,7 @@ struct MemoryChart: View {
     /// The chart's right edge: now.
     var end = Date()
     @Environment(\.colorScheme) private var scheme
+    @EnvironmentObject private var language: LanguageModel
 
     var body: some View {
         let dark = scheme == .dark
@@ -26,12 +27,12 @@ struct MemoryChart: View {
         let color = healthColor(health)
         VStack(alignment: .leading, spacing: 4) {
             HStack {
-                Text("Last 2 hours")
+                Text(verbatim: language.tr("Last 2 hours"))
                 Spacer()
-                Text(verbatim: memoryLabel(rssBytes))
+                Text(verbatim: memoryLabel(rssBytes, locale: language.locale))
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.primary)
-                Text(verbatim: "\u{00B7} " + cpuLabel(cpuPct))
+                Text(verbatim: "\u{00B7} " + cpuLabel(cpuPct, bundle: language.bundle, locale: language.locale))
             }
             .font(.system(size: 11))
             .foregroundStyle(.secondary)
@@ -75,7 +76,7 @@ struct MemoryChart: View {
         return GeometryReader { geo in
             ForEach(kept, id: \.self) { i in
                 let x = positions[i] * geo.size.width
-                let label = Text(verbatim: eventChartLabel(shown[i]))
+                let label = Text(verbatim: eventChartLabel(shown[i], bundle: language.bundle, locale: language.locale))
                     .font(.system(size: 10))
                     .foregroundStyle(eventColor(shown[i].kind, dark: dark))
                     .lineLimit(1)
