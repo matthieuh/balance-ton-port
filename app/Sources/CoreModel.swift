@@ -75,7 +75,8 @@ final class CoreModel: ObservableObject {
     /// launch).
     private var afterFirstPass: [() -> Void] = []
     private let killedHoldTime: TimeInterval = 30
-    private let notifier = Notifier.shared
+    /// Read on use, so a preview model never sets up notifications.
+    private var notifier: Notifier { .shared }
     private let language = LanguageModel.shared
 
     init() {
@@ -107,6 +108,16 @@ final class CoreModel: ObservableObject {
             await notifier.requestAuthorization()
             await refreshNotificationPermission()
         }
+    }
+
+    /// A model that never runs a pass or touches notifications, showing
+    /// made-up servers as given: the README screenshots
+    /// (`scripts/screenshots.sh`).
+    init(preview servers: [ServerViewFfi], memory: MemoryBarFfi, recentKills: [KillRecordFfi]) {
+        self.servers = servers
+        self.memory = memory
+        self.recentKills = recentKills
+        notificationPermission = .allowed(bannersOff: false)
     }
 
     func refreshNotificationPermission() async {

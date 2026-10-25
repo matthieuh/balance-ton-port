@@ -22,7 +22,7 @@ struct MenuBarLabel: View {
 /// A tinted image is not a template, so the menu bar keeps its color.
 @MainActor
 func menuBarImage(_ status: MenuBarStatus) -> NSImage {
-    let pig = NSImage(named: "MenuIcon") ?? NSImage()
+    let pig = appBundle.image(forResource: "MenuIcon") ?? NSImage()
     guard let tint = status.tint else { return pig }
     let color: NSColor = tint == .critical ? .systemRed : .systemOrange
     let side: CGFloat = 18
@@ -47,3 +47,7 @@ func menuBarImage(_ status: MenuBarStatus) -> NSImage {
     image.isTemplate = false
     return image
 }
+
+/// The bundle holding the app's assets: the app itself, or the screenshots
+/// test bundle that compiles the same sources.
+let appBundle = Bundle(for: CoreModel.self)

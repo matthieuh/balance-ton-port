@@ -83,6 +83,29 @@ targets:
         CODE_SIGN_IDENTITY: "-"
         CODE_SIGN_STYLE: Manual
         SWIFT_TREAT_WARNINGS_AS_ERRORS: true
+  # The README screenshots: the real views, fed made-up servers, rendered
+  # offscreen to PNG. Every app source but the entry point, no app host, so
+  # nothing watches or stops a server. Run by ../scripts/screenshots.sh.
+  BalanceTonPortScreenshots:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Screenshots
+      - path: Sources
+        excludes:
+          - BalanceTonPortApp.swift
+      - path: Assets.xcassets
+    dependencies:
+      - framework: Frameworks/BtpCore.xcframework
+        embed: false
+      - package: Sparkle
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.matthieuh.balancetonport.screenshots
+        GENERATE_INFOPLIST_FILE: true
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+        SWIFT_TREAT_WARNINGS_AS_ERRORS: true
 schemes:
   BalanceTonPort:
     build:
@@ -91,3 +114,10 @@ schemes:
     test:
       targets:
         - BalanceTonPortTests
+  Screenshots:
+    build:
+      targets:
+        BalanceTonPortScreenshots: [test]
+    test:
+      targets:
+        - BalanceTonPortScreenshots
