@@ -148,5 +148,17 @@ for code in 500 403 000; do
   fi
 done
 
+# formula_version / tap_is_ahead: a late rerun must not downgrade the tap.
+fv="$work/formula-ahead.rb"
+printf 'url "https://github.com/matthieuh/balance-ton-port/releases/download/v0.4.1/btp-0.4.1-macos-universal.tar.gz"\n' >"$fv"
+check "formula_version reads the version from the url" bash -c \
+  '. "$1" && [ "$(formula_version "$2")" = "0.4.1" ]' _ "$lib" "$fv"
+ahead() { bash -c '. "$1" && tap_is_ahead "$2" "$3"' _ "$lib" "$@"; }
+check "tap_is_ahead: a higher tap version is ahead" ahead 0.4.1 0.4.0
+check "tap_is_ahead: compares numerically, not as text" ahead 0.10.0 0.9.0
+check "tap_is_ahead: the same version is not ahead" bash -c '! "$@"' _ bash -c '. "$1" && tap_is_ahead 0.4.0 0.4.0' _ "$lib"
+check "tap_is_ahead: a lower tap version is not ahead" bash -c '. "$1" && ! tap_is_ahead 0.3.0 0.4.0' _ "$lib"
+check "tap_is_ahead: an empty tap version is not ahead" bash -c '. "$1" && ! tap_is_ahead "" 0.4.0' _ "$lib"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
