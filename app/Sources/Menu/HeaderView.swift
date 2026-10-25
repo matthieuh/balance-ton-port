@@ -10,7 +10,7 @@ struct HeaderView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 5) {
-                Image("MenuIcon")
+                Image("MenuIcon", bundle: appBundle)
                     .renderingMode(.template)
                     .resizable()
                     .scaledToFit()

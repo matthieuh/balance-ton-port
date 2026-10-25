@@ -4,6 +4,25 @@ Claude Code sessions start dev servers (Astro, wrangler, Metro, Vite, `serve`...
 
 It is a macOS menu bar app plus a `btp` CLI, both on one Rust core, and an agent skill. Codex CLI sessions are supported too (alerted on port idle only, like a busy Claude Code session; no session-end cleanup); Codex users paste `plugin/skills/balance-ton-port/AGENTS.md` into their repo's `AGENTS.md`.
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/menu-en-dark.png">
+    <img src="docs/screenshots/menu-en-light.png" width="420" alt="The menu: two servers need you (a leak to restart, an idle Codex session), the others sorted by memory, quiet ports folded">
+  </picture>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/detail-en-dark.png">
+    <img src="docs/screenshots/detail-en-light.png" width="420" alt="A server's detail: memory over the last 2 hours with its events, the session, the processes, Restart and Stop">
+  </picture>
+</p>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/menubar-dark.png">
+    <img src="docs/screenshots/menubar-light.png" width="160" alt="The menu bar pig: plain when all is well, orange with a count when servers need you, red under critical memory pressure">
+  </picture>
+</p>
+
+The screenshots are rendered from made-up servers (`scripts/screenshots.sh`).
+
 ## What it does
 
 Every 5 seconds it links new listening servers to the coding-agent session (Claude Code or Codex CLI) that started them, then applies three triggers:
