@@ -103,4 +103,12 @@ final class LanguageTests: XCTestCase {
         model.choice = .en
         XCTAssertEqual(model.tr("Language"), "Language")
     }
+
+    @MainActor
+    func testFrenchMoreFoldAgreesWithTheCount() throws {
+        let model = try testModel()
+        model.choice = .fr
+        XCTAssertEqual(moreLabel(1, bundle: model.bundle, locale: model.locale), "+ 1 autre \u{25B8}")
+        XCTAssertEqual(moreLabel(3, bundle: model.bundle, locale: model.locale), "+ 3 autres \u{25B8}")
+    }
 }
