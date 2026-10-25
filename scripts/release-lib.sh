@@ -42,3 +42,18 @@ previous_feed_version() {
       ;;
   esac
 }
+
+# formula_version FILE: the version in a rendered btp formula's release url.
+formula_version() {
+  sed -n 's|.*/releases/download/v\([0-9][^/]*\)/.*|\1|p' "$1" | head -1
+}
+
+# tap_is_ahead TAP_VERSION VERSION: succeeds when the tap already holds a
+# version above VERSION (sort -V), so publishing VERSION would downgrade it.
+# An empty TAP_VERSION (no formula yet) is never ahead.
+tap_is_ahead() {
+  local tap="${1:-}" version="$2"
+  [ -n "$tap" ] || return 1
+  [ "$tap" != "$version" ] || return 1
+  [ "$(printf '%s\n%s\n' "$tap" "$version" | sort -V | tail -1)" = "$tap" ]
+}

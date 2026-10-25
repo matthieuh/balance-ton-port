@@ -89,6 +89,25 @@ jobs:
           BUILT="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$DIST/$APP_NAME.app/Contents/Info.plist")"
           test "$BUILT" = "$VERSION" || { echo "::error::built app is $BUILT, tag is $VERSION"; exit 1; }
 
+      # Final releases only, and before the two notarizations: a forgotten
+      # CFBundleVersion bump should not cost two notary round trips.
+      - name: Check bundle version
+        if: ${{ !contains(github.ref_name, '-') }}
+        run: |
+          # shellcheck source=scripts/release-lib.sh
+          . "$GITHUB_WORKSPACE/scripts/release-lib.sh"
+          BUNDLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$DIST/$APP_NAME.app/Contents/Info.plist")"
+          # The published feed: a 404 means no Sparkle release yet.
+          FEED="$RUNNER_TEMP/feed.xml"
+          FEED_URL="https://github.com/$GITHUB_REPOSITORY/releases/latest/download/appcast.xml"
+          CODE="$(curl -sSL -o "$FEED" -w '%{http_code}' "$FEED_URL")"
+          # A 404 is the first Sparkle release; an unreadable feed fails the release.
+          PREVIOUS="$(previous_feed_version "$CODE" "$FEED")"
+          if ! bundle_version_increases "$BUNDLE" "$PREVIOUS"; then
+            echo "::error::CFBundleVersion $BUNDLE is not above the published $PREVIOUS"
+            exit 1
+          fi
+
       - name: Import signing certificate
         env:
           APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
@@ -208,19 +227,7 @@ jobs:
           SPARKLE_VERSION: "2.10.0"
           SPARKLE_SHA256: c2bf58aa8387266ac179357b1415d6f2635f044da8be41042af32425dae6da0c
         run: |
-          # shellcheck source=scripts/release-lib.sh
-          . "$GITHUB_WORKSPACE/scripts/release-lib.sh"
           BUNDLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$DIST/$APP_NAME.app/Contents/Info.plist")"
-          # The published feed: a 404 means no Sparkle release yet.
-          FEED="$RUNNER_TEMP/feed.xml"
-          FEED_URL="https://github.com/$GITHUB_REPOSITORY/releases/latest/download/appcast.xml"
-          CODE="$(curl -sSL -o "$FEED" -w '%{http_code}' "$FEED_URL")"
-          # A 404 is the first Sparkle release; an unreadable feed fails the release.
-          PREVIOUS="$(previous_feed_version "$CODE" "$FEED")"
-          if ! bundle_version_increases "$BUNDLE" "$PREVIOUS"; then
-            echo "::error::CFBundleVersion $BUNDLE is not above the published $PREVIOUS"
-            exit 1
-          fi
           # Sparkle's signing tool, pinned by version and checked by sha256.
           TOOLS="$RUNNER_TEMP/sparkle-tools"
           mkdir -p "$TOOLS"
@@ -307,6 +314,8 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
       - name: Update Homebrew tap
         env:
           RELEASE_TOKEN: ${{ github.token }}
@@ -322,6 +331,16 @@ jobs:
           gh auth setup-git
           TAP="$RUNNER_TEMP/homebrew-tap"
           gh repo clone matthieuh/homebrew-tap "$TAP"
+          # A late rerun of an older tag must not downgrade the tap.
+          # shellcheck source=scripts/release-lib.sh
+          . "$GITHUB_WORKSPACE/scripts/release-lib.sh"
+          if [ -f "$TAP/Formula/btp.rb" ]; then
+            TAP_VERSION="$(formula_version "$TAP/Formula/btp.rb")"
+            if tap_is_ahead "$TAP_VERSION" "$VERSION"; then
+              echo "tap is at $TAP_VERSION, above $VERSION: leaving it untouched"
+              exit 0
+            fi
+          fi
           mkdir -p "$TAP/Formula" "$TAP/Casks"
           cp "$RUNNER_TEMP/rendered/btp.rb" "$TAP/Formula/btp.rb"
           cp "$RUNNER_TEMP/rendered/balance-ton-port.rb" "$TAP/Casks/balance-ton-port.rb"
