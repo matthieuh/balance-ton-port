@@ -6,13 +6,20 @@ struct BalanceTonPortApp: App {
     @StateObject private var model = CoreModel()
     @StateObject private var updates = UpdateController()
     @StateObject private var language = LanguageModel.shared
+    @StateObject private var memory = MemoryPressureMonitor()
 
     var body: some Scene {
         // MenuIcon is a pig snout template image (Assets.xcassets), so it
-        // follows the menu bar's light and dark look.
-        MenuBarExtra("Balance ton port", image: "MenuIcon") {
+        // follows the menu bar's light and dark look, until it takes a status
+        // color (MenuBarLabel).
+        MenuBarExtra {
             MenuView()
                 .environmentObject(model)
+                .languaged(language)
+        } label: {
+            MenuBarLabel()
+                .environmentObject(model)
+                .environmentObject(memory)
                 .languaged(language)
         }
         .menuBarExtraStyle(.window)

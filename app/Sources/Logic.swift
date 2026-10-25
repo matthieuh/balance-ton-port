@@ -875,3 +875,26 @@ func addingPort(_ entry: String, to ports: [UInt16]) -> [UInt16]? {
     guard let port = UInt16(text), port > 0, !ports.contains(port) else { return nil }
     return ports + [port]
 }
+
+/// What the menu bar pig shows: red when memory pressure is critical, orange
+/// when it is at warning or servers need you, plain otherwise (`tint` nil).
+/// The count is the "Needs you" cards, capped at `9+`.
+enum StatusTint: Equatable, Sendable {
+    case warning, critical
+}
+
+struct MenuBarStatus: Equatable, Sendable {
+    let tint: StatusTint?
+    let count: String?
+}
+
+func menuBarStatus(needsYou: Int, pressure: MemoryPressure) -> MenuBarStatus {
+    let count = needsYou <= 0 ? nil : needsYou > 9 ? "9+" : String(needsYou)
+    let tint: StatusTint?
+    switch pressure {
+    case .critical: tint = .critical
+    case .warning: tint = .warning
+    case .normal: tint = needsYou > 0 ? .warning : nil
+    }
+    return MenuBarStatus(tint: tint, count: count)
+}

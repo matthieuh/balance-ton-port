@@ -396,6 +396,7 @@ final class NotificationSetupTests: XCTestCase {
             nothingToDecide, moreLabel(2), recentlyStoppedLabel(1), headerCount(7), headerCount(1),
             sectionTitle("Needs you", count: 2), sectionTitle("All good", count: 5), rowSubtitle(s),
             agentBadge(s).text, rowStatus(s, notificationsOff: true),
+            menuBarAccessibilityLabel(needsYou: 3, pressure: .critical),
         ] + ["restart", "postpone", "stop"].map { cardActionLabel(CardFfi(kind: "leak", reason: "", action: $0)) }
         for text in menuCopy {
             XCTAssertFalse(text.contains("\u{2014}"), text)
@@ -1227,4 +1228,45 @@ private func statusOf(_ text: String) -> StatusFfi {
         return status("kept_by_agent", 0, String(rest[..<colon.lowerBound]), String(reason))
     }
     return status("idle", UInt64(text.split(separator: " ").dropFirst().first.flatMap { Int($0) } ?? 0))
+}
+
+final class MenuBarStatusTests: XCTestCase {
+    func testPlainPigWhenAllIsFine() {
+        XCTAssertEqual(menuBarStatus(needsYou: 0, pressure: .normal), MenuBarStatus(tint: nil, count: nil))
+    }
+
+    func testOrangeWithCountWhenServersNeedYou() {
+        XCTAssertEqual(menuBarStatus(needsYou: 3, pressure: .normal), MenuBarStatus(tint: .warning, count: "3"))
+    }
+
+    func testMemoryWarningIsOrangeCriticalIsRed() {
+        XCTAssertEqual(menuBarStatus(needsYou: 0, pressure: .warning), MenuBarStatus(tint: .warning, count: nil))
+        XCTAssertEqual(menuBarStatus(needsYou: 0, pressure: .critical), MenuBarStatus(tint: .critical, count: nil))
+    }
+
+    func testCriticalWinsAndKeepsTheCount() {
+        XCTAssertEqual(menuBarStatus(needsYou: 2, pressure: .critical), MenuBarStatus(tint: .critical, count: "2"))
+        XCTAssertEqual(menuBarStatus(needsYou: 2, pressure: .warning), MenuBarStatus(tint: .warning, count: "2"))
+    }
+
+    func testCountCapsAtNinePlus() {
+        XCTAssertEqual(menuBarStatus(needsYou: 9, pressure: .normal).count, "9")
+        XCTAssertEqual(menuBarStatus(needsYou: 10, pressure: .normal).count, "9+")
+    }
+
+    func testPressureFromSysctlLevel() {
+        XCTAssertEqual(MemoryPressure(sysctlLevel: 1), .normal)
+        XCTAssertEqual(MemoryPressure(sysctlLevel: 2), .warning)
+        XCTAssertEqual(MemoryPressure(sysctlLevel: 4), .critical)
+        XCTAssertEqual(MemoryPressure(sysctlLevel: 0), .normal)
+    }
+
+    func testAccessibilityLabelNamesEachProblem() {
+        XCTAssertEqual(menuBarAccessibilityLabel(needsYou: 0, pressure: .normal), "Balance ton port")
+        XCTAssertEqual(menuBarAccessibilityLabel(needsYou: 1, pressure: .normal), "Balance ton port, 1 server needs you")
+        XCTAssertEqual(
+            menuBarAccessibilityLabel(needsYou: 3, pressure: .warning),
+            "Balance ton port, 3 servers need you, memory pressure high"
+        )
+    }
 }

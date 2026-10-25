@@ -36,8 +36,8 @@ targets:
       properties:
         CFBundleName: Balance ton port
         CFBundleDisplayName: Balance ton port
-        CFBundleShortVersionString: "0.4.2"
-        CFBundleVersion: "6"
+        CFBundleShortVersionString: "0.4.3"
+        CFBundleVersion: "7"
         LSUIElement: true
         LSMinimumSystemVersion: "14.0"
         NSHumanReadableCopyright: ""
@@ -65,6 +65,7 @@ targets:
     sources:
       - path: Tests
       - path: Sources/Logic.swift
+      - path: Sources/MemoryPressure.swift
       - path: Sources/Copy.swift
       - path: Sources/Menu/MenuStyle.swift
       - path: Sources/Updates.swift
