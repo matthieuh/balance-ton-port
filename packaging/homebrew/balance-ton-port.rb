@@ -11,7 +11,7 @@ cask "balance-ton-port" do
   homepage "https://github.com/matthieuh/balance-ton-port"
 
   auto_updates true
-  depends_on macos: ">= :sonoma"
+  depends_on macos: :sonoma
 
   app "Balance ton port.app"
 

@@ -75,6 +75,11 @@ jobs:
       - name: Release script tests
         run: bash scripts/test-release-scripts.sh
 
+      # Homebrew's own audit and install dry run on the rendered formula and
+      # cask, in a throwaway tap.
+      - name: Homebrew checks
+        run: scripts/check-homebrew.sh
+
       - name: Build xcframework
         run: scripts/build-xcframework.sh
 

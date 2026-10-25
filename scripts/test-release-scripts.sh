@@ -52,7 +52,7 @@ check "render: every token replaced" tokens_replaced
 
 # --- templates --------------------------------------------------------------
 check "formula is macOS only" bash -c \
-  'grep -q "depends_on macos: \">= :sonoma\"" "$1" && ! grep -qE "on_linux|on_intel|on_arm" "$1"' _ "$repo/packaging/homebrew/btp.rb"
+  'grep -q "depends_on macos: :sonoma" "$1" && ! grep -qE "on_linux|on_intel|on_arm" "$1"' _ "$repo/packaging/homebrew/btp.rb"
 check "cask_declares_auto_updates" grep -q '^  auto_updates true$' "$out/balance-ton-port.rb"
 check "descs say coding-agent sessions" bash -c \
   'grep -q "coding-agent sessions" "$1" && grep -q "coding-agent sessions" "$2"' _ "$out/btp.rb" "$out/balance-ton-port.rb"
