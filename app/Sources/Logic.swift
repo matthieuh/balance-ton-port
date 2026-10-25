@@ -72,18 +72,34 @@ func sectionsMaxHeight(screenHeight: CGFloat) -> CGFloat {
     max(200, screenHeight - 220)
 }
 
-/// The menu's two lists: servers that need a decision (one card each) and
-/// the others, of which the first `visibleAllGood` show before the fold.
+/// The menu's lists: servers that need a decision (one card each), the
+/// others, of which the first `visibleAllGood` show before the fold, and the
+/// quiet listeners folded under "Other ports".
 struct MenuSections {
     let needsYou: [ServerViewFfi]
     let allGood: [ServerViewFfi]
     let hiddenCount: Int
+    let otherPorts: [ServerViewFfi]
+}
+
+/// Under this, a listener with no agent and no known tool (ssh, adb, a
+/// tunnel) waits under "Other ports"; past it, it is back in the list.
+let quietListenerMaxBytes: UInt64 = 100 * 1_048_576
+
+func isQuietListener(_ s: ServerViewFfi) -> Bool {
+    !s.managed && s.agent.isEmpty && (s.framework ?? "").isEmpty && s.rssBytes < quietListenerMaxBytes
+}
+
+/// Memory in 64 MB steps: rows sort by it, so two servers of about the same
+/// size do not swap at every pass.
+private func memoryStep(_ s: ServerViewFfi) -> UInt64 {
+    s.rssBytes / (64 * 1_048_576)
 }
 
 /// Cards: leak, session ended but open, about to stop, idle alert, then the
-/// biggest first. All good: agent servers by port, then the others by port.
-/// The port (then the pid) breaks every tie, so rows never swap between
-/// passes.
+/// biggest first. All good: the biggest first (in 64 MB steps); quiet
+/// listeners go to Other ports, by port. The port (then the pid) breaks
+/// every tie, so rows do not swap between passes.
 func menuSections(_ servers: [ServerViewFfi], visibleAllGood: Int = allGoodVisibleRows) -> MenuSections {
     let cards = servers.filter { $0.card != nil }.sorted {
         let (a, b) = (cardRank($0.card?.kind), cardRank($1.card?.kind))
@@ -91,12 +107,14 @@ func menuSections(_ servers: [ServerViewFfi], visibleAllGood: Int = allGoodVisib
         if $0.rssBytes != $1.rssBytes { return $0.rssBytes > $1.rssBytes }
         return ($0.port, $0.pid) < ($1.port, $1.pid)
     }
-    let rest = servers.filter { $0.card == nil }.sorted {
-        if $0.managed != $1.managed { return $0.managed }
-        return ($0.port, $0.pid) < ($1.port, $1.pid)
+    let byPort: (ServerViewFfi, ServerViewFfi) -> Bool = { ($0.port, $0.pid) < ($1.port, $1.pid) }
+    let others = servers.filter { $0.card == nil && isQuietListener($0) }.sorted(by: byPort)
+    let rest = servers.filter { $0.card == nil && !isQuietListener($0) }.sorted {
+        let (a, b) = (memoryStep($0), memoryStep($1))
+        return a != b ? a > b : byPort($0, $1)
     }
     let shown = Array(rest.prefix(max(0, visibleAllGood)))
-    return MenuSections(needsYou: cards, allGood: shown, hiddenCount: rest.count - shown.count)
+    return MenuSections(needsYou: cards, allGood: shown, hiddenCount: rest.count - shown.count, otherPorts: others)
 }
 
 private func cardRank(_ kind: String?) -> Int {

@@ -22,9 +22,11 @@ pub fn tool_label(command: &str) -> String {
         if is_flag(w) {
             continue;
         }
-        // `node …/react-native/cli.js start` runs Metro too.
+        // `node …/react-native/cli.js start` runs Metro too, and
+        // `node …/wrangler/wrangler-dist/cli.js dev` runs wrangler.
         let name = match program_name(w).as_str() {
             "cli" if w.contains("/react-native/") => "react-native".to_string(),
+            "cli" if w.contains("/wrangler/") => "wrangler".to_string(),
             n => n.to_string(),
         };
         if program_pos || w.contains("node_modules/.bin/") {
@@ -445,6 +447,14 @@ pub(crate) mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(".git"), format!("gitdir: {gitdir}\n")).unwrap();
         dir
+    }
+
+    #[test]
+    fn wrangler_run_through_node() {
+        let cmd = "/u/.hermes/node/bin/node --no-warnings --experimental-vm-modules \
+                   /w/node_modules/wrangler/wrangler-dist/cli.js dev --port=3017";
+        assert_eq!(tool_label(cmd), "wrangler dev");
+        assert_eq!(framework(cmd, None).as_deref(), Some("wrangler"));
     }
 
     #[test]

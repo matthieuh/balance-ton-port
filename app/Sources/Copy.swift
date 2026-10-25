@@ -303,6 +303,11 @@ func moreLabel(_ n: Int, bundle: Bundle = copyBundle, locale: Locale = copyLocal
     L("+ \(n) more \u{25B8}", bundle, locale)
 }
 
+/// `Other ports (4)`: the fold of quiet listeners.
+func otherPortsLabel(_ n: Int, bundle: Bundle = copyBundle, locale: Locale = copyLocale) -> String {
+    L("Other ports (\(n))", bundle, locale)
+}
+
 /// `Recently stopped (1)`.
 func recentlyStoppedLabel(_ n: Int, bundle: Bundle = copyBundle, locale: Locale = copyLocale) -> String {
     L("Recently stopped (\(n))", bundle, locale)
