@@ -624,6 +624,13 @@ final class MenuLayoutTests: XCTestCase {
         XCTAssertEqual(sectionsMaxHeight(screenHeight: 300), 200)
     }
 
+    func testMiddleTruncatedKeepsBothEnds() {
+        XCTAssertEqual(middleTruncated("chore/node-security-release-oct-2026", max: 18), "chore/nod\u{2026}oct-2026")
+        XCTAssertEqual(middleTruncated("chore/node-security-release-oct-2026", max: 18).count, 18)
+        XCTAssertEqual(middleTruncated("website-1-26", max: 18), "website-1-26")
+        XCTAssertEqual(middleTruncated("abc", max: 1), "abc")
+    }
+
     func testTitlePartsDropARepeatedFramework() {
         XCTAssertEqual(titleParts(menuServer(title: "Revva", framework: "Expo")).framework, "Expo")
         XCTAssertNil(titleParts(menuServer(title: "Vite", framework: "Vite")).framework)

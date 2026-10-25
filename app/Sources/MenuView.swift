@@ -117,7 +117,7 @@ struct MenuView: View {
                     } label: {
                         Text(verbatim: moreLabel(sections.hiddenCount, bundle: language.bundle, locale: language.locale))
                             .font(.system(size: 12))
-                            .foregroundStyle(Color(nsColor: .tertiaryLabelColor))
+                            .foregroundStyle(.secondary)
                             .padding(.vertical, 4)
                             .padding(.horizontal, 6)
                             .contentShape(Rectangle())

@@ -2,8 +2,9 @@ import AppKit
 import SwiftUI
 
 /// The second line of a card or row: port in its color, other ports, branch
-/// or project, agent badge, and (rows only) the status. The place gives way
-/// first (cut in the middle); the status stays whole.
+/// or project, agent badge, and (rows only) the status. Short of room it
+/// drops the other ports, then shortens the place, then drops it; the status
+/// is cut last.
 struct ServerSubtitle: View {
     let server: ServerViewFfi
     var status: String?
@@ -12,18 +13,29 @@ struct ServerSubtitle: View {
 
     var body: some View {
         let p = subtitleParts(server, bundle: language.bundle, locale: language.locale)
+        ViewThatFits(in: .horizontal) {
+            line(p, otherPorts: true, place: p.place)
+            line(p, otherPorts: false, place: p.place)
+            line(p, otherPorts: false, place: p.place.map { middleTruncated($0, max: 18) })
+            line(p, otherPorts: false, place: nil)
+        }
+        .font(.system(size: 12))
+        .foregroundStyle(.secondary)
+        .lineLimit(1)
+    }
+
+    private func line(_ p: SubtitleParts, otherPorts: Bool, place: String?) -> some View {
         let badge = agentBadge(server, bundle: language.bundle, locale: language.locale)
         let sep = " \u{00B7} "
         let port = Text(verbatim: p.port)
             .font(.system(size: 12, design: .monospaced))
             .foregroundColor(portColor(server.port, dark: scheme == .dark))
-        HStack(spacing: 0) {
-            (p.otherPorts.map { port + Text(verbatim: " " + $0) } ?? port)
+        return HStack(spacing: 0) {
+            (otherPorts ? p.otherPorts.map { port + Text(verbatim: " " + $0) } ?? port : port)
                 .fixedSize()
-            if let place = p.place {
+            if let place {
                 Text(verbatim: sep + place)
-                    .truncationMode(.middle)
-                    .layoutPriority(0)
+                    .fixedSize()
             }
             (Text(verbatim: sep) + Text(verbatim: badge.text)
                 .foregroundColor(badge.color ?? Color(nsColor: .tertiaryLabelColor)))
@@ -31,26 +43,28 @@ struct ServerSubtitle: View {
             if let status {
                 Text(verbatim: sep + status)
                     .truncationMode(.tail)
-                    .layoutPriority(2)
             }
         }
-        .font(.system(size: 12))
-        .foregroundStyle(.secondary)
-        .lineLimit(1)
     }
 }
 
-/// The title line: bold title, then ` · framework` in secondary.
+/// The title line: bold title, then ` · framework` in secondary, which goes
+/// first when the title does not fit.
 struct ServerTitle: View {
     let server: ServerViewFfi
 
     var body: some View {
         let t = titleParts(server)
-        var line = Text(verbatim: t.title).fontWeight(.semibold)
-        if let f = t.framework {
-            line = line + Text(verbatim: " \u{00B7} \(f)").font(.system(size: 12)).foregroundColor(.secondary)
+        let title = Text(verbatim: t.title).fontWeight(.semibold)
+        ViewThatFits(in: .horizontal) {
+            if let f = t.framework {
+                (title + Text(verbatim: " \u{00B7} \(f)").font(.system(size: 12)).foregroundColor(.secondary))
+                    .fixedSize()
+            }
+            title.truncationMode(.tail)
         }
-        return line.font(.system(size: 13)).lineLimit(1).truncationMode(.tail)
+        .font(.system(size: 13))
+        .lineLimit(1)
     }
 }
 
@@ -80,7 +94,7 @@ struct ServerRowView: View {
             // Stays in the layout while hovering, so the row never reflows.
             gauge
             Text(verbatim: memoryLabel(server.rssBytes, locale: language.locale))
-                .font(.system(size: 12, design: .monospaced))
+                .font(.system(size: 12).monospacedDigit())
                 .foregroundStyle(sizeColor(server.health) ?? Color.secondary)
                 .frame(width: 54, alignment: .trailing)
         }
