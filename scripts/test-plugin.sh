@@ -601,8 +601,14 @@ check "download refuses when brew owns btp" test "$code" != 0 -a ! -e "$ihome/.l
 check "download refuses: ... says why" grep -q "btp is installed with Homebrew; update it with brew upgrade matthieuh/tap/btp" <<<"$out"
 
 make_release "$v"
+BTP_NO_BREW=1 brew_install
+check "BTP_NO_BREW skips brew" test "$code" = 0 -a "$("$ihome/.local/bin/btp" --version)" = "btp $v"
+check "BTP_NO_BREW: brew neither installs nor upgrades" bash -c '! grep -qE "install|upgrade" "$1"' _ "$FAKE_BREW_LOG"
+
+make_release "$v"
 FAKE_BREW_LIST=0 BTP_NO_BREW=1 brew_install
-check "BTP_NO_BREW skips brew" test "$code" = 0 -a ! -s "$FAKE_BREW_LOG" -a "$("$ihome/.local/bin/btp" --version)" = "btp $v"
+check "BTP_NO_BREW with a Homebrew btp: refused, no second copy" test "$code" != 0 -a ! -e "$ihome/.local/bin/btp"
+check "BTP_NO_BREW with a Homebrew btp: ... says why" grep -q "btp is installed with Homebrew; update it with brew upgrade matthieuh/tap/btp" <<<"$out"
 
 make_release "$v"
 ihome="$work/ihome-brewlag"
