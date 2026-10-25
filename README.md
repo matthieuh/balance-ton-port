@@ -11,11 +11,11 @@ It is a macOS menu bar app plus a `btp` CLI, both on one Rust core, and an agent
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/menu-en-dark.png">
-    <img src="docs/screenshots/menu-en-light.png" width="420" alt="The menu: two servers need you (a leak to restart, an idle Codex session), the others sorted by memory, quiet ports folded">
+    <img src="docs/screenshots/menu-en-light.png" width="49%" alt="The menu: two servers need you (a leak to restart, an idle Codex session), the others sorted by memory, quiet ports folded">
   </picture>
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/detail-en-dark.png">
-    <img src="docs/screenshots/detail-en-light.png" width="420" alt="A server's detail: memory over the last 2 hours with its events, the session, the processes, Restart and Stop">
+    <img src="docs/screenshots/detail-en-light.png" width="49%" alt="A server's detail: memory over the last 2 hours with its events, the session, the processes, Restart and Stop">
   </picture>
 </p>
 <p align="center">
