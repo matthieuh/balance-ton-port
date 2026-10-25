@@ -1,6 +1,6 @@
 # Releasing
 
-CI (`.github/workflows/ci.yml`) runs fmt, clippy, the Rust tests and the Swift tests on every push and pull request. A `v*` tag runs `.github/workflows/release.yml`: universal `btp` and app, signed with the HAPPYSOLVERS Developer ID, notarized, app stapled, app packed by `scripts/make-dmg.sh` into `BalanceTonPort-<v>.dmg` (app plus an Applications link), the dmg signed, notarized and stapled too, then a GitHub release with `btp-<v>-macos-universal.tar.gz`, `BalanceTonPort-<v>.dmg`, their `.sha256` files, the filled Homebrew formula and cask, and notes generated from the merged pull requests. A tag with a hyphen (`v0.2.0-beta.1`) is published as a prerelease. Nothing is published unless every step passed.
+CI (`.github/workflows/ci.yml`) runs fmt, clippy, the Rust tests and the Swift tests on every push and pull request. A `v*` tag runs `.github/workflows/release.yml`: universal `btp` and app, signed with the HAPPYSOLVERS Developer ID, notarized, app stapled, app packed by `scripts/make-dmg.sh` into `BalanceTonPort-<v>.dmg` (app plus an Applications link), the dmg signed, notarized and stapled too, then a GitHub release with `btp-<v>-macos-universal.tar.gz`, `BalanceTonPort-<v>.dmg`, their `.sha256` files, the filled Homebrew formula and cask, and notes generated from the merged pull requests. For a final release it also signs the dmg with the Sparkle key and attaches `appcast.xml` (the update feed, `https://github.com/matthieuh/balance-ton-port/releases/latest/download/appcast.xml`), and the `tap` job then pushes the formula and cask to the Homebrew tap. A tag with a hyphen (`v0.2.0-beta.1`) is published as a prerelease, with no appcast and no tap update, so installed apps and `brew` keep the previous final release. Nothing is published unless every step passed.
 
 ### Repository secrets (one time)
 
@@ -26,6 +26,7 @@ Settings > Secrets and variables > Actions, or `gh secret set NAME`:
    ```
 
 3. Check the release: download the dmg, `spctl -a -t open --context context:primary-signature -vv BalanceTonPort-0.1.0.dmg` must say `accepted, source=Notarized Developer ID`; open it, drag the app to Applications, then `spctl -a -vv "/Applications/Balance ton port.app"` must say the same.
+4. Final releases only: check the feed and the tap. `curl -sL https://github.com/matthieuh/balance-ton-port/releases/latest/download/appcast.xml` must show the new version, `sparkle:version` (the build number) and an `edSignature`; the `tap` job must be green (a new commit in `matthieuh/homebrew-tap`), then run the `brew` checks under "Publishing to Homebrew". An installed older app picks the update up within a day, or at once with Settings > About > Check for Updates.
 
 ### The Claude Code plugin
 

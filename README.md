@@ -38,12 +38,18 @@ The full design, limitations included, is in [docs/design.md](docs/design.md).
 
 Menu bar app: download `BalanceTonPort-<version>.dmg` from [GitHub Releases](https://github.com/matthieuh/balance-ton-port/releases), open it and drag Balance ton port to Applications. The image and the app are signed with a Developer ID and notarized. The `btp` CLI is attached to the same release as `btp-<version>-macos-universal.tar.gz`.
 
-Homebrew (coming with the first release):
+Homebrew (macOS; Linux support comes later):
 
 ```bash
-brew install matthieuh/tap/btp                   # CLI
+brew install matthieuh/tap/btp                       # CLI
 brew install --cask matthieuh/tap/balance-ton-port   # menu bar app
 ```
+
+The tap is updated by every final release. The cask is marked `auto_updates`, so the app updates itself and `brew upgrade` leaves it alone.
+
+**Updates.** The app checks for a new version once a day through Sparkle and, by default, downloads and installs it in the background. Settings > About shows the version and build, a Check for Updates button and an Update automatically switch. Updates are signed with an EdDSA key and come from the GitHub release; the feed is `https://github.com/matthieuh/balance-ton-port/releases/latest/download/appcast.xml`. Prereleases are never offered. The CLI does not update itself: use `brew upgrade btp`, or download the new tarball.
+
+**Languages.** The app speaks English, German, French, Spanish, Simplified Chinese, Hebrew (right to left), Japanese and Ukrainian. Settings > General > Language picks one, or System default, and applies at once. The `btp` CLI stays in English. See [LOCALIZATION.md](LOCALIZATION.md) to review or add a language.
 
 From source today (macOS, Xcode, rustup with the aarch64 and x86_64 darwin targets, XcodeGen):
 
@@ -105,7 +111,7 @@ In Claude Code:
 
 What the plugin does: it ships the agent skill, and when a session quits it records the dev servers that session left running. It never stops one at that moment. If you chose "Exit and stop tasks", Claude Code has already stopped its own tasks and there is nothing to record. If you chose "Move to background and exit", the servers were kept on purpose: you get one notification ("Session ended: 2 servers kept running: ... Stopped after 20 min unused, once no session works in that folder"). The background session keeps them while it runs; once it ends, each server is stopped after `dead_session_idle_s` unused, by the app, by `btp watch`, or by a small detached process when neither runs. `/clear` and `/resume` stop nothing: servers left by the earlier conversation and idle more than 5 minutes are offered once, in a single question from Claude.
 
-It needs the `btp` CLI. At the next session start, if `btp` is missing or too old, Claude asks whether to install it; on yes the plugin downloads the latest release, checks its sha256 and its Developer ID signature, and installs it to `~/.local/bin/btp` (never with sudo, and it only replaces a `btp` it installed itself). A "no" is remembered; `/balance-ton-port:install` installs it later. To see what the hook found, start Claude Code with `BTP_HOOK_DEBUG=1`: a trace is appended to `session-end.log` in the data dir.
+It needs the `btp` CLI. At the next session start, if `btp` is missing or too old, Claude asks whether to install it; on yes the plugin runs `brew install matthieuh/tap/btp` when Homebrew is present (`BTP_NO_BREW=1` skips it). Otherwise, or if brew fails, it downloads the latest release, checks its sha256 and its Developer ID signature, and installs it to `~/.local/bin/btp` (never with sudo, and it only replaces a `btp` it installed itself). A "no" is remembered; `/balance-ton-port:install` installs it later. To see what the hook found, start Claude Code with `BTP_HOOK_DEBUG=1`: a trace is appended to `session-end.log` in the data dir.
 
 ## Agent skill
 
