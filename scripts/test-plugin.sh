@@ -401,6 +401,13 @@ brewbin="$work/brewbin"
 mkdir -p "$brewbin"
 cat >"$brewbin/brew" <<'BREWEOF'
 #!/bin/bash
+case "${1:-}" in
+  --prefix)
+    # Not logged: the install script asks for it after a successful install.
+    echo "${FAKE_BREW_PREFIX:-$FAKE_BREW_LOG.prefix}"
+    exit 0
+    ;;
+esac
 echo "$*" >>"$FAKE_BREW_LOG"
 case "${1:-}" in
   list)
@@ -596,6 +603,18 @@ check "download refuses: ... says why" grep -q "btp is installed with Homebrew; 
 make_release "$v"
 FAKE_BREW_LIST=0 BTP_NO_BREW=1 brew_install
 check "BTP_NO_BREW skips brew" test "$code" = 0 -a ! -s "$FAKE_BREW_LOG" -a "$("$ihome/.local/bin/btp" --version)" = "btp $v"
+
+make_release "$v"
+ihome="$work/ihome-brewlag"
+mkdir -p "$work/brewprefix/bin"
+printf '#!/bin/bash\necho "btp 0.1.0"\n' >"$work/brewprefix/bin/btp"
+chmod +x "$work/brewprefix/bin/btp"
+marked_copy "$ihome"
+KEEP_HOME=1 FAKE_BREW_PREFIX="$work/brewprefix" brew_install --data-dir "$ihome/data"
+check "brew installs a btp below the minimum: refused" test "$code" != 0
+check "brew too old: ... says why" grep -q "Homebrew installed btp 0.1.0, older than this plugin needs" <<<"$out"
+check "brew too old: the latest release tag is recorded" test "$(cat "$ihome/data/install-refused")" = "v$v"
+check "brew too old: the plugin copy is left alone" test -e "$ihome/.local/bin/btp"
 
 # --- no em dash -------------------------------------------------------------
 

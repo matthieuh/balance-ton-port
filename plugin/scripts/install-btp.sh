@@ -107,6 +107,18 @@ if [ -n "$use_brew" ]; then
   say "brew $verb $FORMULA"
   if brew "$verb" "$FORMULA" 2>"$brew_err"; then
     rm -f "$brew_err"
+    # The tap can lag the release (a failed tap job): brew succeeding does not
+    # mean the plugin's minimum is met. An unreadable version is not judged.
+    brewed="$(brew --prefix 2>/dev/null || true)/bin/btp"
+    if brewed_version="$(btp_version "$brewed")" && ! btp_version_ge "$brewed_version" "$BTP_MIN"; then
+      latest_json="$(mktemp "${TMPDIR:-/tmp}/btp-latest.XXXXXX")"
+      refused_tag="v$brewed_version"
+      if btp_fetch "$BTP_LATEST_URL" "$latest_json" && latest_tag="$(btp_tag_of "$latest_json")"; then
+        refused_tag="$latest_tag"
+      fi
+      rm -f "$latest_json"
+      refuse_release "$refused_tag" "Homebrew installed btp $brewed_version, older than this plugin needs ($BTP_MIN); the tap may lag the latest release, so try brew update and brew upgrade $FORMULA later. It will offer the install again once a newer release is out"
+    fi
     # The copy this script installed is superseded; one it did not install stays.
     if [ -f "$dest" ] && [ ! -L "$dest" ] && [ -f "$marker" ] && [ "$(cat "$marker")" = "$(sha256_of "$dest")" ]; then
       rm -f "$dest" "$marker"
