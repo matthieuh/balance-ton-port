@@ -12,6 +12,7 @@ struct MenuView: View {
     @Environment(\.colorScheme) private var scheme
     @StateObject private var nav = MenuNavigation()
     @State private var showAll = false
+    @State private var showOtherPorts = false
     /// The cards and rows' natural height, measured, so the scroll view is
     /// only as tall as its content up to `sectionsMaxHeight`.
     @State private var sectionsHeight: CGFloat = 0
@@ -123,6 +124,31 @@ struct MenuView: View {
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(PressableStyle())
+                }
+            }
+
+            if !sections.otherPorts.isEmpty {
+                Button {
+                    showOtherPorts.toggle()
+                } label: {
+                    Text(verbatim: otherPortsLabel(sections.otherPorts.count, bundle: language.bundle, locale: language.locale)
+                        + (showOtherPorts ? " \u{25BE}" : " \u{25B8}"))
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 8)
+                        .padding(.vertical, 4)
+                        .padding(.horizontal, 6)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(PressableStyle())
+                if showOtherPorts {
+                    ForEach(sections.otherPorts, id: \.id) { server in
+                        ServerRowView(
+                            server: server, favicon: model.icons[server.id],
+                            notificationsOff: model.unnotified.contains(server.id),
+                            note: model.rowNotes[server.id]
+                        )
+                    }
                 }
             }
         }

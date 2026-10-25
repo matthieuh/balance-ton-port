@@ -3,7 +3,8 @@ import SwiftUI
 
 /// The second line of a card or row: port in its color, other ports, branch
 /// or project, agent badge, and (rows only) the status. Short of room it
-/// drops the other ports, then shortens the place, then drops it; the status
+/// drops the other ports, then shortens the place (18, then 10
+/// characters), then drops it; the status
 /// is cut last.
 struct ServerSubtitle: View {
     let server: ServerViewFfi
@@ -17,6 +18,7 @@ struct ServerSubtitle: View {
             line(p, otherPorts: true, place: p.place)
             line(p, otherPorts: false, place: p.place)
             line(p, otherPorts: false, place: p.place.map { middleTruncated($0, max: 18) })
+            line(p, otherPorts: false, place: p.place.map { middleTruncated($0, max: 10) })
             line(p, otherPorts: false, place: nil)
         }
         .font(.system(size: 12))

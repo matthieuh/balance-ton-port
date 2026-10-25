@@ -534,19 +534,36 @@ private func menuServer(
 final class MenuLayoutTests: XCTestCase {
     func testSectionsOrderCardsAndFoldAllGood() {
         let servers = [
-            menuServer(port: 8081),
-            menuServer(port: 3000, managed: false, agent: ""),
+            menuServer(port: 8081, rssMb: 200),
+            menuServer(port: 3000, managed: false, agent: "", rssMb: 20),
             menuServer(port: 3010, card: "about_to_stop", action: "postpone"),
-            menuServer(port: 4400),
+            menuServer(port: 4400, rssMb: 50),
             menuServer(port: 5173, agent: "codex", card: "leak", action: "restart"),
-            menuServer(port: 1234, managed: false, agent: ""),
-            menuServer(port: 9000),
+            menuServer(port: 1234, managed: false, agent: "", rssMb: 300),
+            menuServer(port: 9000, rssMb: 900),
         ]
         let m = menuSections(servers)
         XCTAssertEqual(m.needsYou.map(\.port), [5173, 3010])
-        XCTAssertEqual(m.allGood.map(\.port), [4400, 8081, 9000], "agent servers first, by port")
-        XCTAssertEqual(m.hiddenCount, 2)
-        XCTAssertEqual(menuSections(servers, visibleAllGood: 10).allGood.map(\.port), [4400, 8081, 9000, 1234, 3000])
+        XCTAssertEqual(m.allGood.map(\.port), [9000, 1234, 8081], "biggest first")
+        XCTAssertEqual(m.hiddenCount, 1)
+        XCTAssertEqual(m.otherPorts.map(\.port), [3000], "a small listener with no agent waits under Other ports")
+        XCTAssertEqual(menuSections(servers, visibleAllGood: 10).allGood.map(\.port), [9000, 1234, 8081, 4400])
+    }
+
+    func testAboutTheSameSizeKeepsPortOrder() {
+        let servers = [menuServer(port: 5000, rssMb: 130), menuServer(port: 4000, rssMb: 140)]
+        XCTAssertEqual(menuSections(servers, visibleAllGood: 10).allGood.map(\.port), [4000, 5000])
+    }
+
+    func testQuietListener() {
+        XCTAssertTrue(isQuietListener(menuServer(managed: false, agent: "", rssMb: 10)))
+        XCTAssertFalse(isQuietListener(menuServer(managed: false, agent: "", rssMb: 100)), "100 MB and up stays in the list")
+        XCTAssertFalse(isQuietListener(menuServer(managed: false, agent: "", rssMb: 10, framework: "Vite")))
+        XCTAssertFalse(isQuietListener(menuServer(rssMb: 10)), "an agent's server")
+    }
+
+    func testOtherPortsLabel() {
+        XCTAssertEqual(otherPortsLabel(4), "Other ports (4)")
     }
 
     func testCardsOrderByKindThenMemory() {
