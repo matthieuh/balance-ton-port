@@ -18,7 +18,7 @@ Settings > Secrets and variables > Actions, or `gh secret set NAME`:
 
 ### Cutting a release
 
-1. Bump the version in `crates/btp-cli/Cargo.toml` and in `app/project.yml` (`CFBundleShortVersionString`; `CFBundleVersion` must also increase on every final release, the release fails otherwise because Sparkle only offers a higher build number), then `(cd app && xcodegen generate)` to refresh `app/Info.plist`, and commit. The release fails if the tag does not match both.
+1. Bump the version in `crates/btp-cli/Cargo.toml` and in `app/project.yml` (`CFBundleShortVersionString`; `CFBundleVersion` must also increase on every final release, the release fails otherwise because Sparkle only offers a higher build number; every tag, betas included, raises `CFBundleVersion`, so a final is always above the betas that preceded it), then `(cd app && xcodegen generate)` to refresh `app/Info.plist`, and commit. The release fails if the tag does not match both.
 2. Tag and push:
 
    ```bash

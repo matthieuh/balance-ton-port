@@ -15,6 +15,7 @@ app supports and falls back to English.
 
 All app copy lives in one String Catalog, `app/Sources/Localizable.xcstrings`.
 The `btp` command line tool and the Claude Code plugin stay in English.
+Sparkle's own update dialogs follow the macOS language, not the language chosen in the app.
 
 ## Status
 
