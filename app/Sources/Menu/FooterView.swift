@@ -24,6 +24,11 @@ struct FooterView: View {
                 Spacer()
                 Menu {
                     Button(language.tr("Settings\u{2026}")) {
+                        // The menu panel floats above every window: close it so
+                        // Settings is not hidden behind it.
+                        for window in NSApp.windows where window.className.contains("MenuBarExtra") {
+                            window.orderOut(nil)
+                        }
                         NSApp.activate(ignoringOtherApps: true)
                         openSettings()
                     }
