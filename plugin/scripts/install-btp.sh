@@ -140,9 +140,11 @@ if [ -n "$use_brew" ]; then
     refuse "Homebrew could not upgrade btp$detail; try brew upgrade $FORMULA"
   fi
   say "Homebrew could not install it$detail; using the signed download instead"
-  if brew_owns_btp; then
-    refuse "btp is installed with Homebrew; update it with brew upgrade $FORMULA"
-  fi
+fi
+
+# Homebrew's btp is never joined by a second copy, whatever skipped brew above.
+if command -v brew >/dev/null 2>&1 && brew_owns_btp; then
+  refuse "btp is installed with Homebrew; update it with brew upgrade $FORMULA"
 fi
 
 # Only a btp this script installed, unchanged since, may be replaced.
