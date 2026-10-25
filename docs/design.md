@@ -132,7 +132,9 @@ The menu has a "Needs you" list with one card per server that needs a decision, 
 
 **Leaks.** A server leaks when its memory (the whole tree) is above `leak_memory_mb` (default 2048), or has grown by more than `leak_growth_mb` (default 500) in the last 10 minutes. The minimums are 100 and 50. Health is green below 500 MB, amber from 500 MB, red when it leaks. A leak raises one notification per leak episode. Ignore this alert dismisses the current alert only; it re-arms when memory grows another 500 MB. The leak state resets after 10 minutes without a leak, so a leak that flaps does not notify twice in a row. The leak state lives in memory: a relaunch of the app can notify an ongoing leak once more. Observed servers can leak too.
 
-**Updates.** The app checks for a new version once a day through Sparkle and, when automatic updates are on (the default), downloads and installs it in the background. This feed is the only network call besides localhost. Updates are signed with an EdDSA key and the app with Developer ID, and the download comes from the GitHub release.
+**Updates.** The app checks for a new version once a day through Sparkle and, when automatic updates are on (the default), downloads and installs it in the background. This feed is the only network call besides localhost. Updates are signed with an EdDSA key and the app with Developer ID, and the download comes from the GitHub release. The feed is `https://github.com/matthieuh/balance-ton-port/releases/latest/download/appcast.xml` (`SUFeedURL`), a release asset of the latest final release; a prerelease publishes no appcast, so `latest` keeps serving the previous feed. The app is not sandboxed and sends no system profile. Sparkle is pinned to 2.10.0. Settings > About shows the version and build, a Check for Updates button and the Update automatically switch, which moves Sparkle's check and download switches together. Sparkle offers an update only when `CFBundleVersion` is higher, so every final release must raise it.
+
+**Languages.** The app speaks eight languages (English, German, French, Spanish, Simplified Chinese, Hebrew, Japanese, Ukrainian), all copy in one String Catalog. Settings > General > Language picks one or System default (the first macOS preferred language the app supports, else English) and applies at once; Hebrew switches the layout to right to left. The choice is kept in the app's defaults, not in `config.toml`. The CLI and the plugin stay in English. See [LOCALIZATION.md](../LOCALIZATION.md).
 
 ## 12. History and probes
 
@@ -205,7 +207,7 @@ The plugin (`plugin/`) has two hooks, an install command and the agent skill.
 - The shared-worktree rule compares worktree roots only (see section 5).
 - A `btp watch` older than 0.3 ignores Postpone (it still stops on the usual countdown) and, when it rewrites `state.json`, drops the state 0.3 adds (postpones, pending restarts, `restarted_from` records, session folders). Run one version of `btp` and the app.
 - The kill log grows without bound, and the same kill can occasionally be recorded twice.
-- macOS only. The platform layer is behind a trait so that a Linux implementation (`/proc`) can follow.
+- macOS only (the Homebrew formula too). The platform layer is behind a trait so that a Linux implementation (`/proc`) can follow.
 
 ## 17. Architecture
 
@@ -223,4 +225,6 @@ plugin/           the Claude Code plugin: hooks, install script, the agent skill
 
 ## 18. Release pipeline
 
-CI runs fmt, clippy, the Rust tests and the Swift tests on every push and pull request. A `v*` tag runs the release workflow: it checks that the tag matches the CLI and app versions, builds a universal `btp` and app, signs them with a Developer ID, notarizes and staples the app, packs it into `BalanceTonPort-<v>.dmg` (signed, notarized and stapled too), and publishes a GitHub release with the CLI tarball, the dmg, their `.sha256` files and the Homebrew formula and cask filled with the version and checksums; a tag with a hyphen is a prerelease, and nothing is published unless every step passed. See [RELEASING.md](../RELEASING.md) for the secrets and the steps.
+CI runs fmt, clippy, the Rust tests and the Swift tests on every push and pull request. A `v*` tag runs the release workflow: it checks that the tag matches the CLI and app versions, builds a universal `btp` and app, signs them with a Developer ID, notarizes and staples the app, packs it into `BalanceTonPort-<v>.dmg` (signed, notarized and stapled too), and publishes a GitHub release with the CLI tarball, the dmg, their `.sha256` files and the Homebrew formula and cask filled with the version and checksums; a tag with a hyphen is a prerelease, and nothing is published unless every step passed.
+
+For a final release the workflow also signs the dmg with the Sparkle EdDSA key (`SPARKLE_ED_PRIVATE_KEY`) and attaches `appcast.xml`, after checking that `CFBundleVersion` is above the one in the published feed. A separate `tap` job (after `release`) then commits the filled formula (`btp`, macOS only for now) and cask (`balance-ton-port`) to `matthieuh/homebrew-tap` with `HOMEBREW_TAP_TOKEN`; it can be rerun alone. A prerelease skips both the appcast and the tap. See [RELEASING.md](../RELEASING.md) for the secrets and the steps.
