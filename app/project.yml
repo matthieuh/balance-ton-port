@@ -36,8 +36,8 @@ targets:
       properties:
         CFBundleName: Balance ton port
         CFBundleDisplayName: Balance ton port
-        CFBundleShortVersionString: "0.4.1"
-        CFBundleVersion: "5"
+        CFBundleShortVersionString: "0.4.2"
+        CFBundleVersion: "6"
         LSUIElement: true
         LSMinimumSystemVersion: "14.0"
         NSHumanReadableCopyright: ""
