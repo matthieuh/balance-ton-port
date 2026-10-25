@@ -92,7 +92,7 @@ func statusText(_ s: StatusFfi, bundle: Bundle = copyBundle, locale: Locale = co
     case "kept_by_agent":
         let agent = isolated(s.agentLabel, locale)
         guard let reason = s.reason, !reason.isEmpty else { return L("kept by \(agent)", bundle, locale) }
-        return L("kept by \(agent): \"\(reason)\"", bundle, locale)
+        return L("kept by \(agent): \"\(isolated(reason, locale))\"", bundle, locale)
     case "kept_by_user": return L("kept by you", bundle, locale)
     case "stops_in_min":
         // The row right after Postpone 1 h (`postponedView`): the minutes as
@@ -448,7 +448,7 @@ func statusSentence(_ s: ServerViewFfi, bundle: Bundle = copyBundle, locale: Loc
         guard let reason = s.status.reason, !reason.isEmpty else {
             return L("Kept by \(by). No alerts.", bundle, locale)
         }
-        return L("Kept by \(by): \"\(reason)\". No alerts.", bundle, locale)
+        return L("Kept by \(by): \"\(isolated(reason, locale))\". No alerts.", bundle, locale)
     default: break
     }
     let idle = durationText(ms: s.idleMs, bundle: bundle, locale: locale)

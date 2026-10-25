@@ -32,7 +32,7 @@ struct GeneralPane: View {
                         Text(verbatim: language.tr("None")).foregroundStyle(.secondary)
                     }
                     ForEach(discovered, id: \.self) { dir in
-                        Text(verbatim: dir).lineLimit(1).truncationMode(.middle)
+                        Text(verbatim: iso(dir)).lineLimit(1).truncationMode(.middle)
                     }
                 } header: {
                     Text(verbatim: language.tr("Claude config directories: found automatically"))
@@ -234,7 +234,7 @@ private struct ListEditor: View {
         }
         ForEach(items, id: \.self) { item in
             HStack {
-                Text(verbatim: item).lineLimit(1).truncationMode(.middle)
+                Text(verbatim: isolated(item, language.locale)).lineLimit(1).truncationMode(.middle)
                 Spacer()
                 Button {
                     items.removeAll { $0 == item }
