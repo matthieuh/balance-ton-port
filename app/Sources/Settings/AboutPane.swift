@@ -12,8 +12,9 @@ struct AboutPane: View {
             }
             Section {
                 Button(language.tr("Check for Updates…")) { updates.checkNow() }
-                    .disabled(!updates.canCheck)
+                    .disabled(!UpdateController.enabled || !updates.canCheck)
                 Toggle(language.tr("Update automatically"), isOn: $updates.automatic)
+                    .disabled(!UpdateController.enabled)
             } footer: {
                 Text(verbatim: language.tr("Updates are signed and downloaded from GitHub."))
             }

@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import Sparkle
 
@@ -5,8 +6,16 @@ import Sparkle
 /// network call besides localhost.
 @MainActor
 final class UpdateController: ObservableObject {
+    /// Debug builds never start the updater: an unsigned local build must not check
+    /// the real feed, nor install a release over itself.
+    #if DEBUG
+    nonisolated static let enabled = false
+    #else
+    nonisolated static let enabled = true
+    #endif
+
     private let controller = SPUStandardUpdaterController(
-        startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+        startingUpdater: UpdateController.enabled, updaterDelegate: nil, userDriverDelegate: nil)
 
     /// Checks and downloads in the background; both Sparkle switches move together.
     @Published var automatic: Bool {
@@ -24,12 +33,14 @@ final class UpdateController: ObservableObject {
         // didSet does not run inside init: when the switches disagreed, align them.
         updater.automaticallyChecksForUpdates = both
         updater.automaticallyDownloadsUpdates = both
+        // Sparkle publishes canCheckForUpdates through KVO; the pane follows it.
+        updater.publisher(for: \.canCheckForUpdates).assign(to: &$canCheck)
     }
 
     /// Automatic updates are on only when Sparkle both checks and downloads.
     nonisolated static func reconciled(checks: Bool, downloads: Bool) -> Bool { checks && downloads }
 
-    var canCheck: Bool { controller.updater.canCheckForUpdates }
+    @Published private(set) var canCheck = false
 
     func checkNow() { controller.updater.checkForUpdates() }
 
