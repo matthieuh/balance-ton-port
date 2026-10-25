@@ -51,6 +51,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.matthieuh.balancetonport
         PRODUCT_NAME: Balance ton port
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: false
         ENABLE_HARDENED_RUNTIME: true
         CODE_SIGN_IDENTITY: "-"

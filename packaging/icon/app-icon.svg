@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#262A34"/>
+      <stop offset="1" stop-color="#14161B"/>
+    </linearGradient>
+    <linearGradient id="pink" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#F8B6C5"/>
+      <stop offset="1" stop-color="#EE8EA5"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#000" flood-opacity="0.3"/>
+    </filter>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#tile)" filter="url(#shadow)"/>
+  <rect x="101" y="101" width="822" height="822" rx="184" fill="none" stroke="#FFFFFF" stroke-opacity="0.07" stroke-width="2"/>
+  <path d="M256 402 L366 512 L256 622" fill="none" stroke="url(#pink)" stroke-width="64" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="439" y="398" width="348" height="229" rx="114.5" fill="url(#pink)"/>
+  <ellipse cx="549" cy="512.5" rx="33" ry="55" fill="#1A1C22"/>
+  <ellipse cx="677" cy="512.5" rx="33" ry="55" fill="#1A1C22"/>
+</svg>
