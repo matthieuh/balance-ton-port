@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// The capsule a hovered row shows in place of its gauge: Open, Stop (not
+/// The capsule a hovered row shows over its gauge: Open, Stop (not
 /// for an excluded server) and ⋯ (`capsuleButtons`). Restart lives in ⋯
 /// only.
 struct RowCapsule: View {
@@ -24,6 +24,8 @@ struct RowCapsule: View {
         }
         .padding(3)
         .background(Color.primary.opacity(0.08), in: Capsule())
+        // Solid backing: the capsule floats over the row and hides what it covers.
+        .background(Color(nsColor: .windowBackgroundColor), in: Capsule())
     }
 
     private func pill(_ title: String, color: Color, action: @escaping () -> Void) -> some View {

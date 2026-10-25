@@ -55,7 +55,7 @@ struct ServerTitle: View {
 }
 
 /// An "All good" row: icon, title and subtitle, then the memory gauge and
-/// size, which the hover capsule replaces. A click opens the detail.
+/// size, which the hover capsule covers. A click opens the detail.
 struct ServerRowView: View {
     let server: ServerViewFfi
     let favicon: NSImage?
@@ -77,19 +77,23 @@ struct ServerRowView: View {
                 )
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            if hovering {
-                RowCapsule(server: server)
-            } else {
-                gauge
-                Text(verbatim: memoryLabel(server.rssBytes, locale: language.locale))
-                    .font(.system(size: 12, design: .monospaced))
-                    .foregroundStyle(sizeColor(server.health) ?? Color.secondary)
-                    .frame(width: 54, alignment: .trailing)
-            }
+            // Stays in the layout while hovering, so the row never reflows.
+            gauge
+            Text(verbatim: memoryLabel(server.rssBytes, locale: language.locale))
+                .font(.system(size: 12, design: .monospaced))
+                .foregroundStyle(sizeColor(server.health) ?? Color.secondary)
+                .frame(width: 54, alignment: .trailing)
         }
         .padding(.vertical, 7)
         .padding(.horizontal, 6)
         .frame(minHeight: 46)
+        .overlay(alignment: .trailing) {
+            if hovering {
+                RowCapsule(server: server)
+                    .fixedSize()
+                    .padding(.trailing, 6)
+            }
+        }
         .background(
             Color.primary.opacity(hovering ? 0.06 : 0),
             in: RoundedRectangle(cornerRadius: rowRadius, style: .continuous)
