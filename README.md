@@ -1,4 +1,8 @@
-# Balance ton port
+<p align="center">
+  <img src="docs/logo.png" width="128" alt="Balance ton port app icon">
+</p>
+
+<h1 align="center">Balance ton port</h1>
 
 Claude Code sessions start dev servers (Astro, wrangler, Metro, Vite, `serve`...) and leave them behind. The session ends or crashes, the worktree is deleted, and the ports stay taken. Balance ton port cleans up automatically and asks only when it cannot be sure.
 
