@@ -288,6 +288,11 @@ start_payload='{"session_id":"conv-2","transcript_path":"/x.jsonl","cwd":"/x","h
 context() { printf '%s' "$out" | jq -r '.hookSpecificOutput.additionalContext'; }
 asks_install() { grep -q "ask the user once whether to install" <<<"$(context)"; }
 
+brewbin_early="$work/brewbin-early"
+mkdir -p "$brewbin_early"
+printf '#!/bin/bash\nexit 1\n' >"$brewbin_early/brew"
+chmod +x "$brewbin_early/brew"
+
 rm -rf "$work/data"
 run_hook session-start.sh "$start_payload"
 check "session-start: btp missing exits 0" test "$code" = 0
@@ -297,6 +302,15 @@ check "session-start: install context asks first and names the script" \
   bash -c 'grep -q "ask the user" <<<"$1" && grep -q "install-btp.sh\" --data-dir \"$2\"" <<<"$1"' _ "$(context)" "$work/data"
 check "session-start: install context gives the opt-out marker" \
   grep -q "touch \"$work/data/install-declined\"" <<<"$(context)"
+
+# The install prompt names Homebrew when the install would use it.
+HOOK_ENV="PATH=$brewbin_early:$fix/bin:$BASE_PATH" run_hook session-start.sh "$start_payload"
+check "session-start: install context mentions Homebrew when brew is on PATH" \
+  grep -q "brew install matthieuh/tap/btp" <<<"$(context)"
+HOOK_ENV="PATH=$brewbin_early:$fix/bin:$BASE_PATH BTP_NO_BREW=1" run_hook session-start.sh "$start_payload"
+check "session-start: ... but not with BTP_NO_BREW=1" bash -c '! grep -q "Homebrew" <<<"$1"' _ "$(context)"
+run_hook session-start.sh "$start_payload"
+check "session-start: ... nor without brew" bash -c '! grep -q "Homebrew" <<<"$1"' _ "$(context)"
 
 FAKE_BTP_VERSION=0.1.0 run_hook session-start.sh "$start_payload" with-btp
 check "session-start: too old btp is offered an update" grep -q "is too old" <<<"$(context)"
