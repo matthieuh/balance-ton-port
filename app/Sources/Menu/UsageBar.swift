@@ -34,16 +34,23 @@ struct UsageBar: View {
         let c = usageCaption(memory, bundle: language.bundle, locale: language.locale)
         HStack(spacing: 4) {
             Text(verbatim: c.figure)
-                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .font(.system(size: 11, weight: .semibold).monospacedDigit())
                 .foregroundStyle(.primary)
             Text(verbatim: c.dev)
             Spacer(minLength: 8)
-            Text(verbatim: c.apps + " \u{00B7}")
+            swatch(Color.secondary.opacity(0.45))
+            Text(verbatim: c.apps)
+            swatch(Color.primary.opacity(0.1)).padding(.leading, 6)
             Text(verbatim: c.free)
                 .foregroundStyle(memory.freeLow ? Color.orange : Color.secondary)
         }
         .font(.system(size: 11))
         .foregroundStyle(.secondary)
         .lineLimit(1)
+    }
+
+    /// The legend's key: the bar segment's own color.
+    private func swatch(_ color: Color) -> some View {
+        Capsule().fill(color).frame(width: 8, height: 6)
     }
 }

@@ -18,7 +18,7 @@ extension ServerViewFfi {
 
 /// The menu panel's width and padding, and the indent of a card's second
 /// and third lines (past the 22 pt icon and its 8 pt gap).
-let panelWidth: CGFloat = 420
+let panelWidth: CGFloat = 460
 let panelPadding: CGFloat = 14
 let cardIndent: CGFloat = 30
 
@@ -158,6 +158,14 @@ func rowSubtitle(_ s: ServerViewFfi, bundle: Bundle = copyBundle, locale: Locale
     let p = subtitleParts(s, bundle: bundle, locale: locale)
     let port = [p.port, p.otherPorts].compactMap { $0 }.joined(separator: " ")
     return [port, p.place, p.badge].compactMap { $0 }.joined(separator: " \u{00B7} ")
+}
+
+/// `chore/node-sec…oct-2026`: `s` cut in the middle to at most `max`
+/// characters, the ellipsis included.
+func middleTruncated(_ s: String, max: Int) -> String {
+    guard s.count > max, max > 1 else { return s }
+    let keep = max - 1
+    return String(s.prefix((keep + 1) / 2)) + "\u{2026}" + String(s.suffix(keep / 2))
 }
 
 /// The row's title and its framework, the framework left out when it only

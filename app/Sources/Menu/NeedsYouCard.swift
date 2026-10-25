@@ -21,7 +21,7 @@ struct NeedsYouCard: View {
                 ServerIcon(server: server, favicon: favicon)
                 ServerTitle(server: server).frame(maxWidth: .infinity, alignment: .leading)
                 Text(verbatim: memoryLabel(server.rssBytes, locale: language.locale))
-                    .font(.system(size: 12, design: .monospaced))
+                    .font(.system(size: 12).monospacedDigit())
                     .foregroundStyle(sizeColor(server.health) ?? Color.secondary)
             }
             ServerSubtitle(server: server)
