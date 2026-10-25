@@ -308,6 +308,17 @@ func recentlyStoppedLabel(_ n: Int, bundle: Bundle = copyBundle, locale: Locale 
     L("Recently stopped (\(n))", bundle, locale)
 }
 
+/// What VoiceOver reads on the menu bar pig: `Balance ton port, 3 servers
+/// need you, memory pressure high`.
+func menuBarAccessibilityLabel(
+    needsYou: Int, pressure: MemoryPressure, bundle: Bundle = copyBundle, locale: Locale = copyLocale
+) -> String {
+    var parts = ["Balance ton port"]
+    if needsYou > 0 { parts.append(L("\(needsYou) servers need you", bundle, locale)) }
+    if pressure != .normal { parts.append(L("memory pressure high", bundle, locale)) }
+    return parts.joined(separator: ", ")
+}
+
 /// `7 servers`, `1 server`.
 func headerCount(_ n: Int, bundle: Bundle = copyBundle, locale: Locale = copyLocale) -> String {
     L("\(n) servers", bundle, locale)
