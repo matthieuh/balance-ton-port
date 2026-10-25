@@ -141,7 +141,8 @@ jobs:
           # Sparkle's nested code is signed inside out, then the framework, then the
           # app (never --deep when signing); the app is not sandboxed, so the XPC
           # services and helpers take no entitlements. Downloader.xpc is only there
-          # for sandboxed apps, so it is signed if the package ships it.
+          # for sandboxed apps, so it is signed if the package ships it, keeping its
+          # entitlements as Sparkle's signing instructions ask.
           SPARKLE="$DIST/$APP_NAME.app/Contents/Frameworks/Sparkle.framework"
           for nested in \
             "$SPARKLE/Versions/B/XPCServices/Installer.xpc" \
@@ -150,8 +151,11 @@ jobs:
             "$SPARKLE/Versions/B/Updater.app" \
             "$SPARKLE"; do
             if [ -e "$nested" ]; then
+              PRESERVE=()
+              [ "${nested##*/}" != "Downloader.xpc" ] || PRESERVE=(--preserve-metadata=entitlements)
               codesign --force --options runtime --timestamp \
-                --keychain "$KEYCHAIN" --sign "$IDENTITY" "$nested"
+                --keychain "$KEYCHAIN" --sign "$IDENTITY" \
+                ${PRESERVE[@]+"${PRESERVE[@]}"} "$nested"
             elif [ "${nested##*/}" != "Downloader.xpc" ]; then
               echo "::error::missing $nested"; exit 1
             fi
