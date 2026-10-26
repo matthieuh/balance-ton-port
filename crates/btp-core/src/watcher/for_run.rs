@@ -12,16 +12,21 @@ impl<P: Platform> Watcher<P> {
     /// every listener of the port belongs to its tree, `Unknown` when one of
     /// them cannot be attributed (unreadable, or another user's, which
     /// `listeners` does not even list), else an observed holder named by
-    /// its tool label.
+    /// its tool label. The caller and its ancestors are never a holder:
+    /// a port only they listen on (a socket inherited by accident) is
+    /// `Unknown`, so it is rerouted around, never freed.
     pub fn port_holder(&mut self, port: u16, now_ms: u64) -> io::Result<Option<Holder>> {
         let listeners = self.platform.listeners();
-        let on_port: Vec<i32> = listeners
+        let own = own_pids(&self.platform);
+        let all: Vec<i32> = listeners
             .iter()
             .filter(|l| l.port == port)
             .map(|l| l.pid)
             .collect();
+        let on_port: Vec<i32> = all.iter().copied().filter(|p| !own.contains(p)).collect();
         if on_port.is_empty() {
-            return Ok(self.platform.port_answers(port).then_some(Holder::Unknown));
+            let taken = !all.is_empty() || self.platform.port_answers(port);
+            return Ok(taken.then_some(Holder::Unknown));
         }
         let scan = self.scan();
         let p = &self.platform;
@@ -121,6 +126,8 @@ impl<P: Platform> Watcher<P> {
     /// exactly the folder `cwd`: a tracked one of the same worktree first
     /// (its own process or one of its listeners has that key), else an
     /// observed one, whose view has no session (empty `session_name`).
+    /// Never the caller or one of its ancestors: a `btp run` that
+    /// inherited a listening socket would otherwise "reuse" itself.
     pub fn find_reusable(
         &mut self,
         cwd: &Path,
@@ -132,7 +139,8 @@ impl<P: Platform> Watcher<P> {
         let scan = self.scan();
         let listeners = self.platform.listeners();
         let p = &self.platform;
-        let same = |pid: i32| runs_key(p, pid, &folder, cwd, key);
+        let own = own_pids(p);
+        let same = |pid: i32| !own.contains(&pid) && runs_key(p, pid, &folder, cwd, key);
         let (found, tracked) = with_state(&self.data_dir, |state| {
             let trees: Vec<Tree> = state
                 .servers
@@ -180,7 +188,9 @@ impl<P: Platform> Watcher<P> {
         let observed = self
             .observed(&listeners, &tracked, &scan.cfg)
             .into_iter()
-            .find(|o| runs_key(&self.platform, o.key.pid, &folder, cwd, key));
+            .find(|o| {
+                !own.contains(&o.key.pid) && runs_key(&self.platform, o.key.pid, &folder, cwd, key)
+            });
         Ok(observed.map(|o| {
             let established = self.observed_feed(&o, &[], now_ms).established;
             let mut v = observed_view(&o, established);
@@ -242,6 +252,14 @@ fn owner_of(p: &dyn Platform, pid: i32, servers: &[TrackedServer], cfg: &Config)
         }
     }
     owner
+}
+
+/// This process and its ancestors.
+fn own_pids(p: &dyn Platform) -> HashSet<i32> {
+    let me = std::process::id() as i32;
+    let mut own: HashSet<i32> = ancestry(p, me).iter().map(|a| a.pid).collect();
+    own.insert(me);
+    own
 }
 
 /// `pid` runs in `folder` (resolved) a command whose `same_command_key`,
@@ -543,6 +561,44 @@ mod tests {
                 .expect("reused");
         assert_eq!((found.key.pid, found.port), (50, 5173));
         assert_eq!(found.worktree, f.wt);
+        assert!(f.p().signals().is_empty());
+    }
+
+    #[test]
+    fn the_caller_never_reuses_or_holds_for_itself() {
+        let mut f = fx();
+        let admin = f.wt.join("apps/admin");
+        scripts(&admin);
+        f.w.tick(T0).unwrap();
+        let me = std::process::id() as i32;
+        let dir = admin.to_str().unwrap();
+        // An ancestor of this process listens, and so does this process
+        // (a socket it inherited), both running the same command here.
+        f.p().spawn(51, 10, START + 51 * SEC, "vite", dir);
+        f.p().spawn(me, 51, START + 52 * SEC, "vite", dir);
+        for pid in [51, me] {
+            f.p().set_exe(pid, "/opt/homebrew/bin/node");
+        }
+        f.p().add_listener(51, 5173);
+        f.p().add_listener(me, 5174);
+        let key = same_command_key(&args(&["vite"]), &admin).unwrap();
+        assert!(f.w.find_reusable(&admin, &key, T0).unwrap().is_none());
+        // Taken, but by no one btp may touch.
+        for port in [5173, 5174] {
+            assert!(matches!(
+                f.w.port_holder(port, T0).unwrap(),
+                Some(Holder::Unknown)
+            ));
+        }
+        // Another process of the same command is still reused.
+        f.p().spawn(60, 10, START + 60 * SEC, "vite", dir);
+        f.p().set_exe(60, "/opt/homebrew/bin/node");
+        f.p().add_listener(60, 5175);
+        let found =
+            f.w.find_reusable(&admin, &key, T0)
+                .unwrap()
+                .expect("reused");
+        assert_eq!(found.key.pid, 60);
         assert!(f.p().signals().is_empty());
     }
 }

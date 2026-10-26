@@ -7,7 +7,6 @@
 use assert_cmd::Command;
 use btp_core::config::{save_config, Config, PortConflict};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
@@ -53,6 +52,30 @@ fn btp(data: &Path, style: &str) -> Command {
     c
 }
 
+/// Every port of `ports` can be bound on 127.0.0.1 (as the helper binds,
+/// with SO_REUSEADDR). Checked in a python process, never in this one:
+/// macOS sets close-on-exec on a new socket only after creating it, so a
+/// socket of this process can leak into a `btp run` another test thread
+/// spawns at that moment, and that `btp run` would then listen itself.
+fn bindable(ports: &[u16]) -> bool {
+    let list: Vec<String> = ports.iter().map(u16::to_string).collect();
+    std::process::Command::new("python3")
+        .args([
+            "-c",
+            "import socket,sys\n\
+             for p in sys.argv[1:]:\n \
+             s=socket.socket()\n \
+             s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n \
+             s.bind(('127.0.0.1',int(p)))\n \
+             s.close()",
+        ])
+        .args(&list)
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
 /// A port `p` with `p + 1` and `p + 2` free as well, below the ephemeral
 /// range (where the system hands out neighbours to parallel tests), each
 /// test of this run on its own block of ten.
@@ -62,7 +85,7 @@ fn free_port() -> u16 {
     loop {
         let n = NEXT.fetch_add(10, std::sync::atomic::Ordering::SeqCst);
         let p = 20_000 + (base - 20_000 + n) % 25_000;
-        if (p..p + 3).all(|q| TcpListener::bind(("127.0.0.1", q)).is_ok()) {
+        if bindable(&[p, p + 1, p + 2]) {
             return p;
         }
     }
@@ -106,15 +129,21 @@ impl Drop for Holder {
     }
 }
 
+/// The server on `port` answers HTTP 200 (asked from a python process, for
+/// the reason given at `bindable`).
 fn answers(port: u16) -> bool {
-    let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) else {
-        return false;
-    };
-    let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
-    let _ = s.write_all(b"GET / HTTP/1.0\r\n\r\n");
-    let mut out = String::new();
-    let _ = s.read_to_string(&mut out);
-    out.contains("200")
+    std::process::Command::new("python3")
+        .args([
+            "-c",
+            "import sys,urllib.request\n\
+             r=urllib.request.urlopen('http://127.0.0.1:'+sys.argv[1]+'/',timeout=5)\n\
+             sys.exit(0 if r.status==200 else 1)",
+            &port.to_string(),
+        ])
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success()
 }
 
 fn alive(pid: i32) -> bool {
@@ -306,18 +335,16 @@ fn reroutes_around_observed_holder() {
     let o = out.get_output();
     let err = text(&o.stderr);
     let name = dir.path().file_name().unwrap().to_string_lossy();
-    // The first free port above `p`: `p + 1`, unless a process of the
-    // machine outside this test took it meanwhile.
-    let new: u16 = err
-        .strip_prefix(&format!("btp: {name} on http://localhost:"))
-        .and_then(|r| r.split(' ').next())
-        .and_then(|n| n.parse().ok())
-        .unwrap_or_else(|| panic!("{err}"));
-    assert!(new > p && new <= p + 2, "{err}");
-    assert!(err.contains(&format!("{new} ({p} is used by ")), "{err}");
+    assert!(
+        err.contains(&format!(
+            "btp: {name} on http://localhost:{} ({p} is used by ",
+            p + 1
+        )),
+        "{err}"
+    );
     assert!(err.contains("not started by an agent"), "{err}");
     assert!(
-        text(&o.stdout).contains(&format!("serve.py listening on {new}")),
+        text(&o.stdout).contains(&format!("serve.py listening on {}", p + 1)),
         "{}",
         text(&o.stdout)
     );
@@ -456,7 +483,7 @@ fn ctrl_c_forwards() {
     // The child died of SIGINT: so does `btp run` (R14).
     assert_eq!(status.signal(), Some(libc::SIGINT), "{status:?}");
     assert!(!alive(server), "the server is gone");
-    assert!(TcpListener::bind(("127.0.0.1", p)).is_ok(), "port free");
+    assert!(bindable(&[p]), "port free");
 }
 
 #[test]
@@ -707,7 +734,7 @@ fn terminal_reuse_follows_logs_and_r_restarts_here() {
     let status = t.wait();
     // `script` reports the signal its child (btp) died of.
     assert_eq!(status.code(), Some(libc::SIGINT), "{:?}", text(&t.seen));
-    assert!(TcpListener::bind(("127.0.0.1", p)).is_ok(), "port free");
+    assert!(bindable(&[p]), "port free");
 }
 
 /// A python helper that counts the SIGINTs it gets for `secs` seconds,

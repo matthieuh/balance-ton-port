@@ -733,9 +733,13 @@ fn write_out(fd: i32, mut bytes: &[u8]) -> Wrote {
     while !bytes.is_empty() {
         // SAFETY: writes from a live slice.
         let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
-        if n >= 0 {
+        if n > 0 {
             bytes = &bytes[n as usize..];
             continue;
+        }
+        if n == 0 {
+            // Nothing taken of a non-empty buffer: it would loop forever.
+            return Wrote::Failed;
         }
         match io::Error::last_os_error().raw_os_error() {
             Some(libc::EINTR) => {}
@@ -1010,7 +1014,10 @@ fn readable(fd: i32, ms: i32) -> bool {
     unsafe { libc::poll(&mut p, 1, ms) > 0 }
 }
 
-/// Bytes waiting to be read on `fd` (0 when it cannot tell).
+/// Bytes waiting to be read on `fd` (0 when it cannot tell). On macOS
+/// FIONREAD reads 0 on a pty master whatever is waiting, so for the pty the
+/// drain after the exit is governed by the 500 ms cap alone (still never
+/// cutting a write in progress).
 fn pending_bytes(fd: i32) -> usize {
     let mut n: libc::c_int = 0;
     // SAFETY: FIONREAD into a local int.
