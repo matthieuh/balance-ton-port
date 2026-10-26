@@ -64,6 +64,21 @@ jobs:
       - name: cargo test
         run: cargo test --locked
 
+      - name: TEMP diagnostics
+        if: failure()
+        run: |
+          which -a python3; python3 -V; echo "SHELL=$SHELL"
+          export BTP_DATA_DIR="$RUNNER_TEMP/btpd" HOME="$RUNNER_TEMP/btph" BTP_TEST_FRAMEWORK="serve.py:8000:long" BTP_TEST_NO_CODEX=1
+          mkdir -p "$BTP_DATA_DIR" "$HOME"
+          (time python3 crates/btp-cli/tests/helpers/serve.py --port 20997 & sleep 8; kill %1) 2>&1 | head
+          target/debug/btp run -- "$PWD/crates/btp-cli/tests/helpers/serve.py" --port 20998 > "$RUNNER_TEMP/o" 2>&1 < /dev/null &
+          sleep 12
+          echo "--- btp output"; cat "$RUNNER_TEMP/o"
+          echo "--- ps"; ps -axo pid,ppid,stat,etime,command | grep -iE "python|serve|btp" | grep -v grep
+          echo "--- logs dir"; ls -laR "$BTP_DATA_DIR" | head -40
+          for f in $(find "$BTP_DATA_DIR" -name "*.log" | head -3); do echo "== $f"; head -20 "$f"; done
+          echo "--- sample"; for p in $(pgrep -f "serve.py --port 20998"); do sample "$p" 1 2>/dev/null | grep -E "Thread|python|Py" | head -30; done
+
       # Hooks and install script of the Claude Code plugin (fixtures, no
       # network, temp HOME).
       - name: Plugin tests
