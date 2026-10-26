@@ -228,7 +228,7 @@ private struct PortConflictSection: View {
     @Binding var draft: SettingsDraft
 
     var body: some View {
-        Section(language.tr("Port conflicts")) {
+        Section {
             Picker(language.tr("Port conflicts"), selection: $draft.portConflict) {
                 Text(verbatim: language.tr("Free idle agent servers")).tag("free_idle")
                 Text(verbatim: language.tr("Ask me")).tag("ask")

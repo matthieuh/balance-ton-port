@@ -813,7 +813,8 @@ struct SettingsDraft: Equatable, Sendable {
     /// Leak thresholds (MB): no field in the form yet, saved back unchanged.
     var leakMemoryMb: UInt64
     var leakGrowthMb: UInt64
-    /// Port-conflict settings: no field in the form yet, saved back unchanged.
+    /// Port-conflict settings: the "Port conflicts" picker and the hook
+    /// switch of the General pane.
     var portConflict: String
     var portCheckHook: Bool
 

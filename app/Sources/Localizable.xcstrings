@@ -9646,7 +9646,7 @@
         "zh-Hans": {
           "stringUnit": {
             "state": "needs_review",
-            "value": "释放空闲的智能体服务器"
+            "value": "释放空闲的代理服务器"
           }
         }
       }
@@ -9680,7 +9680,7 @@
         "he": {
           "stringUnit": {
             "state": "needs_review",
-            "value": "לעולם לא לסיים, תמיד להשתמש בפורט אחר"
+            "value": "לעולם לא לעצור, תמיד להשתמש בפורט אחר"
           }
         },
         "ja": {
