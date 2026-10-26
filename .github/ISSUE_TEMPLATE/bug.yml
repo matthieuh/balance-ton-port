@@ -1,0 +1,45 @@
+name: Bug
+description: Something else does not work as described.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: And what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "`btp --version`, or Settings > About in the app"
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+    validations:
+      required: true
+  - type: dropdown
+    id: part
+    attributes:
+      label: Part
+      multiple: true
+      options:
+        - Menu bar app
+        - btp CLI
+        - Claude Code plugin or skill
+        - Codex
+        - Install or update
+        - Translation
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      description: For the plugin, start Claude Code with `BTP_HOOK_DEBUG=1` and attach `~/Library/Application Support/balance-ton-port/session-end.log`.
