@@ -35,9 +35,10 @@ pub enum Holder {
 /// The command line flags of `btp run` that bear on the conflict.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RunFlags {
-    /// `--free`: free the holder when it is freeable, under any policy.
+    /// `--free`: act as `free_idle` for this run, under any policy.
     pub free: bool,
-    /// `--reroute`: run on another port rather than touch the holder.
+    /// `--reroute`: never touch the holder, run on another port (or block
+    /// when the port cannot change). Wins over `--free` when both are set.
     pub reroute: bool,
 }
 
@@ -98,22 +99,25 @@ pub fn resolve(
         } if freeable(server, obs, *idle_ms, *in_use, cfg, now_ms) => Some(server.key),
         _ => None,
     };
-    if reroutable && flags.reroute {
-        return Resolution::Reroute;
-    }
-    let free_allowed = match policy {
-        PortConflict::FreeIdle => true,
-        PortConflict::Ask | PortConflict::Reroute => flags.free,
+    let effective = if flags.reroute {
+        PortConflict::Reroute
+    } else if flags.free {
+        PortConflict::FreeIdle
+    } else {
+        policy
     };
-    if let (Some(key), true) = (free_key, free_allowed) {
-        return Resolution::Free(key);
-    }
-    match policy {
+    let fallback = if reroutable {
+        Resolution::Reroute
+    } else {
+        Resolution::Block
+    };
+    match effective {
+        PortConflict::Reroute => fallback,
+        PortConflict::FreeIdle => free_key.map_or(fallback, Resolution::Free),
+        PortConflict::Ask if free_key.is_none() && !reroutable => Resolution::Block,
         PortConflict::Ask => Resolution::Ask {
             can_kill: free_key.is_some(),
         },
-        _ if reroutable => Resolution::Reroute,
-        _ => Resolution::Block,
     }
 }
 
@@ -333,10 +337,44 @@ mod tests {
             go(&Holder::Unknown, true, p, NONE),
             Resolution::Ask { can_kill: false }
         );
+        // Nothing actionable to ask about: block.
+        assert_eq!(go(&Holder::Unknown, false, p, NONE), Resolution::Block);
+        assert_eq!(go(&observed(), false, p, NONE), Resolution::Block);
+    }
+
+    #[test]
+    fn reroute_flag_never_frees() {
+        let f = RunFlags {
+            free: false,
+            reroute: true,
+        };
         assert_eq!(
-            go(&Holder::Unknown, false, p, NONE),
-            Resolution::Ask { can_kill: false }
+            go(&tracked(600_000), false, PortConflict::FreeIdle, f),
+            Resolution::Block
         );
+        assert_eq!(
+            go(&tracked(600_000), false, PortConflict::Ask, f),
+            Resolution::Block
+        );
+        let both = RunFlags {
+            free: true,
+            reroute: true,
+        };
+        assert_eq!(
+            go(&tracked(600_000), true, PortConflict::FreeIdle, both),
+            Resolution::Reroute
+        );
+    }
+
+    #[test]
+    fn ask_policy_with_free_flag_is_decided() {
+        let f = RunFlags {
+            free: true,
+            reroute: false,
+        };
+        let p = PortConflict::Ask;
+        assert_eq!(go(&tracked(0), true, p, f), Resolution::Reroute);
+        assert_eq!(go(&tracked(0), false, p, f), Resolution::Block);
     }
 
     #[test]
