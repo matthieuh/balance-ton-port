@@ -126,10 +126,10 @@ fn serves(entry: &Entry, tokens: &[String]) -> bool {
     if let Some(flag) = entry.serving_flag {
         return rest.iter().any(|w| w == flag);
     }
-    let sub = rest
-        .iter()
-        .find(|w| !w.starts_with('-'))
-        .map_or("", |w| w.as_str());
+    // Only the word right after the program can be a subcommand; a flag
+    // there means none was given, and later words are flag values.
+    let sub = rest.first().map_or("", |w| w.as_str());
+    let sub = if sub.starts_with('-') { "" } else { sub };
     entry.serving.contains(&sub)
 }
 
@@ -537,6 +537,22 @@ mod tests {
         let d = dir_with_scripts(r#"{"build":"next build","dev":"next dev"}"#);
         assert!(recognize(&v(&["npm", "run", "build"]), d.path(), None).is_none());
         assert!(recognize(&v(&["npm", "run", "dev"]), d.path(), None).is_some());
+    }
+
+    #[test]
+    fn flag_values_are_not_subcommands() {
+        let d = rec(&["vite", "--host", "0.0.0.0"]).unwrap();
+        assert_eq!((d.framework.as_str(), d.port), ("Vite", 5173));
+        assert_eq!(rec(&["next", "-H", "0.0.0.0"]).unwrap().port, 3000);
+        assert!(rec(&["next", "--hostname", "x"]).is_some());
+        assert!(rec(&["vite", "--mode", "staging"]).is_some());
+        let d = dir_with_scripts(r#"{"dev":"vite --host 0.0.0.0","x":"cross-env X=1 next dev"}"#);
+        assert!(recognize(&v(&["npm", "run", "dev"]), d.path(), None).is_some());
+        // cross-env is stripped from a script but not from a direct command,
+        // which is therefore not recognized and runs untouched.
+        assert!(recognize(&v(&["npm", "run", "x"]), d.path(), None).is_some());
+        assert!(rec(&["cross-env", "X=1", "next", "dev"]).is_none());
+        assert!(rec(&["next", "build"]).is_none() && rec(&["vite", "build"]).is_none());
     }
 
     #[test]
