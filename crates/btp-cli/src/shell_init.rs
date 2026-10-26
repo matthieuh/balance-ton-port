@@ -24,6 +24,8 @@ __btp_wrap() {
     command "$__btp_name" "$@"
     return $?
   fi
+  # No fallback to the real command when `btp run` itself fails: that would
+  # start the server a second time.
   if command btp _is-dev -- "$__btp_name" "$@" >/dev/null 2>&1; then
     command btp run -- "$__btp_name" "$@"
   else
@@ -39,7 +41,12 @@ pub fn snippet(shell: &str) -> Option<String> {
     }
     let mut out = String::from(COMMON);
     for name in WRAPPED {
-        out.push_str(&format!("{name}() {{ __btp_wrap {name} \"$@\"; }}\n"));
+        // `function` form: unlike `name()`, it does not expand a user alias
+        // of the same name, so an alias never breaks the eval (it keeps
+        // winning at call time and the wrapper is just unused).
+        out.push_str(&format!(
+            "function {name} {{ __btp_wrap {name} \"$@\"; }}\n"
+        ));
     }
     Some(out)
 }

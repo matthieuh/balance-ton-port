@@ -353,7 +353,10 @@ fn shell_init_zsh_parses() {
     let text = shell_init_text(&data, "zsh");
     assert!(text.contains("export BTP_SHELL_WRAP=1"), "{text}");
     for name in ["npm", "pnpm", "yarn", "bun", "npx", "next", "vite", "astro"] {
-        assert!(text.contains(&format!("{name}() {{")), "{name}: {text}");
+        assert!(
+            text.contains(&format!("function {name} {{")),
+            "{name}: {text}"
+        );
     }
     assert!(!text.contains("eval"), "the hint stays out of the output");
     parses("zsh", &text);
@@ -522,4 +525,88 @@ fn wrapper_falls_back_when_btp_is_not_on_path() {
         "fake-npm args=run dev active="
     );
     assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn alias_does_not_break_eval_and_keeps_winning() {
+    let w = wrapped();
+    for shell in ["bash", "zsh"] {
+        if !have(shell) {
+            continue;
+        }
+        let init = shell_init_text(&w.data, shell);
+        let pre = if shell == "bash" {
+            "shopt -s expand_aliases\n"
+        } else {
+            ""
+        };
+        // zsh/bash read the whole -c string first, so eval the snippet.
+        let script = format!("{pre}alias npm='echo aliased'\neval \"$1\"\neval 'npm run dev'\n");
+        let out = std::process::Command::new(shell)
+            .arg("-c")
+            .arg(script)
+            .arg("x")
+            .arg(&init)
+            .current_dir(w.proj.path())
+            .env_clear()
+            .env("PATH", format!("{}:/usr/bin:/bin", w.bin.path().display()))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{shell}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "aliased run dev",
+            "{shell}"
+        );
+    }
+}
+
+#[test]
+fn zsh_snippet_executes() {
+    if !have("zsh") {
+        return;
+    }
+    let w = wrapped();
+    let init = shell_init_text(&w.data, "zsh");
+    let btp_dir = assert_cmd::cargo::cargo_bin("btp")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let run = |line: &str, env: &[(&str, &str)]| {
+        let mut c = std::process::Command::new("zsh");
+        c.arg("-c")
+            .arg(format!("{init}\n{line}"))
+            .current_dir(w.proj.path())
+            .env_clear()
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}:/usr/bin:/bin",
+                    w.bin.path().display(),
+                    btp_dir.display()
+                ),
+            )
+            .env("HOME", w.data.path())
+            .env("BTP_DATA_DIR", w.data.path())
+            .env("BTP_TEST_NO_CODEX", "1");
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        let o = c.output().unwrap();
+        (
+            o.status.code().unwrap(),
+            String::from_utf8_lossy(&o.stdout).into_owned(),
+        )
+    };
+    let (code, out) = run("npm test -- a b", &[]);
+    assert_eq!((code, out.trim()), (7, "fake-npm args=test -- a b active="));
+    let (code, out) = run("npm run dev", &[]);
+    assert_eq!(code, 7, "{out}");
+    assert!(out.contains("active=1"), "{out}");
+    let (_, out) = run("npm run dev", &[("BTP_RUN", "0")]);
+    assert_eq!(out.trim(), "fake-npm args=run dev active=");
 }
