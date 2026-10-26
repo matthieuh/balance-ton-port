@@ -8,6 +8,7 @@ use assert_cmd::Command;
 use btp_core::config::{save_config, Config, PortConflict};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::mpsc::{channel, Receiver};
@@ -79,6 +80,7 @@ impl Holder {
                 "-c",
                 "import socket,sys,time\n\
                  s=socket.socket()\n\
+                 s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n\
                  s.bind(('127.0.0.1',int(sys.argv[1])))\n\
                  s.listen()\n\
                  print('up',flush=True)\n\
@@ -449,7 +451,8 @@ fn ctrl_c_forwards() {
     // SAFETY: the `btp run` this test started.
     unsafe { libc::kill(r.pid(), libc::SIGINT) };
     let status = r.wait();
-    assert_eq!(status.code(), Some(130), "{status:?}");
+    // The child died of SIGINT: so does `btp run` (R14).
+    assert_eq!(status.signal(), Some(libc::SIGINT), "{status:?}");
     assert!(!alive(server), "the server is gone");
     assert!(TcpListener::bind(("127.0.0.1", p)).is_ok(), "port free");
 }
@@ -469,7 +472,7 @@ fn sigterm_forwards_too() {
     // SAFETY: the `btp run` this test started.
     unsafe { libc::kill(r.pid(), libc::SIGTERM) };
     let status = r.wait();
-    assert_eq!(status.code(), Some(128 + libc::SIGTERM), "{status:?}");
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
 }
 
 #[test]
@@ -594,6 +597,16 @@ impl InTerminal {
         panic!("no {needle:?} in {:?}", text(&self.seen));
     }
 
+    /// Reads what comes for 300 ms more.
+    fn settle(&mut self) {
+        let end = Instant::now() + Duration::from_millis(300);
+        while let Some(left) = end.checked_duration_since(Instant::now()) {
+            if let Ok(b) = self.out.recv_timeout(left) {
+                self.seen.push(b);
+            }
+        }
+    }
+
     fn type_keys(&mut self, keys: &str) {
         let stdin = self.child.stdin.as_mut().unwrap();
         stdin.write_all(keys.as_bytes()).unwrap();
@@ -672,12 +685,137 @@ fn terminal_reuse_follows_logs_and_r_restarts_here() {
         .into_owned();
     t.wait_text(&format!("btp: {name} on http://localhost:{p}\r\n"));
     t.wait_count(&format!("serve.py listening on {p} pid "), 2);
-    assert_eq!(first.wait().code(), Some(128 + libc::SIGTERM));
+    assert_eq!(first.wait().signal(), Some(libc::SIGTERM));
     assert!(!alive(old));
     assert!(answers(p));
     // Ctrl-C reaches the new server through the pty: it stops too.
     t.type_keys("\x03");
     let status = t.wait();
-    assert_eq!(status.code(), Some(130), "{:?}", text(&t.seen));
+    // `script` reports the signal its child (btp) died of.
+    assert_eq!(status.code(), Some(libc::SIGINT), "{:?}", text(&t.seen));
     assert!(TcpListener::bind(("127.0.0.1", p)).is_ok(), "port free");
+}
+
+/// A python helper that counts the SIGINTs it gets for `secs` seconds,
+/// then prints the count and exits 0.
+const COUNT_SIGINT: &str = "import signal,sys,time\n\
+n=0\n\
+def h(s,f):\n global n\n n+=1\n\
+signal.signal(signal.SIGINT,h)\n\
+print('ready',flush=True)\n\
+end=time.time()+float(sys.argv[1])\n\
+while time.time()<end: time.sleep(0.05)\n\
+print('count',n,flush=True)";
+
+#[test]
+fn terminal_ctrl_c_reaches_the_child_once() {
+    let (data, _e) = sandbox(PortConflict::FreeIdle);
+    let dir = tempfile::tempdir().unwrap();
+    let mut t = InTerminal::start(
+        data.path(),
+        dir.path(),
+        &["--", "python3", "-c", COUNT_SIGINT, "2"],
+    );
+    t.wait_text("ready");
+    t.type_keys("\x03");
+    t.wait_text("count ");
+    t.settle();
+    assert!(text(&t.seen).contains("count 1"), "{:?}", text(&t.seen));
+    assert_eq!(t.wait().code(), Some(0));
+}
+
+#[test]
+fn a_kill_is_forwarded_once() {
+    let (data, _e) = sandbox(PortConflict::FreeIdle);
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = Running::start(
+        data.path(),
+        "long",
+        dir.path(),
+        &["--", "python3", "-c", COUNT_SIGINT, "2"],
+    );
+    r.wait_line("ready");
+    // SAFETY: the `btp run` this test started.
+    unsafe { libc::kill(r.pid(), libc::SIGINT) };
+    r.wait_line("count 1");
+    assert_eq!(r.wait().code(), Some(0));
+}
+
+#[test]
+fn terminal_child_sees_a_terminal() {
+    let (data, _e) = sandbox(PortConflict::FreeIdle);
+    let dir = tempfile::tempdir().unwrap();
+    let mut t = InTerminal::start(
+        data.path(),
+        dir.path(),
+        &[
+            "--",
+            "python3",
+            "-c",
+            "import os; print('tty', os.isatty(1), os.isatty(2))",
+        ],
+    );
+    t.wait_text("tty ");
+    t.settle();
+    assert!(
+        text(&t.seen).contains("tty True True"),
+        "{:?}",
+        text(&t.seen)
+    );
+    assert_eq!(t.wait().code(), Some(0));
+    let logs = run_logs(data.path());
+    assert_eq!(logs.len(), 1);
+    let log = std::fs::read(&logs[0]).unwrap();
+    assert_eq!(log, b"tty True True\n", "the child's bytes, unchanged");
+}
+
+#[test]
+fn a_background_grandchild_does_not_hold_btp_run() {
+    let (data, _e) = sandbox(PortConflict::FreeIdle);
+    let started = Instant::now();
+    let out = btp(data.path(), "long")
+        .args(["run", "--", "sh", "-c", "sleep 30 & echo $!"])
+        .assert()
+        .success();
+    let elapsed = started.elapsed();
+    let pid: i32 = text(&out.get_output().stdout).trim().parse().unwrap();
+    // SAFETY: the sleep this test started.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+}
+
+#[test]
+fn a_closed_stdout_ends_the_child() {
+    let (data, _e) = sandbox(PortConflict::FreeIdle);
+    let bin = assert_cmd::cargo::cargo_bin("btp");
+    let out = Command::new("sh")
+        .env("BTP_DATA_DIR", data.path())
+        .env("HOME", data.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEX_THREAD_ID")
+        .env_remove("BTP_RUN_ACTIVE")
+        .env("BTP_TEST_NO_CODEX", "1")
+        .arg("-c")
+        .arg(format!("'{}' run -- yes | head -1", bin.display()))
+        .timeout(WAIT)
+        .assert()
+        .success();
+    assert_eq!(text(&out.get_output().stdout), "y\n");
+}
+
+#[test]
+fn a_panic_before_the_start_runs_the_command_untouched() {
+    let (data, _e) = sandbox(PortConflict::FreeIdle);
+    let out = btp(data.path(), "long")
+        .env("BTP_TEST_PANIC_BEFORE_SPAWN", "1")
+        .args(["run", "--", "sh", "-c", "echo hi; exit 7"])
+        .assert()
+        .code(7);
+    let o = out.get_output();
+    assert_eq!(text(&o.stdout), "hi\n");
+    assert_eq!(
+        text(&o.stderr),
+        "btp: port check skipped (internal error), running the command as it is\n"
+    );
 }

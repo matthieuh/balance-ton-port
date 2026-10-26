@@ -1096,6 +1096,17 @@ impl<P: Platform> Watcher<P> {
         })
     }
 
+    /// Whether `pid` descends from a live agent session, by the same
+    /// ancestry match as `register_run` (an exclusion or an agent CLI
+    /// between blocks it). Reads the session files and the config only:
+    /// never the state, so it answers in a read-only data dir too.
+    pub fn in_live_session(&mut self, pid: i32) -> bool {
+        let scan = self.scan();
+        let chain = ancestry(&self.platform, pid);
+        chain.first().is_some_and(|p| p.pid == pid)
+            && session_of(&chain, &scan.sessions(), &[], &scan.cfg).is_some()
+    }
+
     /// Records that the alert for this exact server was delivered (the app
     /// calls it once the notification is posted): no more alerts until it
     /// restarts. A pass never marks alerts itself.
@@ -4559,6 +4570,30 @@ mod tests {
         // A process that does not exist either.
         assert_eq!(f.w.register_run(71, T0).unwrap(), None);
         assert!(state_runs(&f).is_empty());
+    }
+
+    #[test]
+    fn in_live_session_needs_no_state_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut f = fx();
+        let web = f.wt.join("apps/web");
+        f.p().spawn(
+            60,
+            20,
+            START + 60 * SEC,
+            "btp run vite",
+            web.to_str().unwrap(),
+        );
+        f.p()
+            .spawn(70, 10, START + 70 * SEC, "btp run vite", "/tmp");
+        let ro = fs::Permissions::from_mode(0o500);
+        fs::set_permissions(f.data.path(), ro).unwrap();
+        let answers = (f.w.in_live_session(60), f.w.in_live_session(70));
+        let write = f.w.register_run(60, T0);
+        fs::set_permissions(f.data.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(answers, (true, false));
+        assert!(write.is_err(), "the state cannot be written here");
+        assert!(!f.w.in_live_session(71), "no such process");
     }
 
     #[test]

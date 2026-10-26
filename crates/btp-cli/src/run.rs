@@ -19,6 +19,7 @@ use btp_core::watcher::{now_ms, ServerView, Watcher};
 use clap::Args;
 use std::cell::RefCell;
 use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -72,18 +73,48 @@ pub fn run(a: RunArgs) -> u8 {
         return exec_untouched(&a.cmd);
     }
     let dir = data_dir();
+    // A bug of btp before the start never stops the command: it runs as
+    // it is, with one line saying so (the panic message itself is muted).
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepare(&a, &dir)));
+    std::panic::set_hook(hook);
+    let start = match prepared {
+        Ok(Prepared::Start(s)) => s,
+        Ok(Prepared::Exit(code)) => return code,
+        Err(_) => {
+            eprintln!("btp: port check skipped (internal error), running the command as it is");
+            Start {
+                argv: a.cmd.clone(),
+                env: Vec::new(),
+            }
+        }
+    };
+    spawn_and_wait(&dir, start)
+}
+
+enum Prepared {
+    Start(Start),
+    Exit(u8),
+}
+
+/// Everything before the start: linking, log cleanup, the check.
+fn prepare(a: &RunArgs, dir: &Path) -> Prepared {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("BTP_TEST_PANIC_BEFORE_SPAWN").is_some() {
+        panic!("test panic before spawn");
+    }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let mut w = new_watcher(dir.clone());
-    // Linking first, keyed on this process: the child, and anything it
-    // starts with `&`, descends from it.
-    let in_session = w
-        .register_run(std::process::id() as i32, now_ms())
-        .ok()
-        .flatten()
-        .is_some();
-    runlog::cleanup(&dir, &|k| same_process(k), now_ms());
+    let mut w = new_watcher(dir.to_path_buf());
+    let me = std::process::id() as i32;
+    // Read only: the answer holds in a read-only data dir too.
+    let in_session = w.in_live_session(me);
+    // Linking, keyed on this process: the child, and anything it starts
+    // with `&`, descends from it. A failure only loses the link.
+    let _ = w.register_run(me, now_ms());
+    runlog::cleanup(dir, &|k| same_process(k), now_ms());
     let ctx = Ctx {
-        dir,
+        dir: dir.to_path_buf(),
         cwd,
         agent: in_session || !(is_tty(0) && is_tty(2)),
         flags: RunFlags {
@@ -95,23 +126,21 @@ pub fn run(a: RunArgs) -> u8 {
         argv: a.cmd.clone(),
         env: Vec::new(),
     };
-    let start = if a.no_check {
-        untouched()
-    } else {
-        let mut skip_reuse = a.new;
-        loop {
-            match check(&mut w, &ctx, &a.cmd, skip_reuse) {
-                Ok(Outcome::Start(s)) => break s,
-                Ok(Outcome::Exit(code)) => return code,
-                Ok(Outcome::Again) => skip_reuse = true,
-                Err(e) => {
-                    eprintln!("btp: port check skipped ({e}), running the command as it is");
-                    break untouched();
-                }
+    if a.no_check {
+        return Prepared::Start(untouched());
+    }
+    let mut skip_reuse = a.new;
+    loop {
+        match check(&mut w, &ctx, &a.cmd, skip_reuse) {
+            Ok(Outcome::Start(s)) => return Prepared::Start(s),
+            Ok(Outcome::Exit(code)) => return Prepared::Exit(code),
+            Ok(Outcome::Again) => skip_reuse = true,
+            Err(e) => {
+                eprintln!("btp: port check skipped ({e}), running the command as it is");
+                return Prepared::Start(untouched());
             }
         }
-    };
-    spawn_and_wait(&ctx.dir, start)
+    }
 }
 
 struct Ctx {
@@ -410,7 +439,7 @@ fn print_tail(log: &Path) -> u64 {
         } else {
             0
         };
-        write_out(1, &bytes[skip..]);
+        let _ = write_out(1, &bytes[skip..]);
     }
     len
 }
@@ -436,7 +465,7 @@ enum Follow {
 /// Prints what the log gains until a key, a signal, or the server's end.
 fn follow(log: &Path, offset: &mut u64, key: ServerKey) -> Follow {
     let _raw = RawMode::enter(0);
-    let _signals = Signals::install();
+    let _signals = Signals::forwarded();
     let mut last_alive_check = Instant::now();
     loop {
         if let Some(sig) = take_signal() {
@@ -453,7 +482,7 @@ fn follow(log: &Path, offset: &mut u64, key: ServerKey) -> Follow {
             *offset = len;
         } else if len > *offset {
             if let Ok(bytes) = read_from(log, *offset) {
-                write_out(1, &bytes);
+                let _ = write_out(1, &bytes);
                 *offset += bytes.len() as u64;
             }
         }
@@ -487,7 +516,7 @@ fn prompt(port: u16, who: &str, can_kill: bool, reroutable: bool) -> Choice {
     eprint!("Port {port} is used by {who}. {}? ", opts.join(", "));
     let _ = io::stderr().flush();
     let _raw = RawMode::enter(0);
-    let _signals = Signals::install();
+    let _signals = Signals::forwarded();
     let choice = loop {
         if take_signal().is_some() {
             break Choice::Cancel;
@@ -551,16 +580,76 @@ impl Drop for RawMode {
 static CHILD: AtomicI32 = AtomicI32::new(0);
 /// The last signal received and not yet handled (0: none).
 static LAST_SIGNAL: AtomicI32 = AtomicI32::new(0);
+/// The master of the child's pty, for SIGWINCH (-1: no pty).
+static PTY_MASTER: AtomicI32 = AtomicI32::new(-1);
 
 const FORWARDED: [i32; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 
-extern "C" fn on_signal(sig: libc::c_int) {
+/// `_IOR('t', 104, struct winsize)` and `_IOW('t', 103, ...)` (sys/ttycom.h),
+/// which the libc crate does not define for macOS.
+const TIOCGWINSZ: libc::c_ulong = 0x4008_7468;
+const TIOCSWINSZ: libc::c_ulong = 0x8008_7467;
+
+/// How long the pipes are still read once the child has exited: something
+/// it started in the background may hold them open forever.
+const DRAIN_AFTER_EXIT: Duration = Duration::from_millis(500);
+
+/// Forwards the signal to `CHILD`, except one the terminal sent to its
+/// whole foreground group, which the child (in btp's group) already got.
+/// SIGWINCH first copies the terminal's size to the child's pty, then is
+/// always forwarded: a pty with no session sends no SIGWINCH itself, and the
+/// child may have read the old size on the terminal's own SIGWINCH.
+/// Only async-signal-safe calls (atomics, kill, getpgrp, tcgetpgrp, ioctl).
+extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, _: *mut libc::c_void) {
     let pid = CHILD.load(Ordering::SeqCst);
-    if pid > 0 {
+    if sig == libc::SIGWINCH {
+        copy_window_size(PTY_MASTER.load(Ordering::SeqCst));
+        if pid > 0 {
+            // SAFETY: kill is async-signal-safe.
+            unsafe { libc::kill(pid, sig) };
+        }
+        return;
+    }
+    // A signal sent by a process (`kill`, `sigqueue`) carries SI_USER or
+    // SI_QUEUE. The terminal's has neither: on macOS its si_code is 0 but
+    // si_pid is not (the process whose write to the tty raised it).
+    // SAFETY: `info` is the kernel's siginfo for this delivery, or null.
+    let from_terminal =
+        !info.is_null() && unsafe { !matches!((*info).si_code, SI_USER | SI_QUEUE) };
+    if pid > 0 && !(from_terminal && in_foreground_group()) {
         // SAFETY: kill is async-signal-safe.
         unsafe { libc::kill(pid, sig) };
     }
     LAST_SIGNAL.store(sig, Ordering::SeqCst);
+}
+
+/// `si_code` of a signal sent with `kill`, and with `sigqueue`
+/// (sys/signal.h).
+const SI_USER: libc::c_int = 0x10001;
+const SI_QUEUE: libc::c_int = 0x10002;
+
+/// btp (and so the child, which stays in its process group) is the
+/// foreground group of one of its standard streams' terminal.
+fn in_foreground_group() -> bool {
+    // SAFETY: getpgrp and tcgetpgrp only read.
+    unsafe {
+        let me = libc::getpgrp();
+        (0..3).any(|fd| libc::tcgetpgrp(fd) == me)
+    }
+}
+
+/// Sets the pty `master` to the size of btp's terminal (stdout).
+fn copy_window_size(master: i32) {
+    if master < 0 {
+        return;
+    }
+    // SAFETY: ioctl on fds we hold, into a local winsize.
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(1, TIOCGWINSZ, &mut ws) == 0 {
+            libc::ioctl(master, TIOCSWINSZ, &ws);
+        }
+    }
 }
 
 fn take_signal() -> Option<i32> {
@@ -570,23 +659,25 @@ fn take_signal() -> Option<i32> {
     }
 }
 
-/// SIGINT, SIGTERM and SIGHUP caught (forwarded to `CHILD` when set) while
-/// it lives; the previous handlers come back on drop.
+/// `sigs` caught by `on_signal` while it lives; the previous handlers come
+/// back on drop.
 struct Signals {
     old: Vec<(i32, libc::sigaction)>,
 }
 
 impl Signals {
-    fn install() -> Signals {
+    fn install(sigs: &[i32]) -> Signals {
         LAST_SIGNAL.store(0, Ordering::SeqCst);
         let mut old = Vec::new();
-        for sig in FORWARDED {
+        for &sig in sigs {
             // SAFETY: installs a handler that only does async-signal-safe
-            // work (an atomic load and store, kill).
+            // work.
             unsafe {
                 let mut sa: libc::sigaction = std::mem::zeroed();
-                sa.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as usize;
-                sa.sa_flags = libc::SA_RESTART;
+                sa.sa_sigaction = on_signal
+                    as extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void)
+                    as usize;
+                sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
                 libc::sigemptyset(&mut sa.sa_mask);
                 let mut prev: libc::sigaction = std::mem::zeroed();
                 if libc::sigaction(sig, &sa, &mut prev) == 0 {
@@ -595,6 +686,11 @@ impl Signals {
             }
         }
         Signals { old }
+    }
+
+    /// SIGINT, SIGTERM and SIGHUP.
+    fn forwarded() -> Signals {
+        Signals::install(&FORWARDED)
     }
 }
 
@@ -619,9 +715,9 @@ fn same_process(k: ServerKey) -> bool {
         .is_some_and(|i| i.start_time == k.start_time)
 }
 
-/// Writes all of `bytes` to `fd`, unbuffered. A closed terminal is ignored:
-/// the child keeps running and its log keeps growing.
-fn write_out(fd: i32, mut bytes: &[u8]) {
+/// Writes all of `bytes` to `fd`, unbuffered. `false` when `fd` refused
+/// them (a closed pipe: EPIPE).
+fn write_out(fd: i32, mut bytes: &[u8]) -> bool {
     while !bytes.is_empty() {
         // SAFETY: writes from a live slice.
         let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
@@ -630,9 +726,10 @@ fn write_out(fd: i32, mut bytes: &[u8]) {
         } else if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
             continue;
         } else {
-            return;
+            return false;
         }
     }
+    true
 }
 
 /// Nested `btp run`: becomes the command itself.
@@ -650,19 +747,88 @@ fn cannot_run(program: &str, e: &io::Error) -> u8 {
     }
 }
 
-/// Starts the child with its stdout and stderr piped to the terminal and to
-/// its log, forwards SIGINT, SIGTERM and SIGHUP to it, and returns its exit
-/// code (128 + the signal when a signal killed it).
+/// A pty for the child's stdout and stderr, so it sees a terminal as it
+/// would without btp. Output post-processing is off on it, so the bytes the
+/// child writes reach the master unchanged (btp's terminal does its own).
+struct Pty {
+    master: OwnedFd,
+    slave: OwnedFd,
+}
+
+fn open_pty() -> io::Result<Pty> {
+    let (mut m, mut s) = (-1, -1);
+    // SAFETY: openpty fills two fds; a winsize read from our own stdout.
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        let wp = if libc::ioctl(1, TIOCGWINSZ, &mut ws) == 0 {
+            &mut ws as *mut libc::winsize
+        } else {
+            std::ptr::null_mut()
+        };
+        if libc::openpty(
+            &mut m,
+            &mut s,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            wp,
+        ) != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    // SAFETY: both fds were just opened and are owned here only.
+    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s)) };
+    // SAFETY: fcntl and termios calls on the fds above.
+    unsafe {
+        libc::fcntl(m, libc::F_SETFD, libc::FD_CLOEXEC);
+        libc::fcntl(s, libc::F_SETFD, libc::FD_CLOEXEC);
+        let mut t: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(s, &mut t) == 0 {
+            t.c_oflag &= !libc::OPOST;
+            libc::tcsetattr(s, libc::TCSANOW, &t);
+        }
+    }
+    Ok(Pty { master, slave })
+}
+
+/// Starts the child and copies its output, byte for byte, to btp's own
+/// stdout and stderr and to its log: through pipes (each stream to its
+/// own), or, when btp's stdout is a terminal, through a pty that both
+/// streams share (to btp's stdout), so the child still sees a terminal.
+/// stdin is the child's as it is. SIGINT, SIGTERM and SIGHUP are forwarded
+/// (SIGWINCH too with a pty). Returns the child's exit code; when a signal
+/// killed the child, btp dies of that same signal.
 fn spawn_and_wait(dir: &Path, s: Start) -> u8 {
-    let signals = Signals::install();
+    let pty = if is_tty(1) { open_pty().ok() } else { None };
+    let mut sigs = FORWARDED.to_vec();
+    if pty.is_some() {
+        sigs.push(libc::SIGWINCH);
+    }
+    let signals = Signals::install(&sigs);
     let mut cmd = Command::new(&s.argv[0]);
     cmd.args(&s.argv[1..])
         .envs(s.env)
         .env(ACTIVE, "1")
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = match cmd.spawn() {
+        .stdin(Stdio::inherit());
+    match &pty {
+        Some(p) => match (p.slave.try_clone(), p.slave.try_clone()) {
+            (Ok(o), Ok(e)) => {
+                cmd.stdout(Stdio::from(o)).stderr(Stdio::from(e));
+            }
+            _ => {
+                cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+            }
+        },
+        None => {
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        }
+    }
+    let spawned = cmd.spawn();
+    // The slave copies the command holds: the child has its own now, and
+    // the master reads end of file once the child's side is closed.
+    drop(cmd);
+    let pty = pty.map(|p| p.master);
+    let mut child = match spawned {
         Ok(c) => c,
         Err(e) => return cannot_run(&s.argv[0], &e),
     };
@@ -680,26 +846,22 @@ fn spawn_and_wait(dir: &Path, s: Start) -> u8 {
         .map_or_else(|| now_ms() * 1000, |i| i.start_time);
     let log = RunLog::create(dir, ServerKey { pid, start_time }).ok();
     let log = Arc::new(Mutex::new(log));
+    let mut sources: Vec<(Box<dyn Read + Send>, i32)> = Vec::new();
+    if let Some(o) = child.stdout.take() {
+        sources.push((Box::new(o), 1));
+    }
+    if let Some(e) = child.stderr.take() {
+        sources.push((Box::new(e), 2));
+    }
+    if let Some(m) = &pty {
+        PTY_MASTER.store(m.as_raw_fd(), Ordering::SeqCst);
+        if let Ok(dup) = m.try_clone() {
+            sources.push((Box::new(std::fs::File::from(dup)), 1));
+        }
+    }
     let (done_tx, done) = std::sync::mpsc::channel::<()>();
-    let pumps = [
-        (
-            child
-                .stdout
-                .take()
-                .map(|o| Box::new(o) as Box<dyn Read + Send>),
-            1,
-        ),
-        (
-            child
-                .stderr
-                .take()
-                .map(|e| Box::new(e) as Box<dyn Read + Send>),
-            2,
-        ),
-    ];
     let mut open = 0;
-    for (src, fd) in pumps {
-        let Some(src) = src else { continue };
+    for (src, fd) in sources {
         open += 1;
         let log = log.clone();
         let tx = done_tx.clone();
@@ -718,33 +880,46 @@ fn spawn_and_wait(dir: &Path, s: Start) -> u8 {
     };
     CHILD.store(0, Ordering::SeqCst);
     let _ = take_signal();
-    let code = match status {
-        Some(s) => s
-            .code()
-            .map(|c| c as u8)
-            .or_else(|| s.signal().map(|sig| 128 + sig as u8))
-            .unwrap_or(1),
-        None => 1,
-    };
-    // Drain what is left. Something the child started in the background may
-    // hold the pipes: keep copying until it closes them, or until a signal
-    // asks btp run to go.
+    // What the child wrote last, for a short while only: a server it
+    // started in the background may hold the pipes as long as it runs.
+    let deadline = Instant::now() + DRAIN_AFTER_EXIT;
     while open > 0 {
-        match done.recv_timeout(Duration::from_millis(100)) {
-            Ok(()) => open -= 1,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if take_signal().is_some() {
-                    break;
-                }
-            }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || done.recv_timeout(left).is_err() {
+            break;
         }
+        open -= 1;
     }
+    PTY_MASTER.store(-1, Ordering::SeqCst);
     drop(signals);
-    code
+    match status {
+        Some(s) => match (s.code(), s.signal()) {
+            (Some(c), _) => c as u8,
+            (None, Some(sig)) => die_of(sig),
+            _ => 1,
+        },
+        None => 1,
+    }
 }
 
-/// Copies `src` to `fd` and to the log, byte for byte, as it arrives.
+/// Ends btp with the signal that killed the child, so a shell sees the
+/// same death. Returns 128 + `sig` if btp is still alive after that.
+fn die_of(sig: i32) -> u8 {
+    // SAFETY: back to the default action, unblocked, then raised.
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, sig);
+        libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        libc::raise(sig);
+    }
+    128 + sig as u8
+}
+
+/// Copies `src` to `fd` and to the log, byte for byte, as it arrives. When
+/// `fd` is a closed pipe (`btp run -- yes | head -1`), it stops reading and
+/// closes its end, so the child gets its SIGPIPE as without btp.
 fn pump(mut src: Box<dyn Read + Send>, fd: i32, log: &Mutex<Option<RunLog>>) {
     let mut buf = vec![0u8; 64 * 1024];
     loop {
@@ -752,9 +927,10 @@ fn pump(mut src: Box<dyn Read + Send>, fd: i32, log: &Mutex<Option<RunLog>>) {
             Ok(0) => return,
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            // EIO from a pty master: the child's side is closed.
             Err(_) => return,
         };
-        write_out(fd, &buf[..n]);
+        let delivered = write_out(fd, &buf[..n]);
         if let Ok(mut l) = log.lock() {
             if let Some(f) = l.as_mut() {
                 // A log that fails stops being written; the output goes on.
@@ -762,6 +938,9 @@ fn pump(mut src: Box<dyn Read + Send>, fd: i32, log: &Mutex<Option<RunLog>>) {
                     *l = None;
                 }
             }
+        }
+        if !delivered {
+            return;
         }
     }
 }
