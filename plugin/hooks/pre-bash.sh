@@ -5,7 +5,8 @@
 # command with a message for Claude (printed as the permission decision).
 #
 # Prints nothing and exits 0 on every other path: btp missing, older than
-# 0.5.0 (the first with `btp hook pre-bash`), or any error. It never blocks
+# BTP_MIN_VERSION (0.5.0 is the first with `btp hook pre-bash`; btp_find
+# applies the minimum), or any error. It never blocks
 # the agent because of btp.
 #
 # The hook's timeout is 10 s: the port check takes well under a second and
@@ -15,16 +16,11 @@
 
 exec 2>/dev/null
 
-# The first btp that has `btp hook pre-bash`.
-PRE_BASH_MIN_VERSION="0.5.0"
-
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit 0
 # shellcheck source=SCRIPTDIR/../scripts/lib.sh
 . "$here/../scripts/lib.sh" || exit 0
 
 bin="$(btp_find)" || exit 0
-version="$(btp_version "$bin")" || exit 0
-btp_version_ge "$version" "$PRE_BASH_MIN_VERSION" || exit 0
 
 "$bin" hook pre-bash || true
 exit 0
