@@ -443,6 +443,53 @@ fn block_when_not_reroutable() {
 }
 
 #[test]
+fn a_broken_config_reroutes_and_never_frees() {
+    use btp_core::platform::{MacOs, Platform};
+    let (data, _e) = sandbox(PortConflict::FreeIdle);
+    let dir = tempfile::tempdir().unwrap();
+    let p = free_port();
+    let mut holder = Holder::bind(p);
+    // Freeable but for the config: a dead session's server, idle for
+    // hours, while a watcher holds the lock.
+    let pid = holder.0.id() as i32;
+    let start_time = MacOs.proc_info(pid).unwrap().start_time;
+    let state = serde_json::json!({"servers": [{
+        "key": {"pid": pid, "start_time": start_time},
+        "port": p, "command": "python3 holder", "worktree": dir.path(),
+        "session_id": "s1", "session_pid": 1, "session_proc_start": "x",
+        "session_name": "gone", "first_seen_ms": 1, "last_active_ms": 1,
+        "kept": false, "alerted": false,
+    }], "recent_kills": []});
+    std::fs::write(data.path().join("state.json"), state.to_string()).unwrap();
+    std::fs::write(data.path().join("config.toml"), "not = [toml").unwrap();
+    let _watcher = btp_core::watcher::acquire_watch_lock(data.path(), "btp watch").unwrap();
+    let out = btp(data.path(), "long")
+        .current_dir(dir.path())
+        .env("SERVE_EXIT_AFTER", "0.5")
+        .args([
+            "run",
+            "--free",
+            "--",
+            helper().to_str().unwrap(),
+            "--port",
+            &p.to_string(),
+        ])
+        .assert()
+        .success();
+    let err = text(&out.get_output().stderr);
+    assert!(err.contains("btp: invalid "), "warned: {err}");
+    assert!(
+        err.contains(&format!("on http://localhost:{} ({p} is used by ", p + 1)),
+        "{err}"
+    );
+    assert!(!err.contains("freed"), "{err}");
+    assert!(
+        holder.0.try_wait().unwrap().is_none(),
+        "the holder was killed"
+    );
+}
+
+#[test]
 fn reuse_agent_mode() {
     let (data, _e) = sandbox(PortConflict::FreeIdle);
     let dir = tempfile::tempdir().unwrap();
@@ -734,7 +781,17 @@ fn terminal_reuse_follows_logs_and_r_restarts_here() {
     t.wait_text("Following its logs. Ctrl-C stops following; the server keeps running. Press r to restart it here.");
     // The log so far, then `r`: the old server stops, a new one starts here.
     t.wait_text(&format!("serve.py listening on {p} pid {old}"));
+    // `r` asks first; Return (like any key but `y`) keeps the server.
+    let question = format!(" on :{p} and start it here? [y/N]");
     t.type_keys("r");
+    t.wait_text(&question);
+    assert!(text(&t.seen).contains("Stop "), "{:?}", text(&t.seen));
+    t.type_keys("\r");
+    t.wait_text("btp: not stopped; still following");
+    assert!(alive(old), "Return stopped it");
+    t.type_keys("r");
+    t.wait_count(&question, 2);
+    t.type_keys("y");
     t.wait_text("stopped it; starting");
     let name = dir
         .path()
@@ -753,6 +810,36 @@ fn terminal_reuse_follows_logs_and_r_restarts_here() {
     // `script` reports the signal its child (btp) died of.
     assert_eq!(status.code(), Some(libc::SIGINT), "{:?}", text(&t.seen));
     assert!(bindable(&[p]), "port free");
+}
+
+#[test]
+fn terminal_background_job_acts_as_an_agent() {
+    let (data, _e) = sandbox(PortConflict::FreeIdle);
+    let dir = tempfile::tempdir().unwrap();
+    let p = free_port();
+    let ps = p.to_string();
+    let h = helper();
+    let args = ["--", h.to_str().unwrap(), "--port", &ps];
+    let mut first = Running::start(data.path(), "long", dir.path(), &args);
+    first.wait_line(&format!("serve.py listening on {p}"));
+    // A job in the background of an interactive shell (`set -m`): not the
+    // terminal's foreground group, so no following and no raw mode (which
+    // would stop it with SIGTTOU), just the reuse line and exit 0.
+    let btp = assert_cmd::cargo::cargo_bin("btp");
+    let line = format!(
+        "set -m; '{}' run -- '{}' --port {p} & wait $!; echo \"exit=$?\"",
+        btp.display(),
+        h.display()
+    );
+    let mut t = InTerminal::shell(data.path(), dir.path(), &line);
+    t.wait_text("reusing it");
+    t.wait_text("exit=0");
+    assert!(
+        !text(&t.seen).contains("Following its logs"),
+        "{:?}",
+        text(&t.seen)
+    );
+    assert!(alive(first.helper_pid.unwrap()));
 }
 
 /// A python helper that counts the SIGINTs it gets for `secs` seconds,

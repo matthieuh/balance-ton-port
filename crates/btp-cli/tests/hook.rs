@@ -406,3 +406,22 @@ fn a_framework_in_an_argument_is_not_a_dev_command() {
     }
     assert!(h.0.try_wait().unwrap().is_none(), "the holder was touched");
 }
+
+#[test]
+fn unknown_port_style_does_not_suggest_btp_run() {
+    let (data, _e) = sandbox(|_| {});
+    let cwd = tempfile::tempdir().unwrap();
+    let p = free_port();
+    let _h = Holder::bind(p);
+    let o = hook_with(
+        data.path(),
+        &payload(&serve_cmd(p), cwd.path()),
+        false,
+        Some("serve.py:8000:none"),
+    );
+    let r = reason_of(&o);
+    assert!(r.starts_with(&format!("port {p} is used by ")), "{r}");
+    assert!(r.contains("not started by an agent"), "{r}");
+    assert!(!r.contains("btp run"), "{r}");
+    assert!(r.contains("Start it on a free port"), "{r}");
+}

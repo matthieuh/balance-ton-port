@@ -7,7 +7,7 @@
 //! prefixed `btp: `.
 
 use crate::{new_watcher, warn_config};
-use btp_core::config::data_dir;
+use btp_core::config::{data_dir, read_config, Config};
 use btp_core::labels::package_name;
 use btp_core::model::{KillTarget, ServerKey};
 use btp_core::platform::{MacOs, Platform};
@@ -116,7 +116,7 @@ fn prepare(a: &RunArgs, dir: &Path) -> Prepared {
     let ctx = Ctx {
         dir: dir.to_path_buf(),
         cwd,
-        agent: in_session || !(is_tty(0) && is_tty(2)),
+        agent: in_session || !(is_tty(0) && is_tty(2)) || !in_foreground(),
         flags: RunFlags {
             free: a.free,
             reroute: a.reroute,
@@ -146,7 +146,8 @@ fn prepare(a: &RunArgs, dir: &Path) -> Prepared {
 struct Ctx {
     dir: PathBuf,
     cwd: PathBuf,
-    /// No prompt, no following logs: from an agent session or without a TTY.
+    /// No prompt, no following logs: from an agent session, without a TTY,
+    /// or in a background job of the terminal.
     agent: bool,
     flags: RunFlags,
 }
@@ -173,8 +174,22 @@ fn check(
     let Some(port) = dev.port else {
         return Ok(untouched());
     };
-    let cfg = w.config();
-    warn_config(w.config_error());
+    // Read here, as the hook does, not left to an earlier scan. A broken
+    // config: the defaults for rerouting, but nothing is ever freed (as
+    // `free_for_run` refuses), so `--reroute` for this run.
+    let (cfg, flags) = match read_config(&ctx.dir) {
+        Ok(c) => (c, ctx.flags),
+        Err(e) => {
+            warn_config(Some(&e));
+            (
+                Config::default(),
+                RunFlags {
+                    free: false,
+                    reroute: true,
+                },
+            )
+        }
+    };
     let name = app_name(&ctx.cwd);
     let now = now_ms();
 
@@ -192,7 +207,7 @@ fn check(
     };
     let reroutable = dev.style.is_some();
     let who = holder_text(&holder);
-    let mut res = resolve(&holder, reroutable, cfg.port_conflict, ctx.flags, &cfg, now);
+    let mut res = resolve(&holder, reroutable, cfg.port_conflict, flags, &cfg, now);
     if let Resolution::Ask { can_kill } = res {
         if ctx.agent {
             eprintln!(
@@ -397,22 +412,23 @@ fn reuse(w: &mut Watcher<MacOs>, ctx: &Ctx, name: &str, v: &ServerView) -> io::R
     let mut offset = print_tail(&log);
     loop {
         match follow(&log, &mut offset, v.key) {
-            Follow::Interrupted(sig) => {
-                eprintln!(
-                    "btp: stopped following; {name} keeps running on http://localhost:{}",
-                    v.port
-                );
-                return Ok(Outcome::Exit(if sig == libc::SIGINT {
-                    0
-                } else {
-                    128 + sig as u8
-                }));
-            }
+            Follow::Interrupted(sig) => return Ok(Outcome::Exit(stop_following(name, v, sig))),
             Follow::Gone => {
                 eprintln!("btp: {name} on :{} has stopped", v.port);
                 return Ok(Outcome::Exit(0));
             }
             Follow::Restart => {
+                match confirm(&format!(
+                    "Stop {} on :{} and start it here? [y/N] ",
+                    v.tool_label, v.port
+                )) {
+                    Answer::Yes => {}
+                    Answer::No => {
+                        eprintln!("btp: not stopped; still following");
+                        continue;
+                    }
+                    Answer::Signal(sig) => return Ok(Outcome::Exit(stop_following(name, v, sig))),
+                }
                 let stopped = if tracked {
                     w.kill(KillTarget::Key(v.key))?
                 } else {
@@ -422,13 +438,63 @@ fn reuse(w: &mut Watcher<MacOs>, ctx: &Ctx, name: &str, v: &ServerView) -> io::R
                     eprintln!("btp: stopped it; starting {name} here");
                     return Ok(Outcome::Again);
                 }
+                let excluded = matches!(
+                    w.port_holder(v.port, now_ms()),
+                    Ok(Some(Holder::Observed { excluded: true, .. }))
+                );
+                let why = if excluded {
+                    "it is excluded in btp's settings"
+                } else {
+                    "btp may not signal it, or a stop or restart of it is already under way"
+                };
                 eprintln!(
-                    "btp: btp cannot stop {} (it is excluded in btp's settings); still following",
+                    "btp: btp cannot stop {} ({why}); still following",
                     v.tool_label
                 );
             }
         }
     }
+}
+
+/// Says the server keeps running; the exit code after signal `sig` (0 for
+/// Ctrl-C).
+fn stop_following(name: &str, v: &ServerView, sig: i32) -> u8 {
+    eprintln!(
+        "btp: stopped following; {name} keeps running on http://localhost:{}",
+        v.port
+    );
+    if sig == libc::SIGINT {
+        0
+    } else {
+        128 + sig as u8
+    }
+}
+
+enum Answer {
+    Yes,
+    No,
+    Signal(i32),
+}
+
+/// `question`, answered with one key: `y` is yes, any other key (Return
+/// and Escape included) is no, like the app's confirmation.
+fn confirm(question: &str) -> Answer {
+    eprint!("{question}");
+    let _ = io::stderr().flush();
+    let _raw = RawMode::enter(0);
+    let _signals = Signals::forwarded();
+    let answer = loop {
+        if let Some(sig) = take_signal() {
+            break Answer::Signal(sig);
+        }
+        match read_key(0) {
+            Some(b'y' | b'Y') => break Answer::Yes,
+            Some(_) => break Answer::No,
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    eprintln!();
+    answer
 }
 
 /// Prints the last lines of the log; returns the offset to follow from.
@@ -706,6 +772,14 @@ impl Drop for Signals {
             unsafe { libc::sigaction(*sig, prev, std::ptr::null_mut()) };
         }
     }
+}
+
+/// btp's process group is the foreground group of its terminal (stdin):
+/// not a background job (`btp run ... &` in an interactive shell), which
+/// must neither prompt nor change the terminal's mode.
+fn in_foreground() -> bool {
+    // SAFETY: getpgrp and tcgetpgrp only read.
+    unsafe { libc::tcgetpgrp(0) == libc::getpgrp() }
 }
 
 fn is_tty(fd: i32) -> bool {

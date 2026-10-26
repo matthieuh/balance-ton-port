@@ -93,9 +93,9 @@ fn decide(input: &str) -> Option<String> {
         Some(PortStyle::Env) => {
             format!("Rerun as `btp run -- {cmd}` to get a free port, or set PORT={next}.")
         }
-        None => format!(
-            "Rerun as `btp run -- {cmd}`, or start it on a free port (btp cannot change this command's port)."
-        ),
+        // `btp run` could not reroute it either.
+        None => "Start it on a free port (btp cannot change this command's port), or ask the user."
+            .to_string(),
     };
     if matches!(res, Resolution::Ask { can_kill: true }) {
         advice.push_str(" Ask the user before freeing it.");
