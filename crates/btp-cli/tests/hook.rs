@@ -7,6 +7,7 @@
 use assert_cmd::Command;
 use btp_core::config::{save_config, Config, PortConflict};
 use btp_core::platform::{MacOs, Platform};
+use btp_core::watcher::acquire_watch_lock;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
@@ -278,6 +279,8 @@ fn frees_dead_idle_holder() {
         "alerted": false,
     }], "recent_kills": []});
     std::fs::write(data.path().join("state.json"), state.to_string()).unwrap();
+    // A watcher runs: its passes keep the idle clock fresh.
+    let _watcher = acquire_watch_lock(data.path(), "btp watch").unwrap();
     let o = hook(data.path(), &payload(&serve_cmd(p), cwd.path()), false);
     assert!(o.status.success());
     assert_eq!(out(&o), "");
@@ -332,6 +335,8 @@ fn heredoc_body_never_frees_a_holder() {
         "kept": false, "alerted": false,
     }], "recent_kills": []});
     std::fs::write(data.path().join("state.json"), state.to_string()).unwrap();
+    // A watcher runs, so the holder would be freeable for a real command.
+    let _watcher = acquire_watch_lock(data.path(), "btp watch").unwrap();
     let cmd = format!("cat > f.sh <<'EOF'\n{}\nEOF", serve_cmd(p));
     let o = hook(data.path(), &payload(&cmd, cwd.path()), false);
     assert_eq!(out(&o), "");
@@ -346,6 +351,36 @@ fn garbage_stdin_exit_0() {
         assert!(o.status.success(), "{s}");
         assert_eq!(out(&o), "", "{s}");
     }
+}
+
+/// `state.json` tracking `h` on `p` for a session that is gone (pid 1 never
+/// has this start), idle for far more than 10 minutes.
+fn track_dead_idle(data: &Path, cwd: &Path, h: &Holder, p: u16) {
+    let start_time = MacOs.proc_info(h.pid()).unwrap().start_time;
+    let state = serde_json::json!({"servers": [{
+        "key": {"pid": h.pid(), "start_time": start_time},
+        "port": p, "command": serve_cmd(p), "worktree": cwd,
+        "session_id": "s1", "session_pid": 1, "session_proc_start": "x",
+        "session_name": "gone", "first_seen_ms": 1, "last_active_ms": 1,
+        "kept": false, "alerted": false,
+    }], "recent_kills": []});
+    std::fs::write(data.join("state.json"), state.to_string()).unwrap();
+}
+
+#[test]
+fn never_frees_without_a_watcher() {
+    let (data, _e) = sandbox(|_| {});
+    let cwd = tempfile::tempdir().unwrap();
+    let p = free_port();
+    let mut h = Holder::bind(p);
+    track_dead_idle(data.path(), cwd.path(), &h, p);
+    // No watcher: the idle clock is as old as the last pass, so it proves
+    // nothing. The command is denied with the usual advice instead.
+    let o = hook(data.path(), &payload(&serve_cmd(p), cwd.path()), false);
+    let r = reason_of(&o);
+    assert!(r.starts_with(&format!("port {p} is used by ")), "{r}");
+    assert!(r.contains(&format!("or pass --port {}.", p + 1)), "{r}");
+    assert!(h.0.try_wait().unwrap().is_none(), "the holder was killed");
 }
 
 #[test]

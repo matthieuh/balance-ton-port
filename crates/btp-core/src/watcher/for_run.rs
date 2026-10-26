@@ -69,7 +69,9 @@ impl<P: Platform> Watcher<P> {
 
     /// Frees a port for `btp run` by killing the tracked server `key`, only
     /// if it is still `freeable` with the config read from disk now (a
-    /// broken config frees nothing). The check and the SIGTERM happen under
+    /// broken config frees nothing) and a watcher holds `watch.lock`: only
+    /// its passes keep the idle clock fresh, so without one nothing is
+    /// freed. The check and the SIGTERM happen under
     /// the state lock, so a Keep or a note saved meanwhile always wins; the
     /// grace wait and the SIGKILL follow outside it, every start time
     /// re-checked like any kill. Recorded with `KillReason::PortConflict`.
@@ -79,6 +81,9 @@ impl<P: Platform> Watcher<P> {
         let Some(_claim) = self.in_flight.claim(key) else {
             return Ok(None);
         };
+        if !watch_lock_held(&self.data_dir) {
+            return Ok(None);
+        }
         let scan = self.scan();
         if self.config_error.is_some() {
             return Ok(None);
@@ -95,6 +100,7 @@ impl<P: Platform> Watcher<P> {
                 obs,
                 idle_ms,
                 in_use,
+                watched: true,
             }) = self.holder_of(s, &listeners, &scan, now_ms)
             else {
                 return None;
@@ -202,6 +208,7 @@ impl<P: Platform> Watcher<P> {
 
     /// A tracked server as a holder of its port: `Observed` (excluded) when
     /// it matches an exclusion now, `None` once its process is gone.
+    /// `watched` says whether a watcher holds `watch.lock` now.
     fn holder_of(
         &self,
         s: &TrackedServer,
@@ -226,6 +233,7 @@ impl<P: Platform> Watcher<P> {
             obs,
             idle_ms: v.idle_ms,
             in_use: v.in_use,
+            watched: watch_lock_held(&self.data_dir),
         })
     }
 }
@@ -314,8 +322,16 @@ mod tests {
         }
     }
 
-    /// The fixture's server, linked at `T0`, its session gone since.
-    fn dead_session_fx() -> Fx {
+    /// The fixture's server, linked at `T0`, its session gone since, while
+    /// a watcher holds `watch.lock` (the lock is held while it lives).
+    fn dead_session_fx() -> (Fx, WatchLock) {
+        let f = unwatched_dead_session_fx();
+        let lock = acquire_watch_lock(f.data.path(), "btp watch").unwrap();
+        (f, lock)
+    }
+
+    /// `dead_session_fx` with no watcher running.
+    fn unwatched_dead_session_fx() -> Fx {
         let mut f = fx();
         f.w.tick(T0).unwrap();
         f.p().remove_proc(20);
@@ -332,7 +348,7 @@ mod tests {
 
     #[test]
     fn holder_tracked_with_idle() {
-        let mut f = dead_session_fx();
+        let (mut f, _lock) = dead_session_fx();
         // A port of a child of the server is the server's too.
         f.p().add_listener(31, 8787);
         for port in [3000, 8787] {
@@ -342,7 +358,9 @@ mod tests {
                     obs,
                     idle_ms,
                     in_use,
+                    watched,
                 }) => {
+                    assert!(watched);
                     assert_eq!(server.key, key30());
                     assert!(!obs.session_alive);
                     assert_eq!(idle_ms, 11 * MIN);
@@ -408,7 +426,7 @@ mod tests {
 
     #[test]
     fn excluded_child_listener_is_not_the_servers() {
-        let mut f = dead_session_fx();
+        let (mut f, _lock) = dead_session_fx();
         let web = f.wt.join("apps/web");
         let mut cfg = f.cfg();
         cfg.exclude_commands.push("postgres".into());
@@ -443,7 +461,7 @@ mod tests {
 
     #[test]
     fn free_for_run_rechecks() {
-        let mut f = dead_session_fx();
+        let (mut f, _lock) = dead_session_fx();
         let now = T0 + 11 * MIN;
         assert!(matches!(
             f.w.port_holder(3000, now).unwrap(),
@@ -459,7 +477,7 @@ mod tests {
 
     #[test]
     fn free_for_run_refuses_what_is_not_freeable() {
-        let mut f = dead_session_fx();
+        let (mut f, _lock) = dead_session_fx();
         // Idle 9 min only.
         assert_eq!(f.w.free_for_run(key30(), T0 + 9 * MIN).unwrap(), None);
         // In use.
@@ -482,7 +500,7 @@ mod tests {
 
     #[test]
     fn free_for_run_frees_nothing_on_a_broken_config() {
-        let mut f = dead_session_fx();
+        let (mut f, _lock) = dead_session_fx();
         fs::write(f.data.path().join("config.toml"), "not = [toml").unwrap();
         assert_eq!(f.w.free_for_run(key30(), T0 + 11 * MIN).unwrap(), None);
         assert!(f.p().signals().is_empty());
@@ -490,7 +508,7 @@ mod tests {
 
     #[test]
     fn free_for_run_records_reason() {
-        let mut f = dead_session_fx();
+        let (mut f, _lock) = dead_session_fx();
         let now = T0 + 11 * MIN;
         let rec = f.w.free_for_run(key30(), now).unwrap().expect("freed");
         assert_eq!(
@@ -509,6 +527,38 @@ mod tests {
         assert_eq!(f.kill_log(), vec![rec]);
         assert!(f.state_servers().is_empty());
         assert!(f.w.port_holder(3000, now).unwrap().is_none());
+    }
+
+    #[test]
+    fn nothing_is_freed_without_a_watcher() {
+        // No pass refreshes the idle clock: 11 min may be stale.
+        let mut f = unwatched_dead_session_fx();
+        let now = T0 + 11 * MIN;
+        match f.w.port_holder(3000, now).unwrap() {
+            Some(h @ Holder::Tracked { watched: false, .. }) => {
+                let cfg = f.cfg();
+                assert_eq!(
+                    crate::run::conflict::resolve(
+                        &h,
+                        true,
+                        cfg.port_conflict,
+                        Default::default(),
+                        &cfg,
+                        now
+                    ),
+                    crate::run::conflict::Resolution::Reroute
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(f.w.free_for_run(key30(), now).unwrap(), None);
+        assert!(f.p().signals().is_empty());
+        assert!(f.p().is_alive(30));
+        assert_eq!(f.state_servers().len(), 1);
+        // The same server is freed once a watcher holds the lock.
+        let _lock = acquire_watch_lock(f.data.path(), "btp watch").unwrap();
+        assert!(f.w.free_for_run(key30(), now).unwrap().is_some());
+        assert!(!f.p().is_alive(30));
     }
 
     fn scripts(dir: &Path) {

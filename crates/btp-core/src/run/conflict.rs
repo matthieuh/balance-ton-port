@@ -24,6 +24,11 @@ pub enum Holder {
         obs: Observation,
         idle_ms: u64,
         in_use: bool,
+        /// A watcher (the app or `btp watch`) holds `watch.lock`, so its
+        /// passes keep the server's idle clock fresh. Without one,
+        /// `idle_ms` counts from the last pass, however old: the holder is
+        /// never freeable then.
+        watched: bool,
     },
     /// A listener btp sees but does not track (`label` names it for the
     /// message). `excluded` when it matches an exclusion rule.
@@ -81,7 +86,8 @@ pub fn freeable(
 /// Decides what to do about a taken port.
 ///
 /// `reroutable` is false when the command's port cannot be changed. Only a
-/// freeable tracked holder is ever `Free`; `flags.free` never extends that.
+/// freeable tracked holder, while a watcher runs, is ever `Free`;
+/// `flags.free` never extends that.
 pub fn resolve(
     holder: &Holder,
     reroutable: bool,
@@ -96,6 +102,7 @@ pub fn resolve(
             obs,
             idle_ms,
             in_use,
+            watched: true,
         } if freeable(server, obs, *idle_ms, *in_use, cfg, now_ms) => Some(server.key),
         _ => None,
     };
@@ -189,6 +196,7 @@ mod tests {
             obs: obs(),
             idle_ms,
             in_use: false,
+            watched: true,
         }
     }
 
@@ -314,6 +322,56 @@ mod tests {
                 let r = go(&Holder::Unknown, reroutable, policy, flags);
                 assert!(!matches!(r, Resolution::Free(_)), "{policy:?}");
                 assert_ne!(r, Resolution::Ask { can_kill: true });
+            }
+        }
+    }
+
+    #[test]
+    fn unwatched_holder_is_never_freed() {
+        // No watcher: the idle clock may be stale, so even a holder idle for
+        // hours is not freed, under any policy or flag.
+        let h = match tracked(100 * 600_000) {
+            Holder::Tracked {
+                server,
+                obs,
+                idle_ms,
+                in_use,
+                ..
+            } => Holder::Tracked {
+                server,
+                obs,
+                idle_ms,
+                in_use,
+                watched: false,
+            },
+            other => other,
+        };
+        let free = RunFlags {
+            free: true,
+            reroute: false,
+        };
+        for policy in [
+            PortConflict::FreeIdle,
+            PortConflict::Ask,
+            PortConflict::Reroute,
+        ] {
+            for flags in [NONE, free] {
+                assert_eq!(
+                    go(&h, true, policy, flags),
+                    {
+                        if policy == PortConflict::Ask && !flags.free {
+                            Resolution::Ask { can_kill: false }
+                        } else {
+                            Resolution::Reroute
+                        }
+                    },
+                    "{policy:?} {flags:?}"
+                );
+                assert_eq!(
+                    go(&h, false, policy, flags),
+                    Resolution::Block,
+                    "{policy:?}"
+                );
             }
         }
     }
