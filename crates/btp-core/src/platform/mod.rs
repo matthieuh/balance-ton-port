@@ -84,6 +84,14 @@ pub trait Platform {
         let _ = peer_pids;
         self.established(pid, port)
     }
+    /// Something accepts TCP connections on `port` on the loopback address
+    /// (IPv4 or IPv6), whoever owns it: catches a listener `listeners`
+    /// cannot see (another user's, root's). The default knows nothing of
+    /// such listeners: a platform that can tell must override it.
+    fn port_answers(&self, port: u16) -> bool {
+        let _ = port;
+        false
+    }
 }
 
 const MAX_ANCESTRY: usize = 64;
@@ -166,6 +174,8 @@ mod fake {
         exe_calls: usize,
         /// `(pid, port)` -> `(peer pid, connections from it)`.
         established_from: Vec<(i32, u16, i32, u32)>,
+        /// Ports held by a listener `listeners` does not list.
+        foreign_ports: HashSet<u16>,
     }
 
     /// In-memory platform for tests. SIGTERM and SIGKILL remove a process
@@ -287,6 +297,12 @@ mod fake {
             self.st().signals.clone()
         }
 
+        /// `port` is held by a process `listeners` cannot see (another
+        /// user's): only `port_answers` tells.
+        pub fn add_foreign_listener(&self, port: u16) {
+            self.st().foreign_ports.insert(port);
+        }
+
         pub fn is_alive(&self, pid: i32) -> bool {
             self.st().procs.contains_key(&pid)
         }
@@ -403,6 +419,11 @@ mod fake {
                 .map(|e| e.3)
                 .sum();
             total.saturating_sub(from_peers)
+        }
+
+        fn port_answers(&self, port: u16) -> bool {
+            let st = self.st();
+            st.foreign_ports.contains(&port) || st.listeners.iter().any(|l| l.port == port)
         }
 
         fn pids_named(&self, name: &str) -> Vec<i32> {

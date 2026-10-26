@@ -878,6 +878,7 @@ fn saved_view(s: &TrackedServer, now_ms: u64) -> ServerView {
             .filter(|n| n.keep)
             .map(|n| n.reason.clone().unwrap_or_default()),
         kept_by_user: s.kept,
+        has_logs: false,
     }
 }
 
@@ -951,6 +952,7 @@ mod tests {
             postponed_until_ms: None,
             note_reason: None,
             kept_by_user: false,
+            has_logs: false,
         }
     }
 

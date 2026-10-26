@@ -322,6 +322,7 @@ mod tests {
             postponed_until_ms: None,
             note_reason: None,
             kept_by_user: false,
+            has_logs: false,
         }
     }
 

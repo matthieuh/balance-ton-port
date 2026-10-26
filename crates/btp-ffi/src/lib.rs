@@ -1335,6 +1335,7 @@ mod tests {
             postponed_until_ms: None,
             note_reason: None,
             kept_by_user: false,
+            has_logs: false,
         };
         let f = ServerViewFfi::tracked(&v, &Live::default(), 0);
         assert_eq!(f.agent, "claude_code");
@@ -1365,6 +1366,7 @@ mod tests {
             postponed_until_ms: None,
             note_reason: None,
             kept_by_user: false,
+            has_logs: false,
         };
         let f = ServerViewFfi::tracked(&v, &Live::default(), 4 * 60_000);
         assert_eq!((f.pid, f.start_time, f.port), (42, 7, 5173));
@@ -1400,6 +1402,7 @@ mod tests {
             postponed_until_ms: Some(10_000),
             note_reason: None,
             kept_by_user: false,
+            has_logs: false,
         }
     }
 

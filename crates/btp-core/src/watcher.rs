@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+mod for_run;
 mod session;
 pub use session::{
     NoteCmd, NoteOutcome, OwnKillOutcome, SessionEndReport, StaleServer, SweepOutcome, WaiterEnd,
@@ -77,6 +78,8 @@ pub struct ServerView {
     pub note_reason: Option<String>,
     /// Kept by the user (Keep).
     pub kept_by_user: bool,
+    /// A `btp run` log exists for it (`btp logs`).
+    pub has_logs: bool,
 }
 
 /// How long "Postpone 1 h" holds the dead-session kill.
@@ -1748,6 +1751,14 @@ fn record(s: &TrackedServer, reason: KillReason, now_ms: u64) -> KillRecord {
     }
 }
 
+/// The last component of a worktree path, the whole path when it has none.
+fn worktree_name(worktree: &Path) -> String {
+    worktree
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| worktree.display().to_string())
+}
+
 /// `live_session` is the display name of the server's session when it is
 /// alive; it names servers tracked before session names were recorded.
 fn view(
@@ -1776,11 +1787,7 @@ fn view(
         let postponed = s.postponed_until_ms.map_or(0, |u| u.saturating_sub(now_ms));
         Some(rule.max(postponed))
     };
-    let worktree_name = s
-        .worktree
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| s.worktree.display().to_string());
+    let worktree_name = worktree_name(&s.worktree);
     ServerView {
         key: s.key,
         port: s.port,
@@ -1811,6 +1818,7 @@ fn view(
             .filter(|n| n.keep)
             .map(|n| n.reason.clone().unwrap_or_default()),
         kept_by_user: s.kept,
+        has_logs: false,
     }
 }
 
@@ -2352,6 +2360,7 @@ mod tests {
                 postponed_until_ms: None,
                 note_reason: None,
                 kept_by_user: false,
+                has_logs: false,
             }]
         );
         assert_eq!(f.state_servers(), vec![s]);
