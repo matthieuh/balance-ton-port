@@ -100,6 +100,20 @@ final class SettingsDraftTests: XCTestCase {
         XCTAssertEqual(d.ffi.deadSessionIdleS, 90)
     }
 
+    func testPortConflictDraftRoundTrip() {
+        var c = config
+        c.portConflict = "reroute"
+        c.portCheckHook = true
+        var d = SettingsDraft(c)
+        XCTAssertEqual(d.ffi.portConflict, "reroute")
+        XCTAssertTrue(d.ffi.portCheckHook)
+        d.portConflict = "ask"
+        d.portCheckHook = false
+        XCTAssertEqual(d.ffi.portConflict, "ask")
+        XCTAssertFalse(d.ffi.portCheckHook)
+        XCTAssertEqual(SettingsDraft(config).ffi, config)
+    }
+
     func testValidation() {
         XCTAssertTrue(SettingsDraft(config).isValid)
         var d = SettingsDraft(config)

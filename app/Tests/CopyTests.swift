@@ -149,6 +149,13 @@ final class CopyTests: XCTestCase {
         XCTAssertEqual(statusText(status("in_use"), bundle: fr, locale: locale), "in use", "a missing key falls back to its English key")
     }
 
+    func testPortConflictReasonCopy() throws {
+        let record = KillRecordFfi(port: 1, command: "", toolLabel: "", worktree: "", worktreeName: "", reason: "", reasonKind: "port_conflict", idleMs: 0, atMs: 0)
+        XCTAssertEqual(killReasonText(record), "freed for a new server")
+        let fr = try frenchBundle(["freed for a new server": "libéré pour un nouveau serveur"])
+        XCTAssertEqual(killReasonText(record, bundle: fr, locale: Locale(identifier: "fr")), "libéré pour un nouveau serveur")
+    }
+
     func testMemoryLabelUsesLocaleDecimal() {
         let bytes = UInt64(2.3 * 1024 * 1_048_576)
         XCTAssertEqual(memoryLabel(bytes: bytes, locale: Locale(identifier: "en")), "2.3 GB")
