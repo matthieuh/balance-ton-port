@@ -1,0 +1,66 @@
+name: Wrong kill
+description: A server was stopped when it should not have been, or was left running when it should have been stopped.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        If a process the [safety rules](https://github.com/matthieuh/balance-ton-port#safety-rules) say must never be touched was signalled, report it privately instead: https://github.com/matthieuh/balance-ton-port/security/advisories/new
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What happened
+      options:
+        - A server was stopped that should have kept running
+        - A server kept running that should have been stopped
+        - An alert came too early, too late, or not at all
+    validations:
+      required: true
+  - type: textarea
+    id: server
+    attributes:
+      label: The server
+      description: Command, framework, port, and how it was started (by Claude Code, Codex, a terminal, `&` or `nohup`...).
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: recent
+    attributes:
+      label: Output of `btp recent --json`
+      description: Shows the last kills and their reason. Remove anything private (paths, project names).
+      render: json
+  - type: textarea
+    id: list
+    attributes:
+      label: Output of `btp list --json`
+      description: If the server is still running, or for a missed stop.
+      render: json
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "`btp --version`, or Settings > About in the app"
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+    validations:
+      required: true
+  - type: dropdown
+    id: runner
+    attributes:
+      label: What was watching
+      multiple: true
+      options:
+        - Menu bar app
+        - btp watch
+        - Claude Code plugin only
+        - Not sure

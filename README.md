@@ -37,6 +37,18 @@ Every 5 seconds it links new listening servers to the coding-agent session (Clau
 
 A server is a process tree: the listening process started under the session plus its children (for example Astro or wrangler with their `workerd` workers). A child listening on its own port is part of its parent's server, and "idle" means no established connection on any port of the whole tree. Kill is SIGTERM on that tree, then SIGKILL after 5 s for survivors; a process of any agent CLI (Claude Code, Codex) found in the tree, or a process matching an excluded command (a `postgres` the dev server started, say), is never signalled, nor is anything it runs. The menu bar lists running servers and the last 5 kills with their reason.
 
+## Safety rules
+
+- Never stops automatically a process that was not started from a live coding-agent session. The app can stop such a server (shown under other servers) only when you ask, one at a time, after a confirmation; `btp kill` and `btp sweep` refuse it.
+- A server whose worktree is used by another live session is never touched.
+- Agent CLI processes (Claude Code, Codex) themselves are never tracked, and never signalled when found inside a server's process tree.
+- A child matching an excluded command (a database started by the dev server) is never signalled when its server is killed.
+- Excluded commands and ports are re-checked on every scan and right before each kill.
+- Start times are re-checked before every signal, so a reused pid is never hit.
+- `btp sweep --dry-run` prints what would be killed.
+
+A case where one of these rules does not hold is a security issue: report it privately, see [SECURITY.md](SECURITY.md).
+
 ## The menu bar app
 
 - **Needs you**: one card per server that needs a decision (a leak, a session that ended while a browser tab still holds the server, a stop within 10 minutes, the idle alert), each with one suggested action: Restart, Postpone 1 h or Stop. Ignore this alert dismisses the current alert only.
@@ -145,16 +157,6 @@ cp -r plugin/skills/balance-ton-port ~/.claude/skills/
 ```
 
 If you use a custom `CLAUDE_CONFIG_DIR`, copy it into that directory's `skills/` folder instead.
-
-## Safety rules
-
-- Never stops automatically a process that was not started from a live coding-agent session. The app can stop such a server (shown under other servers) only when you ask, one at a time, after a confirmation; `btp kill` and `btp sweep` refuse it.
-- A server whose worktree is used by another live session is never touched.
-- Agent CLI processes (Claude Code, Codex) themselves are never tracked, and never signalled when found inside a server's process tree.
-- A child matching an excluded command (a database started by the dev server) is never signalled when its server is killed.
-- Excluded commands and ports are re-checked on every scan and right before each kill.
-- Start times are re-checked before every signal, so a reused pid is never hit.
-- `btp sweep --dry-run` prints what would be killed.
 
 ## Notifications
 
