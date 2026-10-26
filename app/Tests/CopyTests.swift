@@ -31,7 +31,7 @@ private func row(
         sessionAlive: true, idleMs: idleMs, killInMs: nil, state: "active", managed: true, excluded: false,
         framework: nil, title: toolLabel, hasIcon: false, branch: nil, rssBytes: 0, cpuPct: 0, growthBytes: 0,
         health: "green", inUse: false, statusText: "", status: status, card: nil, leakKind: nil,
-        canRestart: false, postponed: false, uptimeMs: 0, processCount: 1
+        canRestart: false, postponed: false, uptimeMs: 0, processCount: 1, hasLogs: false
     )
 }
 

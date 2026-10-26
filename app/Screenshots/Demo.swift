@@ -126,7 +126,7 @@ enum Demo {
             managed: managed, excluded: false, framework: framework, title: title, hasIcon: false,
             branch: branch, rssBytes: rss, cpuPct: cpu ?? (inUse ? 12 : 1), growthBytes: Int64(growth), health: health,
             inUse: inUse, statusText: "", status: status, card: card, leakKind: leakKind,
-            canRestart: true, postponed: false, uptimeMs: age, processCount: processes
+            canRestart: true, postponed: false, uptimeMs: age, processCount: processes, hasLogs: false
         )
     }
 

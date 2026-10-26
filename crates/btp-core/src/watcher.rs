@@ -817,6 +817,11 @@ impl<P: Platform> Watcher<P> {
         self.config_error.as_deref()
     }
 
+    /// The data dir this watcher keeps its state in.
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
     /// The config the watcher runs on: the last valid one read, else the
     /// defaults.
     pub fn config(&self) -> Config {

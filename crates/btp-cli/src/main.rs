@@ -2,6 +2,7 @@
 //! sessions. Exit codes: 0 success, 1 user error / nothing matched / lock
 //! held, 2 internal error. `btp run` has its own (see `run`).
 
+mod logs;
 mod run;
 
 use btp_core::config::{data_dir, effective_claude_dirs, read_config, save_config};
@@ -82,6 +83,8 @@ enum Cmd {
     /// Start a dev server after checking its port: reuse the same server
     /// running here, free or reroute around a taken port, and keep its logs
     Run(run::RunArgs),
+    /// Show the output of a server started through `btp run`
+    Logs(logs::LogsArgs),
     /// Detached waiter of `session-end`: applies the dead-session rule to
     /// that session's servers when no watcher runs (internal)
     #[command(name = "_sweep-later", hide = true)]
@@ -340,6 +343,7 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
         }
         Cmd::Watch => watch(dir),
         Cmd::Run(a) => Ok(run::run(a)),
+        Cmd::Logs(a) => logs::run(&dir, a),
         Cmd::SessionEnd(a) => {
             // Any internal error or panic still exits 0.
             let notify = notifier();

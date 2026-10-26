@@ -237,6 +237,8 @@ pub struct ServerViewFfi {
     pub uptime_ms: u64,
     /// Processes in its tree (`processes` lists them).
     pub process_count: u32,
+    /// `btp run` kept its output (`btp logs`).
+    pub has_logs: bool,
 }
 
 /// What a pass reads about a server beyond its row: memory, page, git and
@@ -638,6 +640,7 @@ impl ServerViewFfi {
             postponed: v.postponed_until_ms.is_some_and(|u| u > now_ms),
             uptime_ms: now_ms.saturating_sub(v.started_ms),
             process_count: l.process_count,
+            has_logs: v.has_logs,
         }
     }
 
@@ -696,6 +699,8 @@ impl ServerViewFfi {
             postponed: false,
             uptime_ms: now_ms.saturating_sub(started_ms),
             process_count: l.process_count,
+            // Set by the pass, which knows the data dir.
+            has_logs: false,
         }
     }
 }
@@ -806,7 +811,9 @@ fn report_ffi<P: Platform>(w: &mut Watcher<P>, t: &TickReport, now_ms: u64) -> T
             now_ms,
         );
         let (in_use, idle_ms) = observed_use(w, o, now_ms);
-        servers.push(ServerViewFfi::observed(o, &l, in_use, idle_ms, now_ms));
+        let mut row = ServerViewFfi::observed(o, &l, in_use, idle_ms, now_ms);
+        row.has_logs = btp_core::runlog::exists(w.data_dir(), o.key);
+        servers.push(row);
     }
     let dev = servers.iter().map(|s| s.rss_bytes).sum();
     let machine = w.platform().machine_memory();
@@ -1340,6 +1347,12 @@ mod tests {
         let f = ServerViewFfi::tracked(&v, &Live::default(), 0);
         assert_eq!(f.agent, "claude_code");
         assert_eq!(f.agent_label, "Claude");
+        assert!(!f.has_logs);
+        let logged = ServerView {
+            has_logs: true,
+            ..v
+        };
+        assert!(ServerViewFfi::tracked(&logged, &Live::default(), 0).has_logs);
     }
 
     #[test]

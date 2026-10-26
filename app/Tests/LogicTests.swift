@@ -28,7 +28,7 @@ private func server(
         managed: true, excluded: false, framework: nil, title: toolLabel, hasIcon: false,
         branch: nil, rssBytes: 0, cpuPct: 0, growthBytes: 0, health: "green", inUse: false,
         statusText: "idle 0 min", status: StatusFfi(kind: "idle", minutes: 0, agentLabel: "", reason: nil), card: nil, leakKind: nil, canRestart: false, postponed: false,
-        uptimeMs: 0, processCount: 1
+        uptimeMs: 0, processCount: 1, hasLogs: false
     )
 }
 

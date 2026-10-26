@@ -134,13 +134,17 @@ pub fn cleanup(data_dir: &Path, live: &dyn Fn(ServerKey) -> bool, now_ms: u64) {
 
 /// The last `n` lines of a log. Invalid UTF-8 is replaced, never an error.
 pub fn tail(path: &Path, n: usize) -> io::Result<Vec<String>> {
-    let bytes = fs::read(path)?;
-    let text = String::from_utf8_lossy(&bytes);
+    Ok(tail_of(&fs::read(path)?, n))
+}
+
+/// The last `n` lines of log content already read.
+pub fn tail_of(bytes: &[u8], n: usize) -> Vec<String> {
+    let text = String::from_utf8_lossy(bytes);
     let lines: Vec<&str> = text.lines().collect();
-    Ok(lines[lines.len().saturating_sub(n)..]
+    lines[lines.len().saturating_sub(n)..]
         .iter()
         .map(|l| (*l).to_string())
-        .collect())
+        .collect()
 }
 
 /// Patterns matched case-insensitively.

@@ -909,3 +909,289 @@ fn a_slow_reader_still_gets_everything() {
         assert_eq!(text(&out.get_output().stdout).trim(), size.to_string());
     }
 }
+
+// ---- btp logs ----
+
+/// `btp run` of a shell that prints `prelude` and then execs the helper on
+/// `port`, so the listener is the very process whose output is logged.
+fn start_logged(data: &Path, cwd: &Path, port: u16, prelude: &str) -> Running {
+    let h = helper();
+    let script = format!("{prelude}exec python3 '{}' --port {port}", h.display());
+    let mut r = Running::start(data, "long", cwd, &["--", "sh", "-c", &script]);
+    r.wait_line(&format!("serve.py listening on {port}"));
+    wait_log(data, &format!("serve.py listening on {port}"));
+    r
+}
+
+/// The run log of the data dir holds `needle` (the terminal output arrives
+/// a moment before the log write).
+fn wait_log(data: &Path, needle: &str) {
+    let deadline = Instant::now() + WAIT;
+    while Instant::now() < deadline {
+        let found = run_logs(data)
+            .iter()
+            .any(|p| text(&std::fs::read(p).unwrap_or_default()).contains(needle));
+        if found {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("no log with {needle:?}");
+}
+
+fn wait_log_bytes(data: &Path, needle: &[u8]) {
+    let deadline = Instant::now() + WAIT;
+    while Instant::now() < deadline {
+        let found = run_logs(data).iter().any(|p| {
+            let b = std::fs::read(p).unwrap_or_default();
+            b.windows(needle.len()).any(|w| w == needle)
+        });
+        if found {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("no log with {needle:?}");
+}
+
+fn logs_of(data: &Path, args: &[&str]) -> std::process::Output {
+    btp(data, "long")
+        .arg("logs")
+        .args(args)
+        .assert()
+        .success()
+        .get_output()
+        .clone()
+}
+
+#[test]
+fn logs_tail_default_200() {
+    let (data, _e) = sandbox(PortConflict::FreeIdle);
+    let dir = tempfile::tempdir().unwrap();
+    let p = free_port();
+    let _r = start_logged(
+        data.path(),
+        dir.path(),
+        p,
+        "i=1; while [ $i -le 300 ]; do echo line$i; i=$((i+1)); done; ",
+    );
+    let out = text(&logs_of(data.path(), &[&p.to_string()]).stdout);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 200, "{out}");
+    assert_eq!(lines[0], "line102");
+    assert!(lines[199].starts_with("serve.py listening on"), "{out}");
+    let out = text(&logs_of(data.path(), &[&p.to_string(), "-n", "2"]).stdout);
+    assert_eq!(out.lines().collect::<Vec<_>>().len(), 2);
+    assert!(out.starts_with("line300\n"), "{out}");
+}
+
+#[test]
+fn logs_errors_only() {
+    let (data, _e) = sandbox(PortConflict::FreeIdle);
+    let dir = tempfile::tempdir().unwrap();
+    let p = free_port();
+    let _r = start_logged(
+        data.path(),
+        dir.path(),
+        p,
+        "for i in 1 2 3 4 5 6 7 8 9 10; do echo fill$i; done; \
+         echo 'TypeError: x is not defined'; \
+         for i in 1 2 3 4 5 6 7 8 9 10; do echo tail$i; done; \
+         (sleep 1; printf 'bin\\377ary failed\\n') & ",
+    );
+    // Not valid UTF-8, so the terminal reader of `Running` stops there.
+    wait_log_bytes(data.path(), b"ary failed");
+    let out = text(&logs_of(data.path(), &[&p.to_string(), "--errors"]).stdout);
+    let lines: Vec<&str> = out.lines().collect();
+    // Two lines of context around the first error; the second is binary
+    // output with invalid UTF-8, which must not panic.
+    assert_eq!(
+        &lines[..5],
+        [
+            "fill9",
+            "fill10",
+            "TypeError: x is not defined",
+            "tail1",
+            "tail2"
+        ]
+    );
+    assert_eq!(lines[5], "--", "{out}");
+    assert!(lines[6..].iter().any(|l| l.contains("ary failed")), "{out}");
+    assert!(!out.contains("fill8") && !out.contains("tail3"), "{out}");
+}
+
+#[test]
+fn logs_unknown_exit_1() {
+    let (data, _e) = sandbox(PortConflict::FreeIdle);
+    for target in ["59999", "nothing-like-this"] {
+        let out = btp(data.path(), "long")
+            .args(["logs", target])
+            .assert()
+            .code(1);
+        assert_eq!(
+            text(&out.get_output().stderr),
+            format!("btp: no logs for {target} (it was not started through btp run)\n")
+        );
+    }
+}
+
+#[test]
+fn logs_of_a_server_without_a_log_exit_1() {
+    let (data, _e) = sandbox(PortConflict::FreeIdle);
+    let p = free_port();
+    let _holder = Holder::bind(p);
+    let out = btp(data.path(), "long")
+        .args(["logs", &p.to_string()])
+        .assert()
+        .code(1);
+    assert_eq!(
+        text(&out.get_output().stderr),
+        format!("btp: no logs for {p} (it was not started through btp run)\n")
+    );
+}
+
+#[test]
+fn logs_ambiguous_name_lists_the_matches() {
+    let (data, _e) = sandbox(PortConflict::FreeIdle);
+    let dir = tempfile::tempdir().unwrap();
+    let (p1, p2) = (free_port(), free_port());
+    let _a = start_logged(data.path(), dir.path(), p1, "");
+    let _b = start_logged(data.path(), dir.path(), p2, "");
+    let name = dir
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_uppercase();
+    let out = btp(data.path(), "long")
+        .args(["logs", &name])
+        .assert()
+        .code(1);
+    let err = text(&out.get_output().stderr);
+    assert!(err.contains("matches several servers"), "{err}");
+    assert!(
+        err.contains(&p1.to_string()) && err.contains(&p2.to_string()),
+        "{err}"
+    );
+    // A port is never ambiguous.
+    logs_of(data.path(), &[&p1.to_string()]);
+}
+
+#[test]
+fn list_json_has_logs() {
+    let (data, _e) = sandbox(PortConflict::FreeIdle);
+    let dir = tempfile::tempdir().unwrap();
+    let p = free_port();
+    let r = start_logged(data.path(), dir.path(), p, "echo hello-tracked; ");
+    let pid = r.helper_pid.unwrap();
+    use btp_core::platform::{MacOs, Platform};
+    let start_time = MacOs.proc_info(pid).unwrap().start_time;
+    // The same server, tracked for a session.
+    let state = serde_json::json!({"servers": [{
+        "key": {"pid": pid, "start_time": start_time},
+        "port": p,
+        "command": format!("python3 {} --port {p}", helper().display()),
+        "worktree": dir.path(),
+        "session_id": "s1",
+        "session_pid": 1,
+        "session_proc_start": "x",
+        "session_name": "my-tracked-session",
+        "first_seen_ms": 1,
+        "last_active_ms": 1,
+        "kept": true,
+        "alerted": false,
+    }], "recent_kills": []});
+    std::fs::write(data.path().join("state.json"), state.to_string()).unwrap();
+    let out = btp(data.path(), "long")
+        .args(["list", "--json"])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let servers = v["servers"].as_array().unwrap();
+    assert_eq!(servers.len(), 1, "{v}");
+    assert_eq!(servers[0]["has_logs"], true);
+    // A tracked server answers to its session name too.
+    let out = text(&logs_of(data.path(), &["MY-TRACKED-SESSION"]).stdout);
+    assert!(out.contains("hello-tracked"), "{out}");
+}
+
+/// `btp logs -f` started in the background, its output read line by line.
+fn follow_logs(data: &Path, args: &[&str]) -> Running {
+    let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("btp"));
+    env_of(&mut cmd, data, "long");
+    cmd.arg("logs")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    let (tx, lines) = channel();
+    for r in [
+        Box::new(child.stdout.take().unwrap()) as Box<dyn Read + Send>,
+        Box::new(child.stderr.take().unwrap()),
+    ] {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for l in BufReader::new(r).lines().map_while(Result::ok) {
+                let _ = tx.send(l);
+            }
+        });
+    }
+    Running {
+        child,
+        lines,
+        seen: Vec::new(),
+        helper_pid: None,
+    }
+}
+
+#[test]
+fn logs_follow_streams_new_lines_and_stops_with_the_server() {
+    let (data, _e) = sandbox(PortConflict::FreeIdle);
+    let dir = tempfile::tempdir().unwrap();
+    let p = free_port();
+    let _r = start_logged(
+        data.path(),
+        dir.path(),
+        p,
+        "echo before; (sleep 2; echo after-follow; sleep 1; echo Error: late; kill $$) & ",
+    );
+    let mut f = follow_logs(data.path(), &[&p.to_string(), "-f"]);
+    f.wait_line("before");
+    f.wait_line("after-follow");
+    f.wait_line("Error: late");
+    // The server is killed by the background job (the exec'd python has
+    // the shell's pid): `-f` ends by itself, with status 0.
+    assert!(f.wait().success());
+}
+
+#[test]
+fn logs_follow_errors_filters_new_lines() {
+    let (data, _e) = sandbox(PortConflict::FreeIdle);
+    let dir = tempfile::tempdir().unwrap();
+    let p = free_port();
+    let _r = start_logged(
+        data.path(),
+        dir.path(),
+        p,
+        "(sleep 2; echo noise-one; echo Error: boom; echo noise-two; sleep 1; kill $$) & ",
+    );
+    let mut f = follow_logs(data.path(), &[&p.to_string(), "-f", "--errors"]);
+    f.wait_line("Error: boom");
+    assert!(f.wait().success());
+    assert!(!f.seen.iter().any(|l| l.contains("noise")), "{:?}", f.seen);
+}
+
+#[test]
+fn logs_follow_ends_on_sigint() {
+    let (data, _e) = sandbox(PortConflict::FreeIdle);
+    let dir = tempfile::tempdir().unwrap();
+    let p = free_port();
+    let _r = start_logged(data.path(), dir.path(), p, "echo hi; ");
+    let mut f = follow_logs(data.path(), &[&p.to_string(), "-f"]);
+    f.wait_line("hi");
+    // SAFETY: the `btp logs` this test started.
+    unsafe { libc::kill(f.pid(), libc::SIGINT) };
+    assert!(f.wait().success());
+    assert!(answers(p), "the server keeps running");
+}

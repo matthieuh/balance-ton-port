@@ -711,7 +711,7 @@ fn is_tty(fd: i32) -> bool {
 }
 
 /// A process with this pid and start time is running.
-fn same_process(k: ServerKey) -> bool {
+pub(crate) fn same_process(k: ServerKey) -> bool {
     MacOs
         .proc_info(k.pid)
         .is_some_and(|i| i.start_time == k.start_time)
