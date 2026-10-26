@@ -390,7 +390,8 @@ fn reuse(w: &mut Watcher<MacOs>, ctx: &Ctx, name: &str, v: &ServerView) -> io::R
     eprintln!(
         "btp: Following its logs. Ctrl-C stops following; the server keeps running. Press r to restart it here."
     );
-    let log = runlog::log_path(&ctx.dir, v.key);
+    let log_key = runlog::log_key_of(&MacOs, &ctx.dir, v.key).unwrap_or(v.key);
+    let log = runlog::log_path(&ctx.dir, log_key);
     let mut offset = print_tail(&log);
     loop {
         match follow(&log, &mut offset, v.key) {

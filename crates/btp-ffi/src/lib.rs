@@ -647,7 +647,14 @@ impl ServerViewFfi {
     /// An observed server `o` (no agent), with `l`, as the menu shows it
     /// at `now_ms`: a connection is open on it when `in_use`, and it has
     /// been unused for `idle_ms`.
-    pub fn observed(o: &ObservedServer, l: &Live, in_use: bool, idle_ms: u64, now_ms: u64) -> Self {
+    pub fn observed(
+        o: &ObservedServer,
+        l: &Live,
+        in_use: bool,
+        idle_ms: u64,
+        now_ms: u64,
+        has_logs: bool,
+    ) -> Self {
         let worktree = o.cwd.as_deref().map(worktree_root);
         let tool = tool_label(&o.command);
         // Process start times are Unix microseconds.
@@ -699,8 +706,7 @@ impl ServerViewFfi {
             postponed: false,
             uptime_ms: now_ms.saturating_sub(started_ms),
             process_count: l.process_count,
-            // Set by the pass, which knows the data dir.
-            has_logs: false,
+            has_logs,
         }
     }
 }
@@ -811,9 +817,10 @@ fn report_ffi<P: Platform>(w: &mut Watcher<P>, t: &TickReport, now_ms: u64) -> T
             now_ms,
         );
         let (in_use, idle_ms) = observed_use(w, o, now_ms);
-        let mut row = ServerViewFfi::observed(o, &l, in_use, idle_ms, now_ms);
-        row.has_logs = btp_core::runlog::exists(w.data_dir(), o.key);
-        servers.push(row);
+        let has_logs = btp_core::runlog::log_key_of(w.platform(), w.data_dir(), o.key).is_some();
+        servers.push(ServerViewFfi::observed(
+            o, &l, in_use, idle_ms, now_ms, has_logs,
+        ));
     }
     let dev = servers.iter().map(|s| s.rss_bytes).sum();
     let machine = w.platform().machine_memory();
@@ -1546,7 +1553,7 @@ mod tests {
             can_restart: true,
             ..Live::default()
         };
-        let f = ServerViewFfi::observed(&o, &l, false, 5 * 60_000, 62_000);
+        let f = ServerViewFfi::observed(&o, &l, false, 5 * 60_000, 62_000, false);
         assert!(!f.managed);
         assert_eq!((f.agent.as_str(), f.agent_label.as_str()), ("", "no agent"));
         assert_eq!(f.session_name, "");
@@ -1557,7 +1564,7 @@ mod tests {
         assert_eq!(f.started_ms, 2_000);
         assert_eq!(f.uptime_ms, 60_000);
         assert!(f.can_restart);
-        let in_use = ServerViewFfi::observed(&o, &l, true, 0, 62_000);
+        let in_use = ServerViewFfi::observed(&o, &l, true, 0, 62_000, false);
         assert_eq!(
             (in_use.status_text.as_str(), in_use.in_use),
             ("in use", true)
@@ -1566,7 +1573,7 @@ mod tests {
             excluded: true,
             ..o
         };
-        let f = ServerViewFfi::observed(&excluded, &l, false, 0, 62_000);
+        let f = ServerViewFfi::observed(&excluded, &l, false, 0, 62_000, false);
         assert!(f.excluded);
         assert_eq!(f.status_text, "excluded");
         assert!(!f.can_restart, "an excluded server never restarts");
@@ -2342,7 +2349,7 @@ mod tests {
             excluded: false,
         };
         let observed = |o: &ObservedServer, in_use, idle_ms| {
-            ServerViewFfi::observed(o, &Live::default(), in_use, idle_ms, 0).status
+            ServerViewFfi::observed(o, &Live::default(), in_use, idle_ms, 0, false).status
         };
         let s = observed(&o, false, 5 * 60_000);
         assert_eq!((s.kind.as_str(), s.minutes), ("idle", 5));

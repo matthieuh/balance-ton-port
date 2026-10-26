@@ -1195,7 +1195,7 @@ impl<P: Platform> Watcher<P> {
         let live = |k: ServerKey| same_process(&self.platform, k.pid, k.start_time);
         crate::runlog::cleanup(&self.data_dir, &live, now_ms);
         for v in report.servers.iter_mut().chain(report.alerts.iter_mut()) {
-            v.has_logs = crate::runlog::exists(&self.data_dir, v.key);
+            v.has_logs = crate::runlog::log_key_of(&self.platform, &self.data_dir, v.key).is_some();
         }
     }
 

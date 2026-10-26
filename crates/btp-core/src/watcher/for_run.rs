@@ -177,7 +177,8 @@ impl<P: Platform> Watcher<P> {
                         })
                         .map(|l| session_display_name(Some(&l.session.name), &l.session.cwd));
                     let mut v = view(s, &o, t, session.as_deref(), now_ms, &scan.cfg);
-                    v.has_logs = crate::runlog::exists(&self.data_dir, v.key);
+                    v.has_logs =
+                        crate::runlog::log_key_of(&self.platform, &self.data_dir, v.key).is_some();
                     v
                 });
             (found, tracked_pids(&trees))
@@ -194,7 +195,7 @@ impl<P: Platform> Watcher<P> {
         Ok(observed.map(|o| {
             let established = self.observed_feed(&o, &[], now_ms).established;
             let mut v = observed_view(&o, established);
-            v.has_logs = crate::runlog::exists(&self.data_dir, v.key);
+            v.has_logs = crate::runlog::log_key_of(&self.platform, &self.data_dir, v.key).is_some();
             v
         }))
     }

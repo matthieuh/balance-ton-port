@@ -1195,3 +1195,47 @@ fn logs_follow_ends_on_sigint() {
     assert!(f.wait().success());
     assert!(answers(p), "the server keeps running");
 }
+
+#[test]
+fn logs_found_through_a_launcher_that_did_not_exec() {
+    let (data, _e) = sandbox(PortConflict::FreeIdle);
+    let dir = tempfile::tempdir().unwrap();
+    let p = free_port();
+    let h = helper();
+    // `sh` stays the parent of the listener, as `npm run dev` does.
+    let script = format!("echo launcher-line; python3 '{}' --port {p}", h.display());
+    let mut r = Running::start(
+        data.path(),
+        "long",
+        dir.path(),
+        &["--", "sh", "-c", &script],
+    );
+    r.wait_line(&format!("serve.py listening on {p}"));
+    wait_log(data.path(), "launcher-line");
+    let out = text(&logs_of(data.path(), &[&p.to_string()]).stdout);
+    assert!(out.contains("launcher-line"), "{out}");
+    // Tracked as well: the list flags it.
+    let pid = r.helper_pid.unwrap();
+    use btp_core::platform::{MacOs, Platform};
+    let start_time = MacOs.proc_info(pid).unwrap().start_time;
+    let state = serde_json::json!({"servers": [{
+        "key": {"pid": pid, "start_time": start_time},
+        "port": p,
+        "command": format!("python3 {} --port {p}", h.display()),
+        "worktree": dir.path(),
+        "session_id": "s1",
+        "session_pid": 1,
+        "session_proc_start": "x",
+        "first_seen_ms": 1,
+        "last_active_ms": 1,
+        "kept": true,
+        "alerted": false,
+    }], "recent_kills": []});
+    std::fs::write(data.path().join("state.json"), state.to_string()).unwrap();
+    let out = btp(data.path(), "long")
+        .args(["list", "--json"])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(v["servers"][0]["has_logs"], true, "{v}");
+}

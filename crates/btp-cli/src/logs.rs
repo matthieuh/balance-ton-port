@@ -4,6 +4,7 @@
 use crate::{new_watcher, now_ms, saved_view, Failure};
 use btp_core::labels::tool_label;
 use btp_core::model::ServerKey;
+use btp_core::platform::MacOs;
 use btp_core::runlog;
 use btp_core::state::{is_read_only_error, read_state_readonly};
 use btp_core::worktree::worktree_root;
@@ -134,10 +135,10 @@ pub fn run(dir: &Path, a: LogsArgs) -> Result<u8, Failure> {
             )));
         }
     };
-    if !runlog::exists(dir, server.key) {
+    let Some(log_key) = runlog::log_key_of(&MacOs, dir, server.key) else {
         return Err(none());
-    }
-    let path = runlog::log_path(dir, server.key);
+    };
+    let path = runlog::log_path(dir, log_key);
     // Read once: the tail and the offset to follow from agree.
     let bytes = std::fs::read(&path).map_err(|_| none())?;
     let offset = bytes.len() as u64;

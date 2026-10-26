@@ -3,11 +3,41 @@
 //! show it. Separate from the restart logs of `logs/`, which `prune_logs`
 //! trims and never looks into this folder.
 
+use crate::agents::is_agent_cli;
 use crate::model::ServerKey;
+use crate::platform::{ancestry, Platform};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+
+/// The process whose log holds the output of the server `key`. `btp run`
+/// logs the process it spawns (`npm`, `sh`), while a server's key is its
+/// listener (`node`) or the topmost listening ancestor, so this checks `key`
+/// itself, then each ancestor in turn, and returns the first that has a log.
+/// The walk stops at an agent CLI (the session) and at pid 1.
+pub fn log_key_of(p: &dyn Platform, data_dir: &Path, key: ServerKey) -> Option<ServerKey> {
+    for info in ancestry(p, key.pid) {
+        if info.pid == key.pid && info.start_time != key.start_time {
+            // The pid was reused: not the server.
+            return None;
+        }
+        if info.pid != key.pid && is_agent_cli(&info.command).is_some() {
+            return None;
+        }
+        let k = ServerKey {
+            pid: info.pid,
+            start_time: info.start_time,
+        };
+        if exists(data_dir, k) {
+            return Some(k);
+        }
+        if info.pid == 1 {
+            break;
+        }
+    }
+    None
+}
 
 /// A log never grows past this; beyond it the newest half is kept.
 pub const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
@@ -340,5 +370,43 @@ mod tests {
         );
         assert!(errors(&lines(&["fine"]), 2).is_empty());
         assert!(errors(&[], 2).is_empty());
+    }
+
+    fn tree() -> crate::platform::FakePlatform {
+        let p = crate::platform::FakePlatform::new();
+        p.spawn(1, 0, 1, "launchd", "/");
+        p.spawn(10, 1, 7, "claude", "/w");
+        p.spawn(20, 10, 7, "npm run dev", "/w");
+        p.spawn(30, 20, 7, "node vite", "/w");
+        p
+    }
+
+    #[test]
+    fn log_key_of_finds_the_launcher_above_the_listener() {
+        let d = tempfile::tempdir().unwrap();
+        let p = tree();
+        RunLog::create(d.path(), key(20)).unwrap();
+        assert_eq!(log_key_of(&p, d.path(), key(30)), Some(key(20)));
+        // The server's own log wins over an ancestor's.
+        RunLog::create(d.path(), key(30)).unwrap();
+        assert_eq!(log_key_of(&p, d.path(), key(30)), Some(key(30)));
+    }
+
+    #[test]
+    fn log_key_of_none_without_a_log_or_past_the_session() {
+        let d = tempfile::tempdir().unwrap();
+        let p = tree();
+        assert_eq!(log_key_of(&p, d.path(), key(30)), None);
+        // A log of the session process or above is not the server's.
+        RunLog::create(d.path(), key(10)).unwrap();
+        RunLog::create(d.path(), key(1)).unwrap();
+        assert_eq!(log_key_of(&p, d.path(), key(30)), None);
+        // A reused pid (other start time) is not the server.
+        RunLog::create(d.path(), key(20)).unwrap();
+        let stale = ServerKey {
+            pid: 30,
+            start_time: 99,
+        };
+        assert_eq!(log_key_of(&p, d.path(), stale), None);
     }
 }
