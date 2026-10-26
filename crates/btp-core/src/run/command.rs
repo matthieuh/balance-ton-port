@@ -214,6 +214,12 @@ fn analyze(
     cwd: &Path,
     env_port: Option<&str>,
 ) -> Option<(DevCommand, Vec<String>)> {
+    #[cfg(debug_assertions)]
+    if let Ok(spec) = std::env::var("BTP_TEST_FRAMEWORK") {
+        if let Some(hit) = test_entry(&spec, argv, env_port) {
+            return Some(hit);
+        }
+    }
     let r = resolve(argv, cwd)?;
     let text = r.tokens.join(" ");
     let framework = labels::framework(&text, None).or_else(|| extra_framework(&r.tokens))?;
@@ -279,6 +285,51 @@ fn analyze(
             script: r.script,
         },
         key_tokens,
+    ))
+}
+
+/// Debug builds only, for the CLI tests: `BTP_TEST_FRAMEWORK` set to
+/// `<program>:<default port>:<style>` (style `long`, `short`, `env`, or
+/// `none` for a command that cannot be rerouted) recognizes any argv with a
+/// word whose basename is `<program>`, so a tiny helper server stands for a
+/// framework. The port comes from the words after it, then `env_port`, then
+/// the default. Never compiled into a release build.
+#[cfg(debug_assertions)]
+fn test_entry(
+    spec: &str,
+    argv: &[String],
+    env_port: Option<&str>,
+) -> Option<(DevCommand, Vec<String>)> {
+    let mut parts = spec.rsplitn(3, ':');
+    let style = match parts.next()? {
+        "long" => Some(PortStyle::LongFlag),
+        "short" => Some(PortStyle::ShortFlag),
+        "env" => Some(PortStyle::Env),
+        "none" => None,
+        _ => return None,
+    };
+    let default_port: u16 = parts.next()?.parse().ok()?;
+    let name = base(parts.next()?);
+    let at = argv.iter().position(|w| base(w) == name)?;
+    let rest = &argv[at + 1..];
+    let env = env_port.and_then(|p| p.trim().parse::<u16>().ok());
+    let (port, port_from) = match (last_port(rest), env) {
+        (Some(p), _) => (p, PortSource::Argv),
+        (None, Some(p)) => (p, PortSource::Env),
+        _ => (default_port, PortSource::Default),
+    };
+    let mut key = vec![name.clone()];
+    key.extend(strip_ports(rest));
+    Some((
+        DevCommand {
+            framework: format!("test {name}"),
+            port,
+            port_from,
+            style,
+            launcher: Launcher::Direct,
+            script: None,
+        },
+        key,
     ))
 }
 
@@ -683,5 +734,24 @@ mod tests {
         );
         assert_ne!(key(&["vite", "--host"]), key(&["vite"]));
         assert!(key(&["make", "serve"]).is_none());
+    }
+
+    #[test]
+    fn test_entry_stands_for_a_framework() {
+        let argv = v(&["/usr/bin/python3", "/t/serve.py", "--port", "4100"]);
+        let (dev, key) = test_entry("serve.py:8000:long", &argv, None).unwrap();
+        assert_eq!((dev.port, dev.port_from), (4100, PortSource::Argv));
+        assert_eq!(dev.style, Some(PortStyle::LongFlag));
+        assert_eq!(key, v(&["serve.py"]));
+        // As `btp run` sees it: the same key, whatever the interpreter.
+        let (_, k2) = test_entry("serve.py:8000:long", &v(&["/x/serve.py"]), None).unwrap();
+        assert_eq!(k2, key);
+        let (dev, _) = test_entry("serve.py:8000:env", &v(&["serve.py"]), Some("4200")).unwrap();
+        assert_eq!((dev.port, dev.style), (4200, Some(PortStyle::Env)));
+        let (dev, _) = test_entry("serve.py:8000:none", &v(&["serve.py"]), None).unwrap();
+        assert_eq!((dev.port, dev.style), (8000, None));
+        assert!(test_entry("serve.py:8000:long", &v(&["vite"]), None).is_none());
+        assert!(test_entry("serve.py:x:long", &v(&["serve.py"]), None).is_none());
+        assert!(test_entry("serve.py:8000:odd", &v(&["serve.py"]), None).is_none());
     }
 }

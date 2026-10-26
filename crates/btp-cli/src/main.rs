@@ -1,6 +1,8 @@
 //! `btp`: list, kill and sweep the dev servers left behind by Claude Code
 //! sessions. Exit codes: 0 success, 1 user error / nothing matched / lock
-//! held, 2 internal error.
+//! held, 2 internal error. `btp run` has its own (see `run`).
+
+mod run;
 
 use btp_core::config::{data_dir, effective_claude_dirs, read_config, save_config};
 use btp_core::display::format_idle as ago;
@@ -77,6 +79,9 @@ enum Cmd {
     /// Claude Code SessionEnd hook: record the servers the quitting session
     /// leaves running (never stops any). Prints nothing and always exits 0.
     SessionEnd(SessionEndArgs),
+    /// Start a dev server after checking its port: reuse the same server
+    /// running here, free or reroute around a taken port, and keep its logs
+    Run(run::RunArgs),
     /// Detached waiter of `session-end`: applies the dead-session rule to
     /// that session's servers when no watcher runs (internal)
     #[command(name = "_sweep-later", hide = true)]
@@ -195,7 +200,14 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(e) => {
-            let code = if e.use_stderr() { 1 } else { 0 };
+            // `btp run` exits with its command's code, so its usage errors
+            // take 2, the code the design gives them.
+            let usage = if std::env::args().nth(1).as_deref() == Some("run") {
+                2
+            } else {
+                1
+            };
+            let code = if e.use_stderr() { usage } else { 0 };
             let _ = e.print();
             return ExitCode::from(code);
         }
@@ -327,6 +339,7 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
             Ok(0)
         }
         Cmd::Watch => watch(dir),
+        Cmd::Run(a) => Ok(run::run(a)),
         Cmd::SessionEnd(a) => {
             // Any internal error or panic still exits 0.
             let notify = notifier();
