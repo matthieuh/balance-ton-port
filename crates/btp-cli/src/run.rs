@@ -289,7 +289,7 @@ fn options(can_kill: bool, reroutable: bool) -> String {
 }
 
 /// The holder as the status lines name it.
-fn holder_text(h: &Holder) -> String {
+pub(crate) fn holder_text(h: &Holder) -> String {
     match h {
         Holder::Tracked {
             server,

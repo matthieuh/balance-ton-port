@@ -2,6 +2,7 @@
 //! sessions. Exit codes: 0 success, 1 user error / nothing matched / lock
 //! held, 2 internal error. `btp run` has its own (see `run`).
 
+mod hook;
 mod logs;
 mod run;
 
@@ -85,6 +86,12 @@ enum Cmd {
     Run(run::RunArgs),
     /// Show the output of a server started through `btp run`
     Logs(logs::LogsArgs),
+    /// Claude Code hooks of the plugin (internal)
+    #[command(hide = true)]
+    Hook {
+        #[command(subcommand)]
+        hook: HookCmd,
+    },
     /// Detached waiter of `session-end`: applies the dead-session rule to
     /// that session's servers when no watcher runs (internal)
     #[command(name = "_sweep-later", hide = true)]
@@ -96,6 +103,14 @@ enum Cmd {
         #[arg(long)]
         at: u64,
     },
+}
+
+#[derive(Subcommand)]
+enum HookCmd {
+    /// PreToolUse on Bash: check the port of a dev server start. Prints
+    /// nothing and exits 0, except to deny the command.
+    #[command(name = "pre-bash")]
+    PreBash,
 }
 
 #[derive(Args)]
@@ -198,6 +213,9 @@ fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(c) => c,
         // The SessionEnd hook never fails Claude Code's shutdown.
+        Err(_) if std::env::args().nth(1).as_deref() == Some("hook") => {
+            return ExitCode::SUCCESS;
+        }
         Err(e) if std::env::args().nth(1).as_deref() == Some("session-end") => {
             eprintln!("btp: session-end: {}", e.kind());
             return ExitCode::SUCCESS;
@@ -344,6 +362,9 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
         Cmd::Watch => watch(dir),
         Cmd::Run(a) => Ok(run::run(a)),
         Cmd::Logs(a) => logs::run(&dir, a),
+        Cmd::Hook {
+            hook: HookCmd::PreBash,
+        } => Ok(hook::pre_bash()),
         Cmd::SessionEnd(a) => {
             // Any internal error or panic still exits 0.
             let notify = notifier();
