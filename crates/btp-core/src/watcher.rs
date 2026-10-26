@@ -1173,6 +1173,16 @@ impl<P: Platform> Watcher<P> {
         })
     }
 
+    /// Deletes the old logs of dead `btp run` servers and flags the servers
+    /// that have a log.
+    fn settle_run_logs(&self, report: &mut TickReport, now_ms: u64) {
+        let live = |k: ServerKey| same_process(&self.platform, k.pid, k.start_time);
+        crate::runlog::cleanup(&self.data_dir, &live, now_ms);
+        for v in report.servers.iter_mut().chain(report.alerts.iter_mut()) {
+            v.has_logs = crate::runlog::exists(&self.data_dir, v.key);
+        }
+    }
+
     fn scan(&mut self) -> Scan {
         let cfg = self.load_config();
         let mut found: Vec<AgentSession> = Vec::new();
@@ -1487,6 +1497,7 @@ impl<P: Platform> Watcher<P> {
                 )
             })?;
         let mut feeds = feeds;
+        self.settle_run_logs(&mut report, now_ms);
         if !self.observed {
             // The CLI: no observed servers, history, leaks, cards or probes.
             return self.finish(report, to_kill, mode, &scan.cfg, now_ms);
@@ -2544,6 +2555,15 @@ mod tests {
         assert_eq!(f.kill_log(), vec![rec.clone()]);
         assert_eq!(f.state_kills(), vec![rec]);
         assert!(f.state_servers().is_empty());
+    }
+
+    #[test]
+    fn has_logs_follows_the_run_log() {
+        let mut f = fx();
+        assert!(!f.w.tick(T0).unwrap().servers[0].has_logs);
+        let mut log = crate::runlog::RunLog::create(f.data.path(), key30()).unwrap();
+        log.write(b"x\n").unwrap();
+        assert!(f.w.tick(T0 + MIN).unwrap().servers[0].has_logs);
     }
 
     #[test]

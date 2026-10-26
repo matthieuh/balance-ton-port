@@ -168,7 +168,9 @@ impl<P: Platform> Watcher<P> {
                                 && l.session.proc_start == s.session_proc_start
                         })
                         .map(|l| session_display_name(Some(&l.session.name), &l.session.cwd));
-                    view(s, &o, t, session.as_deref(), now_ms, &scan.cfg)
+                    let mut v = view(s, &o, t, session.as_deref(), now_ms, &scan.cfg);
+                    v.has_logs = crate::runlog::exists(&self.data_dir, v.key);
+                    v
                 });
             (found, tracked_pids(&trees))
         })?;
@@ -181,7 +183,9 @@ impl<P: Platform> Watcher<P> {
             .find(|o| runs_key(&self.platform, o.key.pid, &folder, cwd, key));
         Ok(observed.map(|o| {
             let established = self.observed_feed(&o, &[], now_ms).established;
-            observed_view(&o, established)
+            let mut v = observed_view(&o, established);
+            v.has_logs = crate::runlog::exists(&self.data_dir, v.key);
+            v
         }))
     }
 
