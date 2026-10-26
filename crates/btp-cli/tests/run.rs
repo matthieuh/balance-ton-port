@@ -274,6 +274,24 @@ fn unknown_command_untouched() {
 }
 
 #[test]
+fn unreadable_port_runs_untouched_and_logged() {
+    let (data, _e) = sandbox(PortConflict::FreeIdle);
+    let dir = tempfile::tempdir().unwrap();
+    let h = helper();
+    // Recognized, but its port is `$PORT` as a script would leave it: no
+    // check, no rewrite. The helper fails on it as it would without btp.
+    let out = btp(data.path(), "long")
+        .current_dir(dir.path())
+        .args(["run", "--", h.to_str().unwrap(), "--port", "$PORT"])
+        .assert()
+        .code(1);
+    let err = text(&out.get_output().stderr);
+    assert!(!err.contains("btp:"), "{err}");
+    assert!(err.contains("ValueError"), "{err}");
+    assert_eq!(run_logs(data.path()).len(), 1, "logged");
+}
+
+#[test]
 fn the_child_sees_btp_run_active() {
     let (data, _e) = sandbox(PortConflict::FreeIdle);
     let out = btp(data.path(), "long")

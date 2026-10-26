@@ -168,6 +168,11 @@ fn check(
     let Some(dev) = recognize(argv, &ctx.cwd, env_port.as_deref()) else {
         return Ok(untouched());
     };
+    // A port set with a value btp cannot read (`--port $PORT` in a script):
+    // no check and no rewrite, as with `--no-check`.
+    let Some(port) = dev.port else {
+        return Ok(untouched());
+    };
     let cfg = w.config();
     warn_config(w.config_error());
     let name = app_name(&ctx.cwd);
@@ -181,8 +186,8 @@ fn check(
         }
     }
 
-    let Some(holder) = w.port_holder(dev.port, now)? else {
-        eprintln!("btp: {name} on http://localhost:{}", dev.port);
+    let Some(holder) = w.port_holder(port, now)? else {
+        eprintln!("btp: {name} on http://localhost:{}", port);
         return Ok(untouched());
     };
     let reroutable = dev.style.is_some();
@@ -192,12 +197,12 @@ fn check(
         if ctx.agent {
             eprintln!(
                 "btp: port {} is used by {who}. Ask the user, then rerun with {}.",
-                dev.port,
+                port,
                 options(can_kill, reroutable)
             );
             return Ok(Outcome::Exit(CONFLICT));
         }
-        res = match prompt(dev.port, &who, can_kill, reroutable) {
+        res = match prompt(port, &who, can_kill, reroutable) {
             Choice::Kill => match &holder {
                 Holder::Tracked { server, .. } => Resolution::Free(server.key),
                 _ => Resolution::Block,
@@ -216,12 +221,12 @@ fn check(
                 {
                     eprintln!(
                         "btp: freed :{} ({}, {ended}, idle {})",
-                        dev.port,
+                        port,
                         file_name(&server.worktree),
                         minutes(*idle_ms)
                     );
                 }
-                eprintln!("btp: {name} on http://localhost:{}", dev.port);
+                eprintln!("btp: {name} on http://localhost:{}", port);
                 return Ok(untouched());
             }
             // No longer freeable (a Keep, a note, a connection meanwhile).
@@ -241,18 +246,15 @@ fn check(
                 .port_holder(p, now)
                 .map_or(true, |h| h.is_some())
         };
-        if let Some(port) = next_free_port(dev.port, &taken) {
-            if let Some((argv, env)) = with_port(argv, &dev, port) {
-                eprintln!(
-                    "btp: {name} on http://localhost:{port} ({} is used by {who})",
-                    dev.port
-                );
+        if let Some(other) = next_free_port(port, &taken) {
+            if let Some((argv, env)) = with_port(argv, &dev, other) {
+                eprintln!("btp: {name} on http://localhost:{other} ({port} is used by {who})");
                 return Ok(Outcome::Start(Start { argv, env }));
             }
         } else {
             eprintln!(
                 "btp: port {} is used by {who}, and no free port was found above it.",
-                dev.port
+                port
             );
             return Ok(Outcome::Exit(CONFLICT));
         }
@@ -261,13 +263,13 @@ fn check(
     if ctx.agent {
         eprintln!(
             "btp: port {} is used by {who}. Ask the user, then rerun with {}.",
-            dev.port,
+            port,
             options(false, false)
         );
     } else {
         eprintln!(
             "btp: port {} is used by {who}, and btp cannot change the port of this command. Rerun it with a free port.",
-            dev.port
+            port
         );
     }
     Ok(Outcome::Exit(CONFLICT))

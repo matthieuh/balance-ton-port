@@ -60,7 +60,9 @@ fn decide(input: &str) -> Option<String> {
     }
     let mut w = new_watcher(dir);
     let now = now_ms();
-    let holder = w.port_holder(dev.port, now).ok()??;
+    // A port btp cannot read: nothing to check.
+    let port = dev.port?;
+    let holder = w.port_holder(port, now).ok()??;
     let res = resolve(
         &holder,
         dev.style.is_some(),
@@ -79,7 +81,7 @@ fn decide(input: &str) -> Option<String> {
         return None;
     }
     let who = holder_text(&holder);
-    let next = dev.port.saturating_add(1);
+    let next = port.saturating_add(1);
     let cmd = shell_join(&found.argv);
     let mut advice = match dev.style {
         Some(PortStyle::LongFlag) => {
@@ -98,7 +100,7 @@ fn decide(input: &str) -> Option<String> {
     if matches!(res, Resolution::Ask { can_kill: true }) {
         advice.push_str(" Ask the user before freeing it.");
     }
-    Some(format!("port {} is used by {who}. {advice}", dev.port))
+    Some(format!("port {port} is used by {who}. {advice}"))
 }
 
 /// The words quoted so a shell reads them back as they are.

@@ -31,6 +31,17 @@ fn helper() -> PathBuf {
 
 /// `btp hook pre-bash` fed `stdin`.
 fn hook(data: &Path, stdin: &str, wrap: bool) -> std::process::Output {
+    hook_with(data, stdin, wrap, Some("serve.py:8000:long"))
+}
+
+/// `hook` with `framework` as `BTP_TEST_FRAMEWORK`, or with the real
+/// recognition only (`None`).
+fn hook_with(
+    data: &Path,
+    stdin: &str,
+    wrap: bool,
+    framework: Option<&str>,
+) -> std::process::Output {
     let mut c = std::process::Command::new(assert_cmd::cargo::cargo_bin("btp"));
     c.args(["hook", "pre-bash"])
         .env("BTP_DATA_DIR", data)
@@ -41,7 +52,10 @@ fn hook(data: &Path, stdin: &str, wrap: bool) -> std::process::Output {
         .env_remove("PORT")
         .env_remove("BTP_SHELL_WRAP")
         .env("BTP_TEST_NO_CODEX", "1")
-        .env("BTP_TEST_FRAMEWORK", "serve.py:8000:long");
+        .env_remove("BTP_TEST_FRAMEWORK");
+    if let Some(f) = framework {
+        c.env("BTP_TEST_FRAMEWORK", f);
+    }
     if wrap {
         c.env("BTP_SHELL_WRAP", "1");
     }
@@ -332,4 +346,28 @@ fn garbage_stdin_exit_0() {
         assert!(o.status.success(), "{s}");
         assert_eq!(out(&o), "", "{s}");
     }
+}
+
+#[test]
+fn a_framework_in_an_argument_is_not_a_dev_command() {
+    let (data, _e) = sandbox(|_| {});
+    let cwd = tempfile::tempdir().unwrap();
+    let p = free_port();
+    let mut h = Holder::bind(p);
+    let real = |c: &str| hook_with(data.path(), &payload(c, cwd.path()), false, None);
+    // The control: a real Vite command on the taken port is denied.
+    assert!(reason_of(&real(&format!("vite --port {p}"))).starts_with(&format!("port {p} ")));
+    for c in [
+        format!("ls node_modules/.bin/vite --port {p}"),
+        format!("rm node_modules/.bin/vite --port {p}"),
+        format!("cat ./node_modules/.bin/next -p {p}"),
+        format!("git add node_modules/.bin/vite --port {p}"),
+        format!("npx rimraf node_modules/.bin/vite --port {p}"),
+        format!("npx prettier --write node_modules/.bin/next -p {p}"),
+    ] {
+        let o = real(&c);
+        assert!(o.status.success(), "{c}");
+        assert_eq!(out(&o), "", "{c}");
+    }
+    assert!(h.0.try_wait().unwrap().is_none(), "the holder was touched");
 }

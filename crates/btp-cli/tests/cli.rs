@@ -409,6 +409,47 @@ fn is_dev_exit_codes() {
         .code(1);
 }
 
+#[test]
+fn is_dev_reads_the_program_word_only() {
+    let (data, _e) = sandbox();
+    let cwd = tempfile::tempdir().unwrap();
+    std::fs::write(
+        cwd.path().join("package.json"),
+        r#"{"scripts":{"dev":"vite","clean":"rimraf node_modules/.bin/vite"}}"#,
+    )
+    .unwrap();
+    let code = |argv: &[&str]| {
+        btp_isolated(&data)
+            .current_dir(cwd.path())
+            .arg("_is-dev")
+            .arg("--")
+            .args(argv)
+            .output()
+            .unwrap()
+            .status
+            .code()
+    };
+    for argv in [
+        &["ls", "node_modules/.bin/vite"][..],
+        &["rm", "node_modules/.bin/vite"],
+        &["cat", "./node_modules/.bin/next"],
+        &["git", "add", "node_modules/.bin/vite"],
+        &["npx", "rimraf", "node_modules/.bin/vite"],
+        &["npx", "prettier", "--write", "node_modules/.bin/next"],
+        &["npm", "run", "clean"],
+    ] {
+        assert_eq!(code(argv), Some(1), "{argv:?}");
+    }
+    for argv in [
+        &["vite"][..],
+        &["npx", "vite"],
+        &["node", "node_modules/.bin/next", "dev"],
+        &["npm", "run", "dev"],
+    ] {
+        assert_eq!(code(argv), Some(0), "{argv:?}");
+    }
+}
+
 /// A project with `"dev": "vite --port <free>"` and a fake `npm` that prints
 /// its arguments and whether it runs inside `btp run`, exiting 7.
 struct Wrapped {
