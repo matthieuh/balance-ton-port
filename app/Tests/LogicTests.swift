@@ -70,7 +70,8 @@ final class SettingsDraftTests: XCTestCase {
     private let config = ConfigFfi(
         deadSessionIdleS: 1200, alertAfterS: 1800, killGraceS: 5, scanIntervalS: 5,
         claudeConfigDirs: ["/Users/me/.claude"], excludeCommands: ["mcp"], excludePorts: [5432],
-        leakMemoryMb: 4096, leakGrowthMb: 300
+        leakMemoryMb: 4096, leakGrowthMb: 300,
+        portConflict: "ask", portCheckHook: false
     )
 
     func testConversions() {

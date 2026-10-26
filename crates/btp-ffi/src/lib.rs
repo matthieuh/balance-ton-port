@@ -5,7 +5,7 @@
 uniffi::setup_scaffolding!();
 
 use btp_core::agents::AgentKind;
-use btp_core::config::{data_dir, read_config, save_config, Config};
+use btp_core::config::{data_dir, read_config, save_config, Config, PortConflict};
 use btp_core::display::{
     card_reason, format_idle, free_is_low, server_state, session_ended_body, started_label,
     status_text, status_text_observed, usage_line, NeedsYou, SuggestedAction, ACTIVE_WINDOW_MS,
@@ -490,6 +490,10 @@ pub struct ConfigFfi {
     pub leak_memory_mb: u64,
     /// A server growing by more than this (MB) in 10 minutes leaks.
     pub leak_growth_mb: u64,
+    /// `free_idle`, `ask` or `reroute`.
+    pub port_conflict: String,
+    /// Whether the agent hook checks a port before a server command starts.
+    pub port_check_hook: bool,
 }
 
 /// One server a session end left running.
@@ -554,6 +558,7 @@ pub fn reason_label(r: &KillReason) -> String {
         }
         KillReason::Manual => "manual".to_string(),
         KillReason::SessionEnded => "session ended".to_string(),
+        KillReason::PortConflict => "freed for a new server".to_string(),
         KillReason::Other => "other".to_string(),
     }
 }
@@ -564,6 +569,7 @@ fn reason_kind(r: &KillReason) -> &'static str {
         KillReason::DeadSessionIdle { .. } => "dead_session_idle",
         KillReason::Manual => "manual",
         KillReason::SessionEnded => "session_ended",
+        KillReason::PortConflict => "port_conflict",
         KillReason::Other => "other",
     }
 }
@@ -843,6 +849,8 @@ impl From<Config> for ConfigFfi {
             exclude_ports: c.exclude_ports,
             leak_memory_mb: c.leak_memory_mb,
             leak_growth_mb: c.leak_growth_mb,
+            port_conflict: c.port_conflict.as_str().to_string(),
+            port_check_hook: c.port_check_hook,
         }
     }
 }
@@ -863,6 +871,9 @@ impl From<ConfigFfi> for Config {
             exclude_ports: c.exclude_ports,
             leak_memory_mb: c.leak_memory_mb,
             leak_growth_mb: c.leak_growth_mb,
+            // An unknown value (a newer app) falls back to the default.
+            port_conflict: PortConflict::parse(&c.port_conflict).unwrap_or_default(),
+            port_check_hook: c.port_check_hook,
         }
     }
 }
@@ -1966,6 +1977,12 @@ mod tests {
         let mut c = core.config().unwrap();
         assert_eq!(c.dead_session_idle_s, 1200);
         assert_eq!((c.leak_memory_mb, c.leak_growth_mb), (2048, 500));
+        assert_eq!(
+            (c.port_conflict.as_str(), c.port_check_hook),
+            ("free_idle", true)
+        );
+        c.port_conflict = "reroute".into();
+        c.port_check_hook = false;
         c.alert_after_s = 60;
         c.claude_config_dirs = vec!["/tmp/claude-x".into()];
         c.leak_memory_mb = 4096;
@@ -1976,6 +1993,8 @@ mod tests {
         assert_eq!(saved.alert_after_s, 60);
         // The app's save keeps the leak thresholds it was given.
         assert_eq!((saved.leak_memory_mb, saved.leak_growth_mb), (4096, 300));
+        assert_eq!(saved.port_conflict, PortConflict::Reroute);
+        assert!(!saved.port_check_hook);
     }
 
     #[test]
@@ -2386,6 +2405,7 @@ mod tests {
             (KillReason::WorktreeDeleted, "worktree_deleted"),
             (KillReason::Manual, "manual"),
             (KillReason::SessionEnded, "session_ended"),
+            (KillReason::PortConflict, "port_conflict"),
             (KillReason::Other, "other"),
         ];
         for (reason, kind) in kinds {

@@ -46,6 +46,25 @@ fn config_set_then_get() {
 }
 
 #[test]
+fn config_set_port_conflict_then_get() {
+    let (data, _e) = sandbox();
+    btp(&data)
+        .args(["config", "set", "port_conflict", "ask"])
+        .assert()
+        .success();
+    let out = btp(&data).args(["config", "get"]).assert().success();
+    let text = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(text.contains("port_conflict = \"ask\""), "{text}");
+    assert!(text.contains("port_check_hook = true"), "{text}");
+    let out = btp(&data)
+        .args(["config", "set", "port_conflict", "kill"])
+        .assert()
+        .code(1);
+    let err = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(err.contains("free_idle, ask, reroute"), "{err}");
+}
+
+#[test]
 fn config_set_unknown_key_fails() {
     let (data, _e) = sandbox();
     btp(&data)

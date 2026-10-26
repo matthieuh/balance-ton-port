@@ -106,6 +106,8 @@ pub enum KillReason {
     Manual,
     /// Killed when its Claude Code session process quit (SessionEnd hook).
     SessionEnded,
+    /// Freed because a new server needed its port.
+    PortConflict,
     /// Any kind this version does not know (written by a newer version).
     #[serde(other)]
     Other,

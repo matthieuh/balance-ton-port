@@ -816,6 +816,7 @@ fn describe_kill(r: &KillRecord) -> String {
         }
         KillReason::Manual => "manual".to_string(),
         KillReason::SessionEnded => "session ended".to_string(),
+        KillReason::PortConflict => "freed for a new server".to_string(),
         KillReason::Other => "other".to_string(),
     };
     format!(
@@ -1117,12 +1118,13 @@ mod tests {
             &[
                 rec(5173, KillReason::SessionEnded, now - 12 * 60_000),
                 rec(3000, KillReason::Manual, now - 2 * 3_600_000),
+                rec(4000, KillReason::PortConflict, now - 60_000),
             ],
             now,
         );
         assert_eq!(
             text,
-            "12 min ago  :5173 Vite (app) [session ended]\n2 h ago  :3000 Vite (app) [manual]\n"
+            "12 min ago  :5173 Vite (app) [session ended]\n2 h ago  :3000 Vite (app) [manual]\n1 min ago  :4000 Vite (app) [freed for a new server]\n"
         );
         assert_eq!(render_recent(&[], now), "no kills yet\n");
     }

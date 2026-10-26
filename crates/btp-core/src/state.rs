@@ -389,6 +389,14 @@ mod tests {
     }
 
     #[test]
+    fn kill_reason_roundtrip() {
+        let json = serde_json::to_value(KillReason::PortConflict).unwrap();
+        assert_eq!(json, serde_json::json!({"kind": "port_conflict"}));
+        let back: KillReason = serde_json::from_value(json).unwrap();
+        assert_eq!(back, KillReason::PortConflict);
+    }
+
+    #[test]
     fn unknown_reason_kind_decodes_as_other() {
         let r: KillReason =
             serde_json::from_str(r#"{"kind": "made_up_later", "extra": 3}"#).unwrap();

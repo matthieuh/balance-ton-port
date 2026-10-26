@@ -813,6 +813,9 @@ struct SettingsDraft: Equatable, Sendable {
     /// Leak thresholds (MB): no field in the form yet, saved back unchanged.
     var leakMemoryMb: UInt64
     var leakGrowthMb: UInt64
+    /// Port-conflict settings: no field in the form yet, saved back unchanged.
+    var portConflict: String
+    var portCheckHook: Bool
 
     init(_ c: ConfigFfi) {
         deadSessionIdleS = c.deadSessionIdleS
@@ -824,6 +827,8 @@ struct SettingsDraft: Equatable, Sendable {
         excludePorts = c.excludePorts
         leakMemoryMb = c.leakMemoryMb
         leakGrowthMb = c.leakGrowthMb
+        portConflict = c.portConflict
+        portCheckHook = c.portCheckHook
     }
 
     var ffi: ConfigFfi {
@@ -836,7 +841,9 @@ struct SettingsDraft: Equatable, Sendable {
             excludeCommands: excludeCommands,
             excludePorts: excludePorts,
             leakMemoryMb: leakMemoryMb,
-            leakGrowthMb: leakGrowthMb
+            leakGrowthMb: leakGrowthMb,
+            portConflict: portConflict,
+            portCheckHook: portCheckHook
         )
     }
 
