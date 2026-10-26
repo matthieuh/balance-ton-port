@@ -9,7 +9,7 @@ description: Use before starting or after finishing a local dev server, or when 
 
 ## Before starting a dev server
 
-Start it through btp: `btp run -- <cmd>` (for example `btp run -- npm run dev`). It checks the port, reuses a server that already runs the same command here, and keeps the server's logs. Run it in the background as your tool allows; it keeps working when backgrounded. Read the `btp:` line it prints on stderr, it holds the real address:
+Start it through btp: `btp run -- <cmd>` (for example `btp run -- npm run dev`). It checks the port, reuses a server that already runs the same command here, and keeps the server's logs. Run it in the background as your tool allows; without a terminal it never prompts. Read the `btp:` line it prints on stderr, it holds the real address:
 
 - `btp: storefront on http://localhost:3001 (3000 is used by admin, Codex session)`: it ran on another port. Use that address, not the one you expected.
 - `btp: storefront already running on http://localhost:3000 (started by Claude 12 min ago), reusing it`: nothing was started (exit 0). Use that address.
@@ -17,6 +17,8 @@ Start it through btp: `btp run -- <cmd>` (for example `btp run -- npm run dev`).
 - Exit code 3, `btp: port 3000 is used by <holder>. Ask the user, ...`: btp did not resolve the conflict and started nothing. Ask the user, then rerun with `--free`, `--reroute` or a free port (only the options that would work are offered). Do not pick for them.
 
 Options: `--free` frees an idle leftover, `--reroute` never touches the holder, `--new` starts a second copy, `--no-check` skips the check. Other exit codes are the server's own; 2 is a usage error.
+
+Keep the `btp:` line when you background it: it is printed once, on stderr. Let your tool's background mode capture the output and read it, or run `btp run -- npm run dev > "${TMPDIR:-/tmp}/<name>-dev.log" 2>&1 &` and read the first lines of that file (never put the file inside the project). If you lost the line, `btp list --json` shows the server's real `port` once it listens; if the command exited with 3, nothing was started.
 
 A Claude Code hook may refuse a dev command whose port is taken. Rerun it through `btp run -- <cmd>` or pass another port.
 

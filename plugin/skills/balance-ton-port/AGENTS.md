@@ -4,7 +4,7 @@
 
 ### Before starting a dev server
 
-Start it with `btp run -- <cmd>` (for example `btp run -- npm run dev`), in the background as your tool allows. It checks the port, reuses a server already running the same command here, and keeps the logs. Read the `btp:` line on stderr for the real address:
+Start it with `btp run -- <cmd>` (for example `btp run -- npm run dev`), in the background as your tool allows (without a terminal it never prompts). It checks the port, reuses a server already running the same command here, and keeps the logs. Read the `btp:` line on stderr for the real address:
 
 - `btp: ... on http://localhost:3001 (3000 is used by ...)`: it ran on another port, use that address.
 - `btp: ... already running on http://localhost:3000 ..., reusing it`: nothing started (exit 0), use that address.
@@ -12,6 +12,8 @@ Start it with `btp run -- <cmd>` (for example `btp run -- npm run dev`), in the 
 - Exit 3 (`btp: port 3000 is used by <holder>. Ask the user, ...`): nothing started. Ask the user, then rerun with `--free`, `--reroute` or a free port.
 
 Other options: `--new` (second copy), `--no-check`. Other exit codes are the server's own.
+
+Keep the `btp:` line when you background it: it is printed once, on stderr. Let your tool's background mode capture the output and read it, or run `btp run -- npm run dev > "${TMPDIR:-/tmp}/<name>-dev.log" 2>&1 &` and read the first lines of that file (never put the file inside the project). If you lost the line, `btp list --json` shows the server's real `port` once it listens; if the command exited with 3, nothing was started.
 
 If a hook refuses a dev command because its port is taken, rerun it through `btp run -- <cmd>` or pass another port.
 
