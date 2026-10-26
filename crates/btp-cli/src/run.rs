@@ -439,7 +439,7 @@ fn print_tail(log: &Path) -> u64 {
         } else {
             0
         };
-        let _ = write_out(1, &bytes[skip..]);
+        write_out(1, &bytes[skip..]);
     }
     len
 }
@@ -482,7 +482,7 @@ fn follow(log: &Path, offset: &mut u64, key: ServerKey) -> Follow {
             *offset = len;
         } else if len > *offset {
             if let Ok(bytes) = read_from(log, *offset) {
-                let _ = write_out(1, &bytes);
+                write_out(1, &bytes);
                 *offset += bytes.len() as u64;
             }
         }
@@ -616,7 +616,7 @@ extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, _: *mut li
     // SAFETY: `info` is the kernel's siginfo for this delivery, or null.
     let from_terminal =
         !info.is_null() && unsafe { !matches!((*info).si_code, SI_USER | SI_QUEUE) };
-    if pid > 0 && !(from_terminal && in_foreground_group()) {
+    if pid > 0 && !(from_terminal && shares_foreground_group(pid)) {
         // SAFETY: kill is async-signal-safe.
         unsafe { libc::kill(pid, sig) };
     }
@@ -628,13 +628,15 @@ extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, _: *mut li
 const SI_USER: libc::c_int = 0x10001;
 const SI_QUEUE: libc::c_int = 0x10002;
 
-/// btp (and so the child, which stays in its process group) is the
-/// foreground group of one of its standard streams' terminal.
-fn in_foreground_group() -> bool {
-    // SAFETY: getpgrp and tcgetpgrp only read.
+/// btp and the child `pid` are in one process group, the foreground group
+/// of one of btp's standard streams' terminal: the terminal's signal
+/// reached them both. A child that moved to a group of its own did not get
+/// it.
+fn shares_foreground_group(pid: i32) -> bool {
+    // SAFETY: getpgrp, getpgid and tcgetpgrp only read.
     unsafe {
         let me = libc::getpgrp();
-        (0..3).any(|fd| libc::tcgetpgrp(fd) == me)
+        libc::getpgid(pid) == me && (0..3).any(|fd| libc::tcgetpgrp(fd) == me)
     }
 }
 
@@ -715,21 +717,34 @@ fn same_process(k: ServerKey) -> bool {
         .is_some_and(|i| i.start_time == k.start_time)
 }
 
-/// Writes all of `bytes` to `fd`, unbuffered. `false` when `fd` refused
-/// them (a closed pipe: EPIPE).
-fn write_out(fd: i32, mut bytes: &[u8]) -> bool {
+/// How a write to btp's own output ended.
+#[derive(PartialEq)]
+enum Wrote {
+    All,
+    /// The reader is gone (EPIPE).
+    Closed,
+    /// Any other error: the rest of these bytes is dropped.
+    Failed,
+}
+
+/// Writes all of `bytes` to `fd`, unbuffered, waiting while a non-blocking
+/// `fd` is full (EAGAIN).
+fn write_out(fd: i32, mut bytes: &[u8]) -> Wrote {
     while !bytes.is_empty() {
         // SAFETY: writes from a live slice.
         let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
-        if n > 0 {
+        if n >= 0 {
             bytes = &bytes[n as usize..];
-        } else if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
             continue;
-        } else {
-            return false;
+        }
+        match io::Error::last_os_error().raw_os_error() {
+            Some(libc::EINTR) => {}
+            Some(libc::EAGAIN) => std::thread::sleep(Duration::from_millis(10)),
+            Some(libc::EPIPE) => return Wrote::Closed,
+            _ => return Wrote::Failed,
         }
     }
-    true
+    Wrote::All
 }
 
 /// Nested `btp run`: becomes the command itself.
@@ -793,13 +808,17 @@ fn open_pty() -> io::Result<Pty> {
 
 /// Starts the child and copies its output, byte for byte, to btp's own
 /// stdout and stderr and to its log: through pipes (each stream to its
-/// own), or, when btp's stdout is a terminal, through a pty that both
-/// streams share (to btp's stdout), so the child still sees a terminal.
+/// own), or, when btp's stdout is a terminal, through a pty for stdout
+/// (and for stderr when it is that same terminal, else stderr is piped to
+/// btp's stderr), so the child still sees a terminal.
 /// stdin is the child's as it is. SIGINT, SIGTERM and SIGHUP are forwarded
 /// (SIGWINCH too with a pty). Returns the child's exit code; when a signal
 /// killed the child, btp dies of that same signal.
 fn spawn_and_wait(dir: &Path, s: Start) -> u8 {
     let pty = if is_tty(1) { open_pty().ok() } else { None };
+    // stderr shares the pty only when it is the same terminal as stdout:
+    // `2>file` or `2>/dev/null` keeps going where it was sent.
+    let stderr_on_pty = pty.is_some() && same_terminal(1, 2);
     let mut sigs = FORWARDED.to_vec();
     if pty.is_some() {
         sigs.push(libc::SIGWINCH);
@@ -811,14 +830,16 @@ fn spawn_and_wait(dir: &Path, s: Start) -> u8 {
         .env(ACTIVE, "1")
         .stdin(Stdio::inherit());
     match &pty {
-        Some(p) => match (p.slave.try_clone(), p.slave.try_clone()) {
-            (Ok(o), Ok(e)) => {
-                cmd.stdout(Stdio::from(o)).stderr(Stdio::from(e));
-            }
-            _ => {
-                cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-            }
-        },
+        Some(p) => {
+            match p.slave.try_clone() {
+                Ok(o) => cmd.stdout(Stdio::from(o)),
+                Err(_) => cmd.stdout(Stdio::piped()),
+            };
+            match p.slave.try_clone() {
+                Ok(e) if stderr_on_pty => cmd.stderr(Stdio::from(e)),
+                _ => cmd.stderr(Stdio::piped()),
+            };
+        }
         None => {
             cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         }
@@ -846,31 +867,29 @@ fn spawn_and_wait(dir: &Path, s: Start) -> u8 {
         .map_or_else(|| now_ms() * 1000, |i| i.start_time);
     let log = RunLog::create(dir, ServerKey { pid, start_time }).ok();
     let log = Arc::new(Mutex::new(log));
-    let mut sources: Vec<(Box<dyn Read + Send>, i32)> = Vec::new();
+    // (source, btp's fd, is a pty master)
+    let mut sources: Vec<(OwnedFd, i32, bool)> = Vec::new();
     if let Some(o) = child.stdout.take() {
-        sources.push((Box::new(o), 1));
+        sources.push((OwnedFd::from(o), 1, false));
     }
     if let Some(e) = child.stderr.take() {
-        sources.push((Box::new(e), 2));
+        sources.push((OwnedFd::from(e), 2, false));
     }
     if let Some(m) = &pty {
         PTY_MASTER.store(m.as_raw_fd(), Ordering::SeqCst);
         if let Ok(dup) = m.try_clone() {
-            sources.push((Box::new(std::fs::File::from(dup)), 1));
+            sources.push((dup, 1, true));
         }
     }
-    let (done_tx, done) = std::sync::mpsc::channel::<()>();
-    let mut open = 0;
-    for (src, fd) in sources {
-        open += 1;
-        let log = log.clone();
-        let tx = done_tx.clone();
-        std::thread::spawn(move || {
-            pump(src, fd, &log);
-            let _ = tx.send(());
-        });
-    }
-    drop(done_tx);
+    let exited = Arc::new(Mutex::new(None::<Instant>));
+    let pumps: Vec<_> = sources
+        .into_iter()
+        .map(|(src, fd, is_pty)| {
+            let log = log.clone();
+            let exited = exited.clone();
+            std::thread::spawn(move || pump(src, fd, is_pty, &log, &exited))
+        })
+        .collect();
     let status = loop {
         match child.wait() {
             Ok(s) => break Some(s),
@@ -880,15 +899,13 @@ fn spawn_and_wait(dir: &Path, s: Start) -> u8 {
     };
     CHILD.store(0, Ordering::SeqCst);
     let _ = take_signal();
-    // What the child wrote last, for a short while only: a server it
-    // started in the background may hold the pipes as long as it runs.
-    let deadline = Instant::now() + DRAIN_AFTER_EXIT;
-    while open > 0 {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() || done.recv_timeout(left).is_err() {
-            break;
-        }
-        open -= 1;
+    // Each pump delivers all the child left, then waits for the end of its
+    // stream at most `DRAIN_AFTER_EXIT` (see `pump`).
+    if let Ok(mut e) = exited.lock() {
+        *e = Some(Instant::now());
+    }
+    for p in pumps {
+        let _ = p.join();
     }
     PTY_MASTER.store(-1, Ordering::SeqCst);
     drop(signals);
@@ -917,12 +934,46 @@ fn die_of(sig: i32) -> u8 {
     128 + sig as u8
 }
 
-/// Copies `src` to `fd` and to the log, byte for byte, as it arrives. When
-/// `fd` is a closed pipe (`btp run -- yes | head -1`), it stops reading and
-/// closes its end, so the child gets its SIGPIPE as without btp.
-fn pump(mut src: Box<dyn Read + Send>, fd: i32, log: &Mutex<Option<RunLog>>) {
+/// Copies `src` to `fd` and to the log, byte for byte, as it arrives.
+///
+/// Once the child has exited (`exited` set), the pump first delivers in
+/// full what was waiting in `src` at that moment (what the child left,
+/// however slow the reader of `fd`), then keeps reading only until the end
+/// of the stream or `DRAIN_AFTER_EXIT` after the exit, whichever comes
+/// first: a server the child started in the background may hold the
+/// stream as long as it runs. A write in progress is never cut.
+///
+/// When `fd` is a closed pipe (`btp run -- yes | head -1`), the pump stops
+/// and closes `src`, so the child gets its SIGPIPE as without btp (not for
+/// a pty, whose child would then block on a full buffer). Any other write
+/// error drops that chunk and the pump goes on.
+fn pump(
+    src: OwnedFd,
+    fd: i32,
+    is_pty: bool,
+    log: &Mutex<Option<RunLog>>,
+    exited: &Mutex<Option<Instant>>,
+) {
+    let raw = src.as_raw_fd();
+    let mut src = std::fs::File::from(src);
     let mut buf = vec![0u8; 64 * 1024];
+    // Bytes still to read of what was waiting at the exit; `None` before.
+    let mut left_at_exit: Option<usize> = None;
     loop {
+        let exit = exited.lock().ok().and_then(|e| *e);
+        if let Some(at) = exit {
+            let left = *left_at_exit.get_or_insert_with(|| pending_bytes(raw));
+            if left == 0 && at.elapsed() >= DRAIN_AFTER_EXIT {
+                return;
+            }
+        }
+        // Wait for data, waking up to notice the exit and the deadline.
+        if !readable(raw, 100) {
+            if exit.is_some() {
+                left_at_exit = Some(0);
+            }
+            continue;
+        }
         let n = match src.read(&mut buf) {
             Ok(0) => return,
             Ok(n) => n,
@@ -930,7 +981,10 @@ fn pump(mut src: Box<dyn Read + Send>, fd: i32, log: &Mutex<Option<RunLog>>) {
             // EIO from a pty master: the child's side is closed.
             Err(_) => return,
         };
-        let delivered = write_out(fd, &buf[..n]);
+        if let Some(left) = left_at_exit.as_mut() {
+            *left = left.saturating_sub(n);
+        }
+        let wrote = write_out(fd, &buf[..n]);
         if let Ok(mut l) = log.lock() {
             if let Some(f) = l.as_mut() {
                 // A log that fails stops being written; the output goes on.
@@ -939,8 +993,42 @@ fn pump(mut src: Box<dyn Read + Send>, fd: i32, log: &Mutex<Option<RunLog>>) {
                 }
             }
         }
-        if !delivered {
+        if wrote == Wrote::Closed && !is_pty {
             return;
         }
+    }
+}
+
+/// `fd` has data or its end (or an error) to read, within `ms`.
+fn readable(fd: i32, ms: i32) -> bool {
+    let mut p = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: polls one fd we hold.
+    unsafe { libc::poll(&mut p, 1, ms) > 0 }
+}
+
+/// Bytes waiting to be read on `fd` (0 when it cannot tell).
+fn pending_bytes(fd: i32) -> usize {
+    let mut n: libc::c_int = 0;
+    // SAFETY: FIONREAD into a local int.
+    if unsafe { libc::ioctl(fd, libc::FIONREAD, &mut n) } == 0 {
+        n.max(0) as usize
+    } else {
+        0
+    }
+}
+
+/// `a` and `b` are the same terminal device.
+fn same_terminal(a: i32, b: i32) -> bool {
+    if !is_tty(a) || !is_tty(b) {
+        return false;
+    }
+    // SAFETY: fstat into locals.
+    unsafe {
+        let (mut x, mut y): (libc::stat, libc::stat) = (std::mem::zeroed(), std::mem::zeroed());
+        libc::fstat(a, &mut x) == 0 && libc::fstat(b, &mut y) == 0 && x.st_rdev == y.st_rdev
     }
 }

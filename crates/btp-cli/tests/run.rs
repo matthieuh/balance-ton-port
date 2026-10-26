@@ -306,16 +306,18 @@ fn reroutes_around_observed_holder() {
     let o = out.get_output();
     let err = text(&o.stderr);
     let name = dir.path().file_name().unwrap().to_string_lossy();
-    assert!(
-        err.contains(&format!(
-            "btp: {name} on http://localhost:{} ({p} is used by ",
-            p + 1
-        )),
-        "{err}"
-    );
+    // The first free port above `p`: `p + 1`, unless a process of the
+    // machine outside this test took it meanwhile.
+    let new: u16 = err
+        .strip_prefix(&format!("btp: {name} on http://localhost:"))
+        .and_then(|r| r.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("{err}"));
+    assert!(new > p && new <= p + 2, "{err}");
+    assert!(err.contains(&format!("{new} ({p} is used by ")), "{err}");
     assert!(err.contains("not started by an agent"), "{err}");
     assert!(
-        text(&o.stdout).contains(&format!("serve.py listening on {}", p + 1)),
+        text(&o.stdout).contains(&format!("serve.py listening on {new}")),
         "{}",
         text(&o.stdout)
     );
@@ -553,13 +555,25 @@ struct InTerminal {
 
 impl InTerminal {
     fn start(data: &Path, cwd: &Path, args: &[&str]) -> InTerminal {
+        let mut argv = vec![
+            assert_cmd::cargo::cargo_bin("btp").display().to_string(),
+            "run".to_string(),
+        ];
+        argv.extend(args.iter().map(|a| a.to_string()));
+        InTerminal::spawn(data, cwd, &argv)
+    }
+
+    /// `sh -c <line>` in the terminal.
+    fn shell(data: &Path, cwd: &Path, line: &str) -> InTerminal {
+        InTerminal::spawn(data, cwd, &["sh".into(), "-c".into(), line.into()])
+    }
+
+    fn spawn(data: &Path, cwd: &Path, argv: &[String]) -> InTerminal {
         let mut cmd = std::process::Command::new("script");
         env_of(&mut cmd, data, "long");
         cmd.current_dir(cwd)
             .args(["-q", "/dev/null"])
-            .arg(assert_cmd::cargo::cargo_bin("btp"))
-            .arg("run")
-            .args(args)
+            .args(argv)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -818,4 +832,53 @@ fn a_panic_before_the_start_runs_the_command_untouched() {
         text(&o.stderr),
         "btp: port check skipped (internal error), running the command as it is\n"
     );
+}
+
+#[test]
+fn terminal_stderr_redirect_is_kept() {
+    let (data, _e) = sandbox(PortConflict::FreeIdle);
+    let dir = tempfile::tempdir().unwrap();
+    let err = dir.path().join("err.txt");
+    let mut t = InTerminal::shell(
+        data.path(),
+        dir.path(),
+        &format!(
+            "'{}' run -- python3 -c \"import os,sys; print('out', os.isatty(1)); sys.stderr.write('err-bytes\\n')\" 2>'{}'",
+            assert_cmd::cargo::cargo_bin("btp").display(),
+            err.display()
+        ),
+    );
+    assert_eq!(t.wait().code(), Some(0));
+    t.settle();
+    let seen = text(&t.seen);
+    assert!(seen.contains("out True"), "{seen:?}");
+    assert!(!seen.contains("err-bytes"), "{seen:?}");
+    assert_eq!(std::fs::read_to_string(&err).unwrap(), "err-bytes\n");
+}
+
+#[test]
+fn a_slow_reader_still_gets_everything() {
+    let (data, _e) = sandbox(PortConflict::FreeIdle);
+    let bin = assert_cmd::cargo::cargo_bin("btp");
+    // 100000 bytes fit in the two pipe buffers: the child exits at once and
+    // btp still holds what it left when the reader starts, 1 s later.
+    for size in [100_000, 300_000] {
+        let out = Command::new("sh")
+            .env("BTP_DATA_DIR", data.path())
+            .env("HOME", data.path())
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .env_remove("CODEX_HOME")
+            .env_remove("CODEX_THREAD_ID")
+            .env_remove("BTP_RUN_ACTIVE")
+            .env("BTP_TEST_NO_CODEX", "1")
+            .arg("-c")
+            .arg(format!(
+                "'{}' run -- sh -c 'head -c {size} /dev/zero' | (sleep 1; wc -c)",
+                bin.display()
+            ))
+            .timeout(WAIT)
+            .assert()
+            .success();
+        assert_eq!(text(&out.get_output().stdout).trim(), size.to_string());
+    }
 }
