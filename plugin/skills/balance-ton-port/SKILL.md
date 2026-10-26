@@ -20,7 +20,7 @@ Options: `--free` frees an idle leftover, `--reroute` never touches the holder, 
 
 Keep the `btp:` line when you background it: it is printed once, on stderr. Let your tool's background mode capture the output and read it, or run `btp run -- npm run dev > "${TMPDIR:-/tmp}/<name>-dev.log" 2>&1 &` and read the first lines of that file (never put the file inside the project). If you lost the line, `btp list --json` shows the server's real `port` once it listens; if the command exited with 3, nothing was started.
 
-A Claude Code hook may refuse a dev command whose port is taken. Rerun it through `btp run -- <cmd>` or pass another port.
+A Claude Code hook may refuse a dev command. If the same project is already running, use the address it gives instead of starting another copy. If the port is taken, rerun it through `btp run -- <cmd>` or pass the free port it suggests.
 
 ### Without `btp run` (older btp)
 
