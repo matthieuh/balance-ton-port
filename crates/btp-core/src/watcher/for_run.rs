@@ -32,7 +32,7 @@ impl<P: Platform> Watcher<P> {
                 let Some(info) = p.proc_info(pid) else {
                     return Some(Holder::Unknown);
                 };
-                match owner_of(p, pid, &state.servers) {
+                match owner_of(p, pid, &state.servers, &scan.cfg) {
                     Some(i) => {
                         owners.insert(i);
                     }
@@ -216,21 +216,25 @@ impl<P: Platform> Watcher<P> {
 }
 
 /// The tracked server (index into `servers`) whose tree holds `pid`: the
-/// topmost one among `pid` and its ancestors, the walk stopping at an agent
-/// CLI (a nested session's servers are not the outer server's, as in
-/// `tree_of`).
-fn owner_of(p: &dyn Platform, pid: i32, servers: &[TrackedServer]) -> Option<usize> {
+/// topmost one among `pid` and its ancestors. The walk stops where
+/// `term_tree` would stop signalling: at an agent CLI (a nested session's
+/// servers are not the outer server's, as in `tree_of`) and at an untracked
+/// excluded command (spared with its subtree, so killing the server would
+/// not free its port).
+fn owner_of(p: &dyn Platform, pid: i32, servers: &[TrackedServer], cfg: &Config) -> Option<usize> {
     let mut owner = None;
     for (i, proc) in ancestry(p, pid).iter().enumerate() {
         if i > 0 && is_agent_cli(&proc.command).is_some() {
             break;
         }
-        if let Some(j) = servers.iter().position(|s| {
+        match servers.iter().position(|s| {
             !s.session_proc_start.is_empty()
                 && s.key.pid == proc.pid
                 && s.key.start_time == proc.start_time
         }) {
-            owner = Some(j);
+            Some(j) => owner = Some(j),
+            None if is_excluded(&proc.command, cfg) => break,
+            None => {}
         }
     }
     owner
@@ -376,6 +380,41 @@ mod tests {
         assert!(matches!(
             f.w.port_holder(4000, T0).unwrap(),
             Some(Holder::Observed { excluded: true, .. })
+        ));
+    }
+
+    #[test]
+    fn excluded_child_listener_is_not_the_servers() {
+        let mut f = dead_session_fx();
+        let web = f.wt.join("apps/web");
+        let mut cfg = f.cfg();
+        cfg.exclude_commands.push("postgres".into());
+        crate::config::save_config(f.data.path(), &cfg).unwrap();
+        // `bun run dev` starts postgres, which `term_tree` spares.
+        f.p().spawn(
+            40,
+            30,
+            START + 40 * SEC,
+            "postgres -D db",
+            web.to_str().unwrap(),
+        );
+        f.p().add_listener(40, 5432);
+        let now = T0 + 11 * MIN;
+        assert!(matches!(
+            f.w.port_holder(5432, now).unwrap(),
+            Some(Holder::Observed { excluded: true, .. })
+        ));
+        let postgres = ServerKey {
+            pid: 40,
+            start_time: START + 40 * SEC,
+        };
+        assert_eq!(f.w.free_for_run(postgres, now).unwrap(), None);
+        assert!(f.p().signals().is_empty());
+        assert!(f.p().is_alive(40));
+        // The server's own port is still its own.
+        assert!(matches!(
+            f.w.port_holder(3000, now).unwrap(),
+            Some(Holder::Tracked { .. })
         ));
     }
 
