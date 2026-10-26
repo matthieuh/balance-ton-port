@@ -6,7 +6,7 @@
 
 use crate::run::holder_text;
 use crate::{new_watcher, now_ms};
-use btp_core::config::{data_dir, read_config, PortConflict};
+use btp_core::config::{data_dir, read_config};
 use btp_core::run::command::{recognize, PortStyle};
 use btp_core::run::conflict::{resolve, Resolution, RunFlags};
 use std::io::Read;
@@ -80,30 +80,24 @@ fn decide(input: &str) -> Option<String> {
     }
     let who = holder_text(&holder);
     let next = dev.port.saturating_add(1);
-    let advice = if cfg.port_conflict == PortConflict::Ask && !matches!(res, Resolution::Block) {
-        match res {
-            Resolution::Ask { can_kill: true } | Resolution::Free(_) => {
-                "Ask the user before freeing it.".to_string()
-            }
-            _ => "Ask the user which port to use.".to_string(),
+    let cmd = shell_join(&found.argv);
+    let mut advice = match dev.style {
+        Some(PortStyle::LongFlag) => {
+            format!("Rerun as `btp run -- {cmd}` to get a free port, or pass --port {next}.")
         }
-    } else {
-        let cmd = shell_join(&found.argv);
-        match dev.style {
-            Some(PortStyle::LongFlag) => format!(
-                "Rerun as `btp run -- {cmd}` to get a free port, or pass --port {next}."
-            ),
-            Some(PortStyle::ShortFlag) => {
-                format!("Rerun as `btp run -- {cmd}` to get a free port, or pass -p {next}.")
-            }
-            Some(PortStyle::Env) => {
-                format!("Rerun as `btp run -- {cmd}` to get a free port, or set PORT={next}.")
-            }
-            None => format!(
-                "Rerun as `btp run -- {cmd}`, or start it on a free port (btp cannot change this command's port)."
-            ),
+        Some(PortStyle::ShortFlag) => {
+            format!("Rerun as `btp run -- {cmd}` to get a free port, or pass -p {next}.")
         }
+        Some(PortStyle::Env) => {
+            format!("Rerun as `btp run -- {cmd}` to get a free port, or set PORT={next}.")
+        }
+        None => format!(
+            "Rerun as `btp run -- {cmd}`, or start it on a free port (btp cannot change this command's port)."
+        ),
     };
+    if matches!(res, Resolution::Ask { can_kill: true }) {
+        advice.push_str(" Ask the user before freeing it.");
+    }
     Some(format!("port {} is used by {who}. {advice}", dev.port))
 }
 
@@ -216,6 +210,14 @@ fn split(line: &str) -> Option<Vec<Segment>> {
                 cur.push('$');
             }
             '`' | '(' | ')' => return None,
+            // A heredoc or here-string: its body is data, not commands.
+            '<' if chars.peek() == Some(&'<') => return None,
+            // A comment runs to the end of the line.
+            '#' if !in_word => {
+                while chars.peek().is_some_and(|&n| n != '\n') {
+                    chars.next();
+                }
+            }
             ' ' | '\t' => end_word(&mut segs, &mut cur, &mut in_word, &mut quoted),
             ';' | '\n' | '&' | '|' => {
                 end_word(&mut segs, &mut cur, &mut in_word, &mut quoted);
@@ -372,6 +374,24 @@ mod tests {
     fn expansions_skip_only_their_command() {
         let f = find("echo $HOME && vite").unwrap();
         assert_eq!(words(&f), ["vite"]);
+    }
+
+    #[test]
+    fn heredocs_are_unreadable() {
+        assert_eq!(find("cat > f <<'EOF'\nvite --port 1\nEOF"), None);
+        assert_eq!(find("cat <<-EOF\nvite\nEOF"), None);
+        assert_eq!(find("cat <<< vite"), None);
+    }
+
+    #[test]
+    fn comments_are_skipped() {
+        let all = find_commands("ls # x; vite\nnpm run dev # y", Path::new("/tmp")).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(words(&all[0]), ["ls"]);
+        assert_eq!(words(&all[1]), ["npm", "run", "dev"]);
+        // Not a comment inside a word or quotes.
+        let f = find("echo a#b '# c'").unwrap();
+        assert_eq!(words(&f), ["echo", "a#b", "# c"]);
     }
 
     #[test]

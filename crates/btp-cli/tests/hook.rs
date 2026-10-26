@@ -10,7 +10,7 @@ use btp_core::platform::{MacOs, Platform};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 fn sandbox(f: impl FnOnce(&mut Config)) -> (tempfile::TempDir, tempfile::TempDir) {
     let data = tempfile::tempdir().unwrap();
@@ -224,7 +224,9 @@ fn ask_mode_tells_to_ask() {
     let _h = Holder::bind(p);
     let o = hook(data.path(), &payload(&serve_cmd(p), cwd.path()), false);
     let r = reason_of(&o);
-    assert!(r.contains("Ask the user"), "{r}");
+    // The holder is not freeable: the normal advice, nothing more.
+    assert!(r.contains(&format!("or pass --port {}.", p + 1)), "{r}");
+    assert!(!r.contains("Ask the user"), "{r}");
 }
 
 #[test]
@@ -265,11 +267,61 @@ fn frees_dead_idle_holder() {
     let o = hook(data.path(), &payload(&serve_cmd(p), cwd.path()), false);
     assert!(o.status.success());
     assert_eq!(out(&o), "");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while h.0.try_wait().unwrap().is_none() {
-        assert!(Instant::now() < deadline, "the holder was not freed");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    // Freed synchronously: gone (reaped here) and the port bindable already.
+    assert!(
+        h.0.try_wait().unwrap().is_some(),
+        "the holder is still alive"
+    );
+    assert!(bindable(&[p]));
+}
+
+/// The port is taken by an observed holder that stays untouched, and the
+/// hook says nothing for `command`.
+fn silent_with_taken_port(command_for: impl Fn(u16) -> String) {
+    let (data, _e) = sandbox(|_| {});
+    let cwd = tempfile::tempdir().unwrap();
+    let p = free_port();
+    let mut h = Holder::bind(p);
+    let o = hook(data.path(), &payload(&command_for(p), cwd.path()), false);
+    assert!(o.status.success());
+    assert_eq!(out(&o), "");
+    assert!(h.0.try_wait().unwrap().is_none(), "the holder was touched");
+}
+
+#[test]
+fn heredoc_body_is_never_a_command() {
+    silent_with_taken_port(|p| format!("cat > f.sh <<'EOF'\n{}\nEOF", serve_cmd(p)));
+}
+
+#[test]
+fn comment_is_never_a_command() {
+    silent_with_taken_port(|p| format!("ls # x; {}", serve_cmd(p)));
+}
+
+#[test]
+fn quoted_dev_text_is_silent() {
+    silent_with_taken_port(|p| format!("echo \"{}\"", serve_cmd(p)));
+}
+
+#[test]
+fn heredoc_body_never_frees_a_holder() {
+    let (data, _e) = sandbox(|_| {});
+    let cwd = tempfile::tempdir().unwrap();
+    let p = free_port();
+    let mut h = Holder::bind(p);
+    let start_time = MacOs.proc_info(h.pid()).unwrap().start_time;
+    let state = serde_json::json!({"servers": [{
+        "key": {"pid": h.pid(), "start_time": start_time},
+        "port": p, "command": serve_cmd(p), "worktree": cwd.path(),
+        "session_id": "s1", "session_pid": 1, "session_proc_start": "x",
+        "session_name": "gone", "first_seen_ms": 1, "last_active_ms": 1,
+        "kept": false, "alerted": false,
+    }], "recent_kills": []});
+    std::fs::write(data.path().join("state.json"), state.to_string()).unwrap();
+    let cmd = format!("cat > f.sh <<'EOF'\n{}\nEOF", serve_cmd(p));
+    let o = hook(data.path(), &payload(&cmd, cwd.path()), false);
+    assert_eq!(out(&o), "");
+    assert!(h.0.try_wait().unwrap().is_none(), "the holder was killed");
 }
 
 #[test]
