@@ -378,7 +378,7 @@ fn file_name(p: &Path) -> String {
 }
 
 /// The app's name: its package.json `name`, else the folder's name.
-fn app_name(cwd: &Path) -> String {
+pub(crate) fn app_name(cwd: &Path) -> String {
     std::fs::read_to_string(cwd.join("package.json"))
         .ok()
         .and_then(|t| package_name(&t))

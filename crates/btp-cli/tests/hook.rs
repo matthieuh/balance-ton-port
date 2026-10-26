@@ -425,3 +425,82 @@ fn unknown_port_style_does_not_suggest_btp_run() {
     assert!(!r.contains("btp run"), "{r}");
     assert!(r.contains("Start it on a free port"), "{r}");
 }
+
+#[test]
+fn port_hint_skips_taken_ports() {
+    let (data, _e) = sandbox(|_| {});
+    let cwd = tempfile::tempdir().unwrap();
+    let p = free_port();
+    let _h = Holder::bind(p);
+    let _next = Holder::bind(p + 1);
+    let r = reason_of(&hook(
+        data.path(),
+        &payload(&serve_cmd(p), cwd.path()),
+        false,
+    ));
+    let hint: u16 = r
+        .rsplit("or pass --port ")
+        .next()
+        .and_then(|t| t.trim_end_matches('.').parse().ok())
+        .unwrap_or_else(|| panic!("no port hint: {r}"));
+    assert!(hint > p + 1, "{r}");
+    assert!(bindable(&[hint]), "{r}");
+}
+
+/// `serve.py` started in `cwd` on `port`, killed when dropped.
+struct Serving(Child);
+
+impl Serving {
+    fn start(cwd: &Path, port: u16) -> Serving {
+        let mut child = std::process::Command::new("python3")
+            .arg(helper())
+            .args(["--port", &port.to_string()])
+            .current_dir(cwd)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert!(
+            line.starts_with(&format!("serve.py listening on {port}")),
+            "{line}"
+        );
+        Serving(child)
+    }
+}
+
+impl Drop for Serving {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn points_at_the_copy_already_running_here() {
+    let (data, _e) = sandbox(|_| {});
+    let cwd = tempfile::tempdir().unwrap();
+    let running = free_port();
+    let _s = Serving::start(cwd.path(), running);
+    // The same command on another port: still the same server.
+    let p = free_port();
+    let o = hook(data.path(), &payload(&serve_cmd(p), cwd.path()), false);
+    assert!(o.status.success());
+    let r = reason_of(&o);
+    let name = cwd.path().file_name().unwrap().to_string_lossy();
+    assert!(
+        r.starts_with(&format!(
+            "{name} is already running on http://localhost:{running}. "
+        )),
+        "{r}"
+    );
+    // Another folder runs it fresh.
+    let other = tempfile::tempdir().unwrap();
+    let o = hook(data.path(), &payload(&serve_cmd(p), other.path()), false);
+    assert_eq!(out(&o), "");
+    // The shell wrapper reuses it on its own.
+    let o = hook(data.path(), &payload(&serve_cmd(p), cwd.path()), true);
+    assert_eq!(out(&o), "");
+}

@@ -4,11 +4,12 @@
 //! (silently) or denies it with a message for the agent. It never rewrites
 //! the command and never fails: any error or panic is a silent exit 0.
 
-use crate::run::holder_text;
+use crate::run::{app_name, holder_text};
 use crate::{new_watcher, now_ms};
 use btp_core::config::{data_dir, read_config};
-use btp_core::run::command::{recognize, PortStyle};
-use btp_core::run::conflict::{resolve, Resolution, RunFlags};
+use btp_core::run::command::{recognize, same_command_key, PortStyle};
+use btp_core::run::conflict::{next_free_port, resolve, Resolution, RunFlags};
+use std::cell::RefCell;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -60,6 +61,21 @@ fn decide(input: &str) -> Option<String> {
     }
     let mut w = new_watcher(dir);
     let now = now_ms();
+    let wrapped = std::env::var("BTP_SHELL_WRAP").as_deref() == Ok("1");
+    let cmd = shell_join(&found.argv);
+    // The same command already serves this folder: point the agent at it
+    // rather than start a second copy. The shell wrapper reuses it itself.
+    if !wrapped {
+        if let Some(key) = same_command_key(&found.argv, &found.cwd) {
+            if let Ok(Some(v)) = w.find_reusable(&found.cwd, &key, now) {
+                let name = app_name(&found.cwd);
+                return Some(format!(
+                    "{name} is already running on http://localhost:{}. Use it instead of starting another copy (`btp run -- {cmd}` reuses it).",
+                    v.port
+                ));
+            }
+        }
+    }
     // A port btp cannot read: nothing to check.
     let port = dev.port?;
     let holder = w.port_holder(port, now).ok()??;
@@ -77,12 +93,20 @@ fn decide(input: &str) -> Option<String> {
         }
     }
     // The shell wrapper reroutes the command itself.
-    if std::env::var("BTP_SHELL_WRAP").as_deref() == Ok("1") {
+    if wrapped {
         return None;
     }
     let who = holder_text(&holder);
-    let next = port.saturating_add(1);
-    let cmd = shell_join(&found.argv);
+    // The port `btp run` would pick: the first free one above, not just +1.
+    let next = {
+        let cell = RefCell::new(&mut w);
+        let taken = |p: u16| {
+            cell.borrow_mut()
+                .port_holder(p, now)
+                .map_or(true, |h| h.is_some())
+        };
+        next_free_port(port, &taken).unwrap_or_else(|| port.saturating_add(1))
+    };
     let mut advice = match dev.style {
         Some(PortStyle::LongFlag) => {
             format!("Rerun as `btp run -- {cmd}` to get a free port, or pass --port {next}.")
