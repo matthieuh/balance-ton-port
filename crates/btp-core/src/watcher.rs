@@ -21,10 +21,11 @@ use crate::probe::{PageMeta, ProbeCache, ProbeOutcome};
 use crate::restart::{
     pending_for, pending_holds, plan_restart, relinked, CommandSpawner, InFlight, InFlightGuard,
     PendingRestart, RestartBlocked, RestartCheck, RestartJob, RestartTarget, Spawner,
+    RESTART_PENDING_MAX_MS,
 };
 use crate::session_end::session_ended_open;
 use crate::sessions::default_config_dirs;
-use crate::state::{append_kill_log, with_state, KillRecord, State};
+use crate::state::{append_kill_log, with_state, KillRecord, PendingRun, State};
 use crate::worktree::{worktree_root, MetaCache};
 use fs4::{FileExt, TryLockError};
 use std::collections::{HashMap, HashSet};
@@ -132,27 +133,87 @@ pub(crate) fn is_excluded(command: &str, cfg: &Config) -> bool {
         .any(|e| !e.is_empty() && command.contains(&e))
 }
 
+/// The live session that `chain` (a process's ancestry, `chain[0]` being
+/// the process itself) leads to, and how many processes of `chain` from
+/// the start lie below it (the process itself included).
+///
+/// The nearest ancestor that matches a live session by pid and start time
+/// wins. Failing that, the nearest ancestor that is a registered `btp run`
+/// process (pid and start time) whose recorded session is live (pid and
+/// start time) stands for that session, the `btp run` process counted
+/// below it: a `btp run` reparented to launchd still leads there.
+///
+/// `None` when neither matches, or when a process below the session is an
+/// agent CLI (a Codex `exec` or launcher excepted) or matches an excluded
+/// command.
+fn session_of<'a>(
+    chain: &[ProcInfo],
+    sessions: &'a [AgentSession],
+    runs: &[PendingRun],
+    cfg: &Config,
+) -> Option<(usize, &'a AgentSession)> {
+    // Processes that stop a link: another agent CLI (a nested `codex exec`
+    // and a launcher stay with the outer session) or an excluded command.
+    let blocks = |p: &ProcInfo| {
+        let agent = match (is_agent_cli(&p.command), classify_codex(&p.command)) {
+            (Some(_), Some(CodexRole::NonInteractive | CodexRole::Wrapper)) => false,
+            (agent, _) => agent.is_some(),
+        };
+        agent || is_excluded(&p.command, cfg)
+    };
+    let ancestors = || chain.iter().enumerate().skip(1);
+    let (below, session) = ancestors()
+        .find_map(|(i, p)| {
+            let started = format_proc_start(p.start_time);
+            sessions
+                .iter()
+                .find(|s| s.pid == p.pid && s.proc_start == started)
+                .map(|s| (i, s))
+        })
+        .or_else(|| {
+            ancestors().find_map(|(i, p)| {
+                runs.iter()
+                    .filter(|r| r.run_pid == p.pid && r.run_start == p.start_time)
+                    .find_map(|r| {
+                        sessions.iter().find(|s| {
+                            s.pid == r.session_pid && s.proc_start == r.session_proc_start
+                        })
+                    })
+                    .map(|s| (i + 1, s))
+            })
+        })?;
+    if chain[..below].iter().any(blocks) {
+        return None;
+    }
+    Some((below, session))
+}
+
 /// Links a new listener to the live agent session it belongs to.
 ///
 /// `chain` is the listener's ancestry (`chain[0]` is the listener's own
 /// process). The session is the nearest ancestor that matches a live session
 /// by pid and by start time, so a stale session file whose pid now belongs
-/// to another process never links. A Codex session picks the conversation
-/// named by `CODEX_THREAD_ID` (read through `envs`, from the listener or the
-/// nearest ancestor below the session) when that session holds it.
+/// to another process never links. When none does, an ancestor that is a
+/// registered `btp run` process (`runs`, matched by pid and start time)
+/// links to the session it recorded, if that session is still live. A Codex
+/// session picks the conversation named by `CODEX_THREAD_ID` (read through
+/// `envs`, from the listener or the nearest ancestor below the session) when
+/// that session holds it.
 ///
-/// `None` when no ancestor is a live session (a server reparented to
-/// launchd is never linked, whatever its environment), when the listener is
-/// a session or an agent CLI itself, when a process between it and the
-/// session is an agent CLI (a Codex `exec` or launcher excepted) or matches
-/// an excluded command, when the port is excluded, or when the server's
-/// working directory cannot be read. The environment is read only once a
-/// Codex session matched.
+/// `None` when no ancestor is a live session or a `btp run` of one (a
+/// server reparented to launchd is never linked, whatever its environment),
+/// when the listener is a session or an agent CLI itself, when a process
+/// between it and the session (or the `btp run`, that one included) is an
+/// agent CLI (a Codex `exec` or launcher excepted) or matches an excluded
+/// command, when the port is excluded, or when the server's working
+/// directory cannot be read. The environment is read only once a Codex
+/// session matched.
 pub fn link(
     listener: &Listener,
     chain: &[ProcInfo],
     envs: &dyn Fn(i32) -> Option<Vec<(String, String)>>,
     sessions: &[AgentSession],
+    runs: &[PendingRun],
     cfg: &Config,
     now_ms: u64,
 ) -> Option<TrackedServer> {
@@ -163,42 +224,17 @@ pub fn link(
     {
         return None;
     }
-    // Processes that stop a link: another agent CLI (a nested `codex exec`
-    // and a launcher stay with the outer session) or an excluded command.
-    let blocks = |p: &ProcInfo| {
-        let agent = match (is_agent_cli(&p.command), classify_codex(&p.command)) {
-            (Some(_), Some(CodexRole::NonInteractive | CodexRole::Wrapper)) => false,
-            (agent, _) => agent.is_some(),
-        };
-        agent || is_excluded(&p.command, cfg)
-    };
-    // The thread id of the nearest process of `chain[..end]` that has one.
-    let thread = |end: usize| {
-        chain[..end]
-            .iter()
-            .find_map(|p| envs(p.pid).and_then(|e| env_thread(&e)))
-    };
-    let matched = chain.iter().enumerate().skip(1).find_map(|(i, p)| {
-        let started = format_proc_start(p.start_time);
-        sessions
-            .iter()
-            .find(|s| s.pid == p.pid && s.proc_start == started)
-            .map(|s| (i, s))
-    });
-    let (session, conversation) = match matched {
-        Some((depth, session)) => {
-            if chain[..depth].iter().any(blocks) {
-                return None;
-            }
-            let conversation = (session.agent == AgentKind::Codex)
-                .then(|| thread(depth))
-                .flatten()
-                .filter(|t| holds_thread(session, t))
-                .unwrap_or_else(|| session.conversation_id.clone());
-            (session, conversation)
-        }
-        None => return None,
-    };
+    let (below, session) = session_of(chain, sessions, runs, cfg)?;
+    // The thread id of the nearest process below the session that has one.
+    let conversation = (session.agent == AgentKind::Codex)
+        .then(|| {
+            chain[..below]
+                .iter()
+                .find_map(|p| envs(p.pid).and_then(|e| env_thread(&e)))
+        })
+        .flatten()
+        .filter(|t| holds_thread(session, t))
+        .unwrap_or_else(|| session.conversation_id.clone());
     let cwd = server.cwd.as_deref()?;
     Some(TrackedServer {
         key: ServerKey {
@@ -1027,6 +1063,36 @@ impl<P: Platform> Watcher<P> {
         }
     }
 
+    /// Records that the `btp run` process `run_pid` descends from a live
+    /// session, so a server started through it links to that session even
+    /// once `btp run` is reparented (`link`). The session is found by the
+    /// same ancestry match as `link` (an exclusion or an agent CLI between
+    /// blocks it), under the state lock; a record for the same process is
+    /// replaced. `None` when the process is outside any live session or gone.
+    pub fn register_run(&mut self, run_pid: i32, now_ms: u64) -> io::Result<Option<PendingRun>> {
+        let scan = self.scan();
+        let sessions = scan.sessions();
+        let chain = ancestry(&self.platform, run_pid);
+        let Some(run) = chain.first().filter(|p| p.pid == run_pid) else {
+            return Ok(None);
+        };
+        with_state(&self.data_dir, |state| {
+            let (_, session) = session_of(&chain, &sessions, &state.pending_runs, &scan.cfg)?;
+            let record = PendingRun {
+                run_pid,
+                run_start: run.start_time,
+                session_pid: session.pid,
+                session_proc_start: session.proc_start.clone(),
+                at_ms: now_ms,
+            };
+            state
+                .pending_runs
+                .retain(|r| (r.run_pid, r.run_start) != (run_pid, run.start_time));
+            state.pending_runs.push(record.clone());
+            Some(record)
+        })
+    }
+
     /// Records that the alert for this exact server was delivered (the app
     /// calls it once the notification is posted): no more alerts until it
     /// restarts. A pass never marks alerts itself.
@@ -1154,7 +1220,9 @@ impl<P: Platform> Watcher<P> {
     ///   server's row (an observed server's restart links to nothing), then
     ///   drops pending restarts whose process is gone or that are a day old;
     /// - links new listeners, except those inside a tracked server's tree
-    ///   (a server is a process tree: its children's ports are its ports);
+    ///   (a server is a process tree: its children's ports are its ports),
+    ///   then drops pending runs whose process is gone (unless a server was
+    ///   just linked through it) or that are a day old;
     /// - folds a tracked server into a tracked ancestor (a child that started
     ///   listening before its parent did), on every pass.
     fn refresh(
@@ -1166,6 +1234,9 @@ impl<P: Platform> Watcher<P> {
     ) -> Vec<Tree> {
         state.servers.retain(|s| !s.session_proc_start.is_empty());
         let sessions = scan.sessions();
+        // The runs a server was linked through this pass, kept even if
+        // their process quit meanwhile.
+        let mut linked_runs: HashSet<(i32, u64)> = HashSet::new();
         for l in listeners {
             // A tracked pid (same process, or a reused pid that this pass
             // forgets) is not linked again; extra ports of one process too.
@@ -1189,6 +1260,7 @@ impl<P: Platform> Watcher<P> {
                 &chain,
                 &|pid| self.platform.proc_env(pid),
                 &sessions,
+                &state.pending_runs,
                 &scan.cfg,
                 now_ms,
             ) else {
@@ -1197,6 +1269,17 @@ impl<P: Platform> Watcher<P> {
             if owner_in_chain(&chain, new.session_pid, &state.servers).is_some() {
                 continue;
             }
+            linked_runs.extend(
+                state
+                    .pending_runs
+                    .iter()
+                    .filter(|r| {
+                        chain
+                            .iter()
+                            .any(|p| p.pid == r.run_pid && p.start_time == r.run_start)
+                    })
+                    .map(|r| (r.run_pid, r.run_start)),
+            );
             state.servers.push(new);
         }
         // After the linking: a process that only starts listening now still
@@ -1204,6 +1287,11 @@ impl<P: Platform> Watcher<P> {
         state
             .pending_restarts
             .retain(|r| pending_holds(&self.platform, r, now_ms));
+        state.pending_runs.retain(|r| {
+            now_ms.saturating_sub(r.at_ms) < RESTART_PENDING_MAX_MS
+                && (same_process(&self.platform, r.run_pid, r.run_start)
+                    || linked_runs.contains(&(r.run_pid, r.run_start)))
+        });
         // Every pass, not only when something new links: a state written
         // before servers were trees may still hold a separate child row.
         self.fold(state);
@@ -1957,7 +2045,10 @@ mod tests {
             pid: 310,
             port: 5174,
         };
-        assert_eq!(link(&l, &chain, &envs, &sessions(&f), &f.cfg(), T0), None);
+        assert_eq!(
+            link(&l, &chain, &envs, &sessions(&f), &[], &f.cfg(), T0),
+            None
+        );
         assert_eq!(calls.get(), 0);
     }
 
@@ -1999,7 +2090,7 @@ mod tests {
         };
         let mut live = sessions(&f);
         live.push(codex_session(&f));
-        assert_eq!(link(&l, &chain, &envs, &live, &f.cfg(), T0), None);
+        assert_eq!(link(&l, &chain, &envs, &live, &[], &f.cfg(), T0), None);
         assert_eq!(calls.get(), 0);
     }
 
@@ -2197,6 +2288,7 @@ mod tests {
             &chain,
             &|_| None,
             &sessions(f),
+            &[],
             &f.cfg(),
             T0,
         )
@@ -2319,7 +2411,7 @@ mod tests {
             port: 9999,
         };
         assert_eq!(
-            link(&l, &chain, &|_| None, &sessions(&f), &f.cfg(), T0),
+            link(&l, &chain, &|_| None, &sessions(&f), &[], &f.cfg(), T0),
             None
         );
 
@@ -4265,5 +4357,231 @@ mod tests {
                 file.display()
             );
         }
+    }
+
+    /// `btp run` (60) started by claude(20) in `<wt>/apps/web`, registered,
+    /// then reparented to launchd (60 started with `&`, its session gone
+    /// from its ancestry).
+    fn reparented_run(f: &mut Fx) -> PendingRun {
+        let web = f.wt.join("apps/web");
+        let web = web.to_str().unwrap();
+        f.p()
+            .spawn(60, 20, START + 60 * SEC, "btp run npm run dev", web);
+        let run = f.w.register_run(60, T0).unwrap().expect("registered");
+        f.p()
+            .spawn(60, 1, START + 60 * SEC, "btp run npm run dev", web);
+        run
+    }
+
+    fn state_runs(f: &Fx) -> Vec<PendingRun> {
+        with_state(f.data.path(), |s| s.pending_runs.clone()).unwrap()
+    }
+
+    fn link_with_runs(f: &Fx, pid: i32, port: u16, live: &[AgentSession]) -> Option<TrackedServer> {
+        let chain = ancestry(f.p(), pid);
+        link(
+            &Listener { pid, port },
+            &chain,
+            &|_| None,
+            live,
+            &state_runs(f),
+            &f.cfg(),
+            T0,
+        )
+    }
+
+    #[test]
+    fn links_reparented_child_through_run() {
+        let mut f = fx();
+        let run = reparented_run(&mut f);
+        assert_eq!(
+            run,
+            PendingRun {
+                run_pid: 60,
+                run_start: START + 60 * SEC,
+                session_pid: 20,
+                session_proc_start: format_proc_start(START + 20 * SEC),
+                at_ms: T0,
+            }
+        );
+        assert_eq!(state_runs(&f), vec![run]);
+        let web = f.wt.join("apps/web");
+        f.p()
+            .spawn(61, 60, START + 61 * SEC, "node vite", web.to_str().unwrap());
+        f.p().add_listener(61, 5173);
+        let s = link_with_runs(&f, 61, 5173, &sessions(&f)).expect("linked through the run");
+        assert_eq!((s.session_pid, s.session_id.as_str()), (20, "sess-a"));
+        assert_eq!(s.session_proc_start, format_proc_start(START + 20 * SEC));
+        assert_eq!(s.worktree, f.wt);
+        // Without the run record, the reparented listener stays unlinked.
+        let chain = ancestry(f.p(), 61);
+        let l = Listener {
+            pid: 61,
+            port: 5173,
+        };
+        assert_eq!(
+            link(&l, &chain, &|_| None, &sessions(&f), &[], &f.cfg(), T0),
+            None
+        );
+        // And a pass tracks it.
+        f.w.tick(T0).unwrap();
+        let s = server_of(&f, 61).expect("tracked");
+        assert_eq!(s.session_pid, 20);
+    }
+
+    #[test]
+    fn run_never_reads_the_environment() {
+        let mut f = fx();
+        reparented_run(&mut f);
+        let web = f.wt.join("apps/web");
+        f.p()
+            .spawn(61, 60, START + 61 * SEC, "node vite", web.to_str().unwrap());
+        let chain = ancestry(f.p(), 61);
+        let calls = std::cell::Cell::new(0);
+        let envs = |_: i32| {
+            calls.set(calls.get() + 1);
+            None
+        };
+        let l = Listener {
+            pid: 61,
+            port: 5173,
+        };
+        let s = link(
+            &l,
+            &chain,
+            &envs,
+            &sessions(&f),
+            &state_runs(&f),
+            &f.cfg(),
+            T0,
+        );
+        assert_eq!(s.map(|s| s.session_pid), Some(20));
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn no_link_when_run_session_dead() {
+        let mut f = fx();
+        reparented_run(&mut f);
+        let web = f.wt.join("apps/web");
+        f.p()
+            .spawn(61, 60, START + 61 * SEC, "node vite", web.to_str().unwrap());
+        f.p().add_listener(61, 5173);
+        assert_eq!(link_with_runs(&f, 61, 5173, &[]), None);
+        // A session file whose pid is now another process does not match.
+        let mut stale = sessions(&f);
+        stale[0].proc_start = format_proc_start(START + 7 * SEC);
+        assert_eq!(link_with_runs(&f, 61, 5173, &stale), None);
+        f.p().remove_proc(20);
+        f.w.tick(T0).unwrap();
+        assert_eq!(server_of(&f, 61), None);
+    }
+
+    #[test]
+    fn run_does_not_bypass_exclusion() {
+        let mut f = fx();
+        reparented_run(&mut f);
+        let web = f.wt.join("apps/web");
+        let web = web.to_str().unwrap();
+        f.p().spawn(61, 60, START + 61 * SEC, "storybook dev", web);
+        f.p().spawn(62, 61, START + 62 * SEC, "node vite", web);
+        f.p().add_listener(62, 6006);
+        assert!(link_with_runs(&f, 62, 6006, &sessions(&f)).is_some());
+        let mut c = f.cfg();
+        c.exclude_commands.push("storybook".into());
+        save_config(f.data.path(), &c).unwrap();
+        assert_eq!(link_with_runs(&f, 62, 6006, &sessions(&f)), None);
+        // Nor an excluded port, nor an agent CLI between.
+        let mut c = f.cfg();
+        c.exclude_commands.clear();
+        c.exclude_ports.push(6006);
+        save_config(f.data.path(), &c).unwrap();
+        assert_eq!(link_with_runs(&f, 62, 6006, &sessions(&f)), None);
+        let mut c = f.cfg();
+        c.exclude_ports.clear();
+        save_config(f.data.path(), &c).unwrap();
+        f.p().spawn(61, 60, START + 61 * SEC, "claude", web);
+        assert_eq!(link_with_runs(&f, 62, 6006, &sessions(&f)), None);
+        // Back to a plain process between, it links again.
+        f.p().spawn(61, 60, START + 61 * SEC, "zsh", web);
+        assert!(link_with_runs(&f, 62, 6006, &sessions(&f)).is_some());
+    }
+
+    #[test]
+    fn live_session_ancestor_wins_over_a_run() {
+        let mut f = fx();
+        let web = f.wt.join("apps/web");
+        let web = web.to_str().unwrap();
+        // claude(50, "sess-b") under the reparented run: its own session.
+        reparented_run(&mut f);
+        f.p().spawn(50, 60, START + 50 * SEC, "claude", web);
+        f.session(50, "sess-b", &f.wt, START + 50 * SEC);
+        f.p().spawn(51, 50, START + 51 * SEC, "node vite", web);
+        let s = link_with_runs(&f, 51, 5173, &sessions(&f)).expect("linked");
+        assert_eq!((s.session_pid, s.session_id.as_str()), (50, "sess-b"));
+    }
+
+    #[test]
+    fn register_run_outside_session_is_none() {
+        let mut f = fx();
+        f.p()
+            .spawn(70, 10, START + 70 * SEC, "btp run vite", "/tmp");
+        assert_eq!(f.w.register_run(70, T0).unwrap(), None);
+        // A process that does not exist either.
+        assert_eq!(f.w.register_run(71, T0).unwrap(), None);
+        assert!(state_runs(&f).is_empty());
+    }
+
+    #[test]
+    fn register_run_is_blocked_like_a_link() {
+        let mut f = fx();
+        let mut c = f.cfg();
+        c.exclude_commands.push("storybook".into());
+        save_config(f.data.path(), &c).unwrap();
+        f.p()
+            .spawn(65, 20, START + 65 * SEC, "storybook dev", "/tmp");
+        f.p()
+            .spawn(66, 65, START + 66 * SEC, "btp run vite", "/tmp");
+        assert_eq!(f.w.register_run(66, T0).unwrap(), None);
+        assert!(state_runs(&f).is_empty());
+    }
+
+    #[test]
+    fn register_run_twice_keeps_one_record() {
+        let mut f = fx();
+        f.p()
+            .spawn(60, 20, START + 60 * SEC, "btp run vite", "/tmp");
+        f.w.register_run(60, T0).unwrap().expect("registered");
+        f.w.register_run(60, T0 + 5).unwrap().expect("registered");
+        let runs = state_runs(&f);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].at_ms, T0 + 5);
+    }
+
+    #[test]
+    fn pending_run_dropped_once_gone_or_a_day_old() {
+        let mut f = fx();
+        reparented_run(&mut f);
+        f.w.tick(T0 + MIN).unwrap();
+        assert_eq!(state_runs(&f).len(), 1, "kept while its process lives");
+        f.w.tick(T0 + crate::restart::RESTART_PENDING_MAX_MS)
+            .unwrap();
+        assert!(state_runs(&f).is_empty(), "dropped after a day");
+
+        let mut f = fx();
+        reparented_run(&mut f);
+        f.p().remove_proc(60);
+        f.w.tick(T0 + MIN).unwrap();
+        assert!(
+            state_runs(&f).is_empty(),
+            "dropped once its process is gone"
+        );
+
+        // A reused pid is not the run.
+        let mut f = fx();
+        reparented_run(&mut f);
+        f.p().spawn(60, 1, START + 99 * SEC, "other", "/tmp");
+        f.w.tick(T0 + MIN).unwrap();
+        assert!(state_runs(&f).is_empty());
     }
 }

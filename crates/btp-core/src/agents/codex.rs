@@ -523,7 +523,7 @@ mod tests {
             };
             let chain = ancestry(&p, 301);
             let server =
-                crate::watcher::link(&listener, &chain, &|_| None, &s, &Config::default(), 0)
+                crate::watcher::link(&listener, &chain, &|_| None, &s, &[], &Config::default(), 0)
                     .expect("linked");
             assert_eq!(server.agent, AgentKind::Codex);
         }
