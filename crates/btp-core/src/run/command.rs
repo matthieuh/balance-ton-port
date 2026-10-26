@@ -61,60 +61,77 @@ struct Entry {
     framework: &'static str,
     default_port: u16,
     style: PortStyle,
+    /// Subcommands that serve; `""` stands for none given.
+    serving: &'static [&'static str],
+    /// A flag that makes the command serve, for tools with no subcommand.
+    serving_flag: Option<&'static str>,
+}
+
+const fn entry(
+    framework: &'static str,
+    default_port: u16,
+    style: PortStyle,
+    serving: &'static [&'static str],
+) -> Entry {
+    Entry {
+        framework,
+        default_port,
+        style,
+        serving,
+        serving_flag: None,
+    }
 }
 
 const FRAMEWORKS: &[Entry] = &[
+    entry(
+        "Vite",
+        5173,
+        PortStyle::LongFlag,
+        &["", "dev", "serve", "preview"],
+    ),
+    entry("Next.js", 3000, PortStyle::ShortFlag, &["", "dev", "start"]),
+    entry("Astro", 4321, PortStyle::LongFlag, &["dev", "preview"]),
+    entry("Expo", 8081, PortStyle::LongFlag, &["start"]),
+    entry("wrangler", 8787, PortStyle::LongFlag, &["dev"]),
+    entry(
+        "SvelteKit",
+        5173,
+        PortStyle::LongFlag,
+        &["", "dev", "preview"],
+    ),
+    entry("Remix", 3000, PortStyle::LongFlag, &["dev", "vite:dev"]),
+    entry("Nuxt", 3000, PortStyle::LongFlag, &["dev", "preview"]),
     Entry {
-        framework: "Vite",
-        default_port: 5173,
-        style: PortStyle::LongFlag,
+        serving_flag: Some("--serve"),
+        ..entry("Eleventy", 8080, PortStyle::LongFlag, &[""])
     },
-    Entry {
-        framework: "Next.js",
-        default_port: 3000,
-        style: PortStyle::ShortFlag,
-    },
-    Entry {
-        framework: "Astro",
-        default_port: 4321,
-        style: PortStyle::LongFlag,
-    },
-    Entry {
-        framework: "Expo",
-        default_port: 8081,
-        style: PortStyle::LongFlag,
-    },
-    Entry {
-        framework: "wrangler",
-        default_port: 8787,
-        style: PortStyle::LongFlag,
-    },
-    Entry {
-        framework: "SvelteKit",
-        default_port: 5173,
-        style: PortStyle::LongFlag,
-    },
-    Entry {
-        framework: "Remix",
-        default_port: 3000,
-        style: PortStyle::LongFlag,
-    },
-    Entry {
-        framework: "Nuxt",
-        default_port: 3000,
-        style: PortStyle::LongFlag,
-    },
-    Entry {
-        framework: "Eleventy",
-        default_port: 8080,
-        style: PortStyle::LongFlag,
-    },
-    Entry {
-        framework: "Storybook",
-        default_port: 6006,
-        style: PortStyle::LongFlag,
-    },
+    entry("Storybook", 6006, PortStyle::LongFlag, &["", "dev"]),
 ];
+
+/// Whether the resolved command serves: its subcommand (the first word after
+/// the program) is one the framework serves with. `remix-serve <build>` has
+/// no subcommand and always serves.
+fn serves(entry: &Entry, tokens: &[String]) -> bool {
+    if tokens
+        .iter()
+        .any(|t| ENV_PROGRAMS.contains(&program(t).as_str()))
+    {
+        return true;
+    }
+    let prog = tokens.iter().position(|t| {
+        labels::framework(t, None).is_some_and(|f| f == entry.framework)
+            || extra_framework(std::slice::from_ref(t)).is_some_and(|f| f == entry.framework)
+    });
+    let rest = strip_ports(&tokens[prog.map_or(0, |i| i + 1)..]);
+    if let Some(flag) = entry.serving_flag {
+        return rest.iter().any(|w| w == flag);
+    }
+    let sub = rest
+        .iter()
+        .find(|w| !w.starts_with('-'))
+        .map_or("", |w| w.as_str());
+    entry.serving.contains(&sub)
+}
 
 /// Programs `labels::framework` does not know, by program name.
 const EXTRA_PROGRAMS: &[(&str, &str)] = &[("eleventy", "Eleventy"), ("11ty", "Eleventy")];
@@ -201,6 +218,9 @@ fn analyze(
     let text = r.tokens.join(" ");
     let framework = labels::framework(&text, None).or_else(|| extra_framework(&r.tokens))?;
     let entry = FRAMEWORKS.iter().find(|e| e.framework == framework)?;
+    if !serves(entry, &r.tokens) {
+        return None;
+    }
 
     let argv_port = last_port(&r.extra).or_else(|| {
         // Direct launches carry the port in the program words themselves.
@@ -490,6 +510,33 @@ mod tests {
             Some(PortStyle::ShortFlag)
         );
         assert_eq!(rec(&["npx", "vite"]).unwrap().launcher, Launcher::Direct);
+    }
+
+    #[test]
+    fn non_serving_subcommands_are_none() {
+        for a in [
+            &["next", "build"][..],
+            &["vite", "build"],
+            &["wrangler", "deploy"],
+            &["astro", "build"],
+            &["storybook", "build"],
+            &["expo", "install"],
+            &["eleventy"],
+        ] {
+            assert!(rec(a).is_none(), "{a:?}");
+        }
+        for a in [
+            &["next", "start"][..],
+            &["vite", "preview"],
+            &["storybook", "dev"],
+            &["astro", "preview"],
+        ] {
+            assert!(rec(a).is_some(), "{a:?}");
+        }
+        // The subcommand also counts when it comes from a script.
+        let d = dir_with_scripts(r#"{"build":"next build","dev":"next dev"}"#);
+        assert!(recognize(&v(&["npm", "run", "build"]), d.path(), None).is_none());
+        assert!(recognize(&v(&["npm", "run", "dev"]), d.path(), None).is_some());
     }
 
     #[test]
