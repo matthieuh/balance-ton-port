@@ -9,6 +9,7 @@ pub mod observed;
 pub mod platform;
 pub mod probe;
 pub mod restart;
+pub mod run;
 pub mod session_end;
 pub mod sessions;
 pub mod state;
