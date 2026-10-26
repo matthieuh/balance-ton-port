@@ -64,7 +64,7 @@ btp run -- npm run dev     # checks the port, reuses or reroutes, keeps the outp
 btp logs 3000 --errors     # the server's errors, when the page is blank
 ```
 
-`btp run` starts a dev server after settling its port: it reuses a server already running the same command in the folder, frees the port only when its holder is an idle server of an ended session (`port_conflict = "free_idle"`, the default), or picks another port. It prints the address as a `btp:` line on stderr and keeps the output for 24 hours after the server stops (`btp logs`, mode 0600, never sent anywhere). Commands it does not recognise run untouched. The plugin's hook applies the same port check before Claude Code starts a server (`port_check_hook`). To wrap `npm run dev` and friends typed in a terminal, add `eval "$(btp shell-init zsh)"` to your rc file (opt-in; btp never edits it). See [docs/design.md](docs/design.md), section 14.
+`btp run` starts a dev server after settling its port: it reuses a server already running the same command in the folder, frees the port only when its holder is an idle server of an ended session (`port_conflict = "free_idle"`, the default), or picks another port. It prints the address as a `btp:` line on stderr and keeps the output until 24 hours after the server stopped (`btp logs`, mode 0600, never sent anywhere). Commands it does not recognise run untouched. The plugin's hook applies the same port check before Claude Code starts a server (`port_check_hook`). To wrap `npm run dev` and friends typed in a terminal, add `eval "$(btp shell-init zsh)"` to your rc file (opt-in; btp never edits it). See [docs/design.md](docs/design.md), section 14.
 
 ## Install
 
