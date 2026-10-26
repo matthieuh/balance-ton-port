@@ -5,6 +5,7 @@
 mod hook;
 mod logs;
 mod run;
+mod shell_init;
 
 use btp_core::config::{data_dir, effective_claude_dirs, read_config, save_config};
 use btp_core::display::format_idle as ago;
@@ -86,6 +87,26 @@ enum Cmd {
     Run(run::RunArgs),
     /// Show the output of a server started through `btp run`
     Logs(logs::LogsArgs),
+    /// Print shell functions that run dev server commands through `btp run`.
+    /// Add `eval "$(btp shell-init zsh)"` to ~/.zshrc (or the bash line to
+    /// ~/.bashrc); btp never edits your rc files. `BTP_RUN=0` turns the
+    /// wrapping off for one command.
+    ShellInit {
+        /// zsh or bash
+        shell: String,
+    },
+    /// Exit 0 when the command starts a known dev server here, 1 otherwise
+    /// (internal)
+    #[command(name = "_is-dev", hide = true)]
+    IsDev {
+        #[arg(
+            required = true,
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "CMD"
+        )]
+        argv: Vec<String>,
+    },
     /// Claude Code hooks of the plugin (internal)
     #[command(hide = true)]
     Hook {
@@ -247,6 +268,22 @@ fn main() -> ExitCode {
 }
 
 fn run(cmd: Cmd) -> Result<u8, Failure> {
+    // Fast paths: no data dir, no state.
+    match &cmd {
+        Cmd::IsDev { argv } => return Ok(shell_init::is_dev(argv)),
+        Cmd::ShellInit { shell } => {
+            return match shell_init::snippet(shell) {
+                Some(text) => {
+                    print!("{text}");
+                    Ok(0)
+                }
+                None => Err(Failure::Internal(format!(
+                    "unknown shell {shell:?}, use zsh or bash"
+                ))),
+            };
+        }
+        _ => {}
+    }
     let dir = data_dir();
     match cmd {
         Cmd::List { json } => {
@@ -362,6 +399,7 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
         Cmd::Watch => watch(dir),
         Cmd::Run(a) => Ok(run::run(a)),
         Cmd::Logs(a) => logs::run(&dir, a),
+        Cmd::ShellInit { .. } | Cmd::IsDev { .. } => unreachable!("handled above"),
         Cmd::Hook {
             hook: HookCmd::PreBash,
         } => Ok(hook::pre_bash()),
