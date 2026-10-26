@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 pub const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 
 /// A dead server's log is kept this long after its last write.
-pub const LOG_KEEP_MS: u64 = 86_450_000;
+pub const LOG_KEEP_MS: u64 = 86_400_000;
 
 fn run_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("logs").join("run")
@@ -266,6 +266,24 @@ mod tests {
         assert!(!exists(dir.path(), key(2)), "dead and old");
         assert!(exists(dir.path(), key(3)), "dead but recent");
         assert!(run_dir(dir.path()).join("notes.txt").exists());
+    }
+
+    #[test]
+    fn keep_window_is_exactly_24h() {
+        assert_eq!(LOG_KEEP_MS, 24 * 3_600_000);
+        let dir = tempfile::tempdir().unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        for pid in [1, 2] {
+            RunLog::create(dir.path(), key(pid)).unwrap();
+        }
+        aged(&log_path(dir.path(), key(1)), LOG_KEEP_MS + 1_000, now);
+        aged(&log_path(dir.path(), key(2)), LOG_KEEP_MS - 60_000, now);
+        cleanup(dir.path(), &|_| false, now);
+        assert!(!exists(dir.path(), key(1)), "24 h + 1 s old");
+        assert!(exists(dir.path(), key(2)), "23 h 59 min old");
     }
 
     #[test]
