@@ -13,10 +13,12 @@ use libproc::proc_pid::{listpidinfo, pidinfo};
 use libproc::processes::{pids_by_type, ProcFilter};
 use std::collections::HashSet;
 use std::ffi::{CStr, OsStr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::os::raw::{c_char, c_int, c_void};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 /// macOS platform, backed by libproc.
 #[derive(Debug, Default, Clone, Copy)]
@@ -649,6 +651,18 @@ impl Platform for MacOs {
         exe(pid)
     }
 
+    fn port_answers(&self, port: u16) -> bool {
+        // A loopback connect is refused at once when nothing listens; the
+        // timeout only bounds a listener whose backlog is full.
+        let timeout = Duration::from_millis(200);
+        [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ]
+        .into_iter()
+        .any(|ip| TcpStream::connect_timeout(&SocketAddr::new(ip, port), timeout).is_ok())
+    }
+
     fn pids_named(&self, name: &str) -> Vec<i32> {
         // SAFETY: geteuid has no preconditions and cannot fail.
         let uid = unsafe { libc::geteuid() };
@@ -686,6 +700,15 @@ mod tests {
         }
         v.extend_from_slice(b"PATH=/bin\0SECRET_TOKEN=hunter2\0");
         v
+    }
+
+    #[test]
+    fn port_answers_a_loopback_listener() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        assert!(MacOs.port_answers(port));
+        drop(l);
+        assert!(!MacOs.port_answers(port));
     }
 
     #[test]

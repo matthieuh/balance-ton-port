@@ -3,6 +3,41 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+/// What happens when a new server wants a port that another server holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortConflict {
+    /// Free the port when its holder is idle, otherwise ask.
+    #[default]
+    FreeIdle,
+    /// Always ask before touching the holder.
+    Ask,
+    /// Never touch the holder: run the new server on another port.
+    Reroute,
+}
+
+impl PortConflict {
+    /// The values accepted by `Config::set`, in display order.
+    pub const NAMES: &'static str = "free_idle, ask, reroute";
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PortConflict::FreeIdle => "free_idle",
+            PortConflict::Ask => "ask",
+            PortConflict::Reroute => "reroute",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "free_idle" => Some(PortConflict::FreeIdle),
+            "ask" => Some(PortConflict::Ask),
+            "reroute" => Some(PortConflict::Reroute),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -22,6 +57,10 @@ pub struct Config {
     pub leak_memory_mb: u64,
     /// A server growing by more than this (MB) in 10 minutes leaks.
     pub leak_growth_mb: u64,
+    /// What to do when a new server wants a port another server holds.
+    pub port_conflict: PortConflict,
+    /// Whether the agent hook checks a port before a server command starts.
+    pub port_check_hook: bool,
 }
 
 impl Default for Config {
@@ -46,6 +85,8 @@ impl Default for Config {
             exclude_ports: Vec::new(),
             leak_memory_mb: 2048,
             leak_growth_mb: 500,
+            port_conflict: PortConflict::default(),
+            port_check_hook: true,
         }
     }
 }
@@ -208,6 +249,30 @@ impl Config {
     }
 
     pub fn set(&mut self, key: &str, value: &str) -> Result<(), String> {
+        match key {
+            "port_conflict" => {
+                self.port_conflict = PortConflict::parse(value).ok_or_else(|| {
+                    format!(
+                        "port_conflict expects one of {}, got {value:?}",
+                        PortConflict::NAMES
+                    )
+                })?;
+                return Ok(());
+            }
+            "port_check_hook" => {
+                self.port_check_hook = match value {
+                    "true" => true,
+                    "false" => false,
+                    _ => {
+                        return Err(format!(
+                            "port_check_hook expects one of true, false, got {value:?}"
+                        ))
+                    }
+                };
+                return Ok(());
+            }
+            _ => {}
+        }
         let min = minimum(key).ok_or_else(|| format!("unknown key: {key}"))?;
         let v = value
             .parse::<u64>()
@@ -451,6 +516,51 @@ mod tests {
             ..Config::default()
         };
         save_config(d.path(), &c).unwrap();
+        assert_eq!(read_config(d.path()).unwrap(), c);
+    }
+
+    #[test]
+    fn port_conflict_defaults() {
+        let c = Config::default();
+        assert_eq!(c.port_conflict, PortConflict::FreeIdle);
+        assert!(c.port_check_hook);
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("config.toml"), "alert_after_s = 60\n").unwrap();
+        let c = read_config(d.path()).unwrap();
+        assert_eq!(c.port_conflict, PortConflict::FreeIdle);
+        assert!(c.port_check_hook);
+    }
+
+    #[test]
+    fn set_port_conflict() {
+        let mut c = Config::default();
+        c.set("port_conflict", "ask").unwrap();
+        assert_eq!(c.port_conflict, PortConflict::Ask);
+        c.set("port_conflict", "reroute").unwrap();
+        assert_eq!(c.port_conflict, PortConflict::Reroute);
+        c.set("port_conflict", "free_idle").unwrap();
+        assert_eq!(c.port_conflict, PortConflict::FreeIdle);
+        let e = c.set("port_conflict", "kill").unwrap_err();
+        assert!(e.contains("free_idle, ask, reroute"), "{e}");
+        c.set("port_check_hook", "false").unwrap();
+        assert!(!c.port_check_hook);
+        c.set("port_check_hook", "true").unwrap();
+        assert!(c.port_check_hook);
+        let e = c.set("port_check_hook", "maybe").unwrap_err();
+        assert!(e.contains("true, false"), "{e}");
+    }
+
+    #[test]
+    fn port_settings_roundtrip_through_the_file() {
+        let d = tempfile::tempdir().unwrap();
+        let c = Config {
+            port_conflict: PortConflict::Reroute,
+            port_check_hook: false,
+            ..Config::default()
+        };
+        save_config(d.path(), &c).unwrap();
+        let text = std::fs::read_to_string(d.path().join(CONFIG_FILE)).unwrap();
+        assert!(text.contains("port_conflict = \"reroute\""), "{text}");
         assert_eq!(read_config(d.path()).unwrap(), c);
     }
 }

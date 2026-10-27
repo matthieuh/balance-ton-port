@@ -46,6 +46,25 @@ fn config_set_then_get() {
 }
 
 #[test]
+fn config_set_port_conflict_then_get() {
+    let (data, _e) = sandbox();
+    btp(&data)
+        .args(["config", "set", "port_conflict", "ask"])
+        .assert()
+        .success();
+    let out = btp(&data).args(["config", "get"]).assert().success();
+    let text = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(text.contains("port_conflict = \"ask\""), "{text}");
+    assert!(text.contains("port_check_hook = true"), "{text}");
+    let out = btp(&data)
+        .args(["config", "set", "port_conflict", "kill"])
+        .assert()
+        .code(1);
+    let err = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(err.contains("free_idle, ask, reroute"), "{err}");
+}
+
+#[test]
 fn config_set_unknown_key_fails() {
     let (data, _e) = sandbox();
     btp(&data)
@@ -290,4 +309,345 @@ fn note_refuses_when_data_dir_not_writable() {
         err.contains("btp: data dir is read-only here; run btp outside the sandbox"),
         "{err}"
     );
+}
+
+// ---- btp shell-init ----
+
+fn shell_init_text(data: &tempfile::TempDir, shell: &str) -> String {
+    let out = btp_isolated(data)
+        .args(["shell-init", shell])
+        .assert()
+        .success();
+    String::from_utf8(out.get_output().stdout.clone()).unwrap()
+}
+
+fn have(shell: &str) -> bool {
+    std::process::Command::new(shell)
+        .arg("-c")
+        .arg("true")
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn parses(shell: &str, text: &str) {
+    if !have(shell) {
+        return;
+    }
+    let out = std::process::Command::new(shell)
+        .arg("-n")
+        .arg("-c")
+        .arg(text)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{shell} -n: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn shell_init_zsh_parses() {
+    let (data, _e) = sandbox();
+    let text = shell_init_text(&data, "zsh");
+    assert!(text.contains("export BTP_SHELL_WRAP=1"), "{text}");
+    for name in ["npm", "pnpm", "yarn", "bun", "npx", "next", "vite", "astro"] {
+        assert!(
+            text.contains(&format!("function {name} {{")),
+            "{name}: {text}"
+        );
+    }
+    assert!(!text.contains("eval"), "the hint stays out of the output");
+    parses("zsh", &text);
+}
+
+#[test]
+fn shell_init_bash_parses() {
+    let (data, _e) = sandbox();
+    parses("bash", &shell_init_text(&data, "bash"));
+}
+
+#[test]
+fn shell_init_unknown_shell_exits_2() {
+    let (data, _e) = sandbox();
+    btp_isolated(&data)
+        .args(["shell-init", "fish"])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn shell_init_help_has_the_eval_hint() {
+    let (data, _e) = sandbox();
+    let out = btp_isolated(&data)
+        .args(["shell-init", "--help"])
+        .assert()
+        .success();
+    let text = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(text.contains("eval \"$(btp shell-init zsh)\""), "{text}");
+}
+
+#[test]
+fn is_dev_exit_codes() {
+    let (data, _e) = sandbox();
+    let cwd = tempfile::tempdir().unwrap();
+    btp_isolated(&data)
+        .current_dir(cwd.path())
+        .args(["_is-dev", "--", "vite"])
+        .assert()
+        .code(0);
+    btp_isolated(&data)
+        .current_dir(cwd.path())
+        .args(["_is-dev", "--", "vite", "--port", "4000"])
+        .assert()
+        .code(0);
+    btp_isolated(&data)
+        .current_dir(cwd.path())
+        .args(["_is-dev", "--", "ls", "-la"])
+        .assert()
+        .code(1);
+}
+
+#[test]
+fn is_dev_reads_the_program_word_only() {
+    let (data, _e) = sandbox();
+    let cwd = tempfile::tempdir().unwrap();
+    std::fs::write(
+        cwd.path().join("package.json"),
+        r#"{"scripts":{"dev":"vite","clean":"rimraf node_modules/.bin/vite"}}"#,
+    )
+    .unwrap();
+    let code = |argv: &[&str]| {
+        btp_isolated(&data)
+            .current_dir(cwd.path())
+            .arg("_is-dev")
+            .arg("--")
+            .args(argv)
+            .output()
+            .unwrap()
+            .status
+            .code()
+    };
+    for argv in [
+        &["ls", "node_modules/.bin/vite"][..],
+        &["rm", "node_modules/.bin/vite"],
+        &["cat", "./node_modules/.bin/next"],
+        &["git", "add", "node_modules/.bin/vite"],
+        &["npx", "rimraf", "node_modules/.bin/vite"],
+        &["npx", "prettier", "--write", "node_modules/.bin/next"],
+        &["npm", "run", "clean"],
+    ] {
+        assert_eq!(code(argv), Some(1), "{argv:?}");
+    }
+    for argv in [
+        &["vite"][..],
+        &["npx", "vite"],
+        &["node", "node_modules/.bin/next", "dev"],
+        &["npm", "run", "dev"],
+    ] {
+        assert_eq!(code(argv), Some(0), "{argv:?}");
+    }
+}
+
+/// A project with `"dev": "vite --port <free>"` and a fake `npm` that prints
+/// its arguments and whether it runs inside `btp run`, exiting 7.
+struct Wrapped {
+    data: tempfile::TempDir,
+    _empty: tempfile::TempDir,
+    proj: tempfile::TempDir,
+    bin: tempfile::TempDir,
+}
+
+fn wrapped() -> Wrapped {
+    let (data, empty) = sandbox();
+    let proj = tempfile::tempdir().unwrap();
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    std::fs::write(
+        proj.path().join("package.json"),
+        format!(r#"{{"name":"w","scripts":{{"dev":"vite --port {port}"}}}}"#),
+    )
+    .unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let fake = bin.path().join("npm");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\necho \"fake-npm args=$* active=${BTP_RUN_ACTIVE:-}\"\nexit 7\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    Wrapped {
+        data,
+        _empty: empty,
+        proj,
+        bin,
+    }
+}
+
+/// Source the bash init, then run `line` in the project. Returns (code, stdout).
+fn run_wrapped(w: &Wrapped, line: &str, extra_env: &[(&str, &str)]) -> (i32, String) {
+    let init = shell_init_text(&w.data, "bash");
+    let btp_dir = assert_cmd::cargo::cargo_bin("btp")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let path = format!(
+        "{}:{}:/usr/bin:/bin",
+        w.bin.path().display(),
+        btp_dir.display()
+    );
+    let mut c = std::process::Command::new("bash");
+    c.arg("-c")
+        .arg(format!("{init}\n{line}"))
+        .current_dir(w.proj.path())
+        .env_clear()
+        .env("PATH", path)
+        .env("HOME", w.data.path())
+        .env("BTP_DATA_DIR", w.data.path())
+        .env("BTP_TEST_NO_CODEX", "1");
+    for (k, v) in extra_env {
+        c.env(k, v);
+    }
+    let out = c.output().unwrap();
+    (
+        out.status.code().unwrap(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+#[test]
+fn wrapped_npm_test_passes_through() {
+    let w = wrapped();
+    let (code, out) = run_wrapped(&w, "npm test -- --watch=false", &[]);
+    assert_eq!(code, 7, "{out}");
+    assert_eq!(
+        out.trim(),
+        "fake-npm args=test -- --watch=false active=",
+        "{out}"
+    );
+}
+
+#[test]
+fn wrapped_npm_run_dev_goes_through_btp_run() {
+    let w = wrapped();
+    let (code, out) = run_wrapped(&w, "npm run dev", &[]);
+    assert_eq!(code, 7, "{out}");
+    assert!(out.contains("active=1"), "{out}");
+}
+
+#[test]
+fn btp_run_zero_disables() {
+    let w = wrapped();
+    let (code, out) = run_wrapped(&w, "npm run dev", &[("BTP_RUN", "0")]);
+    assert_eq!(code, 7, "{out}");
+    assert_eq!(out.trim(), "fake-npm args=run dev active=", "{out}");
+}
+
+#[test]
+fn wrapper_falls_back_when_btp_is_not_on_path() {
+    let w = wrapped();
+    let init = shell_init_text(&w.data, "bash");
+    let out = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(format!("{init}\nnpm run dev"))
+        .current_dir(w.proj.path())
+        .env_clear()
+        .env("PATH", format!("{}:/usr/bin:/bin", w.bin.path().display()))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(7));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "fake-npm args=run dev active="
+    );
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn alias_does_not_break_eval_and_keeps_winning() {
+    let w = wrapped();
+    for shell in ["bash", "zsh"] {
+        if !have(shell) {
+            continue;
+        }
+        let init = shell_init_text(&w.data, shell);
+        let pre = if shell == "bash" {
+            "shopt -s expand_aliases\n"
+        } else {
+            ""
+        };
+        // zsh/bash read the whole -c string first, so eval the snippet.
+        let script = format!("{pre}alias npm='echo aliased'\neval \"$1\"\neval 'npm run dev'\n");
+        let out = std::process::Command::new(shell)
+            .arg("-c")
+            .arg(script)
+            .arg("x")
+            .arg(&init)
+            .current_dir(w.proj.path())
+            .env_clear()
+            .env("PATH", format!("{}:/usr/bin:/bin", w.bin.path().display()))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{shell}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "aliased run dev",
+            "{shell}"
+        );
+    }
+}
+
+#[test]
+fn zsh_snippet_executes() {
+    if !have("zsh") {
+        return;
+    }
+    let w = wrapped();
+    let init = shell_init_text(&w.data, "zsh");
+    let btp_dir = assert_cmd::cargo::cargo_bin("btp")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let run = |line: &str, env: &[(&str, &str)]| {
+        let mut c = std::process::Command::new("zsh");
+        c.arg("-c")
+            .arg(format!("{init}\n{line}"))
+            .current_dir(w.proj.path())
+            .env_clear()
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}:/usr/bin:/bin",
+                    w.bin.path().display(),
+                    btp_dir.display()
+                ),
+            )
+            .env("HOME", w.data.path())
+            .env("BTP_DATA_DIR", w.data.path())
+            .env("BTP_TEST_NO_CODEX", "1");
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        let o = c.output().unwrap();
+        (
+            o.status.code().unwrap(),
+            String::from_utf8_lossy(&o.stdout).into_owned(),
+        )
+    };
+    let (code, out) = run("npm test -- a b", &[]);
+    assert_eq!((code, out.trim()), (7, "fake-npm args=test -- a b active="));
+    let (code, out) = run("npm run dev", &[]);
+    assert_eq!(code, 7, "{out}");
+    assert!(out.contains("active=1"), "{out}");
+    let (_, out) = run("npm run dev", &[("BTP_RUN", "0")]);
+    assert_eq!(out.trim(), "fake-npm args=run dev active=");
 }

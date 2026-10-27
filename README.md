@@ -69,6 +69,15 @@ A case where one of these rules does not hold is a security issue: report it pri
 
 The full design, limitations included, is in [docs/design.md](docs/design.md).
 
+## Starting servers with btp run
+
+```bash
+btp run -- npm run dev     # checks the port, reuses or reroutes, keeps the output
+btp logs 3000 --errors     # the server's errors, when the page is blank
+```
+
+`btp run` starts a dev server after settling its port: it reuses a server already running the same command in the folder, frees the port only when its holder is an idle server of an ended session (`port_conflict = "free_idle"`, the default), or picks another port. It prints the address as a `btp:` line on stderr and keeps the output until 24 hours after the server stopped (`btp logs`, mode 0600, never sent anywhere). Commands it does not recognise run untouched. The plugin's hook applies the same port check before Claude Code starts a server (`port_check_hook`). To wrap `npm run dev` and friends typed in a terminal, add `eval "$(btp shell-init zsh)"` to your rc file (opt-in; btp never edits it). See [docs/design.md](docs/design.md), section 14.
+
 ## Install
 
 Menu bar app: download `BalanceTonPort-<version>.dmg` from [GitHub Releases](https://github.com/matthieuh/balance-ton-port/releases), open it and drag Balance ton port to Applications. The image and the app are signed with a Developer ID and notarized. The `btp` CLI is attached to the same release as `btp-<version>-macos-universal.tar.gz`.
@@ -110,6 +119,9 @@ btp recent [--json]      # the last kills
 btp note <port> --keep [reason]  # agent intent: spare this server (no alerts), with a reason
 btp note <port> --done   # agent intent: stop it once idle after the session ends
 btp stale --conversation <id>    # servers of an earlier conversation idle over 5 min (JSON)
+btp run [--free|--reroute|--no-check] [--new] -- <cmd>   # start a dev server after the port check
+btp logs <port|name> [-f] [--errors] [-n N]   # output of a server started with btp run
+btp shell-init zsh|bash  # shell functions that route dev commands through btp run (opt-in)
 btp session-end          # called by the plugin's SessionEnd hook, not by hand
 ```
 
@@ -129,6 +141,8 @@ Only servers Balance ton port tracks can be killed; an unknown port or pid exits
 | `leak_growth_mb` | 500 | A server growing by more than this (MB) in 10 minutes is flagged as a leak (at least 50) |
 | `claude_config_dirs` | `[]` | Extra Claude config dirs only. `~/.claude`, `$CLAUDE_CONFIG_DIR` and every `~/.claude-*` with a `sessions/` folder are found automatically |
 | `exclude_commands` | `mcp`, `argent`, `postgres`, `redis-server`, `mysqld`, `mongod` | Never tracked or killed when the command line contains one of these (case-insensitive) |
+| `port_conflict` | `free_idle` | When `btp run` finds its port taken: `free_idle` (free an idle server of an ended session, else another port), `ask`, `reroute` (never kill) |
+| `port_check_hook` | `true` | The plugin's hook checks the port before Claude Code starts a dev server |
 | `exclude_ports` | `[]` | Never tracked or killed when the server, or one of its child processes, listens on one of these ports |
 
 An exclusion matches the whole command line, paths included: a project path containing "mcp" excludes its servers. That errs on the safe side. Exclusions are checked on every scan, not only when a server is first seen: adding one stops tracking a server that matches, it is never killed.
@@ -165,7 +179,7 @@ The idle alert (trigger 3) needs notifications allowed for Balance ton port. The
 ## Known limitations
 
 - A Claude Code process that has no session file in a watched config dir (for example a `CLAUDE_CONFIG_DIR` whose `sessions/` folder is shared with another dir, or an older Claude Code) is not watched: the servers it starts are not tracked and never killed. That is the safe direction: nothing is killed, but nothing is cleaned up for that session either.
-- A server started in the background (`cmd &`, `nohup`) inside one shell command is reparented to launchd before the first scan and is not tracked.
+- A server started in the background (`cmd &`, `nohup`) inside one shell command, not through `btp run`, is reparented to launchd before the first scan and is not tracked.
 - Claude Code runs no hook when it crashes or is killed hard: nothing is recorded then, and the normal rules (the app or `btp watch`) apply.
 
 ## Releasing

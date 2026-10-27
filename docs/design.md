@@ -103,7 +103,7 @@ A pid that was reused within the grace period is never hit, and pid 1 and the wa
 
 Manual kills only ever reach tracked servers: by port (any port the tree listens on now, else the recorded port), by pid (the server's own pid) or, from the app and its notifications, by the exact (pid, start time) of the row. An untracked port or pid is refused (`btp kill` exits 1).
 
-Every kill is recorded with port, command, worktree, reason (`worktree_deleted`, `dead_session_idle` with the idle time, or `manual`) and time: the last 5 in the state file (shown in the menu), all of them appended to `kills.log`.
+Every kill is recorded with port, command, worktree, reason (`worktree_deleted`, `dead_session_idle` with the idle time, `port_conflict` or `manual`) and time: the last 5 in the state file (shown in the menu), all of them appended to `kills.log`.
 
 ## 8. Alerts
 
@@ -152,7 +152,52 @@ A restart is refused when the folder is gone, the environment cannot be read, th
 
 **Session chip.** The detail view's session chip copies `cd '<folder>' && claude --resume <id>` (or `codex resume <id>`) to the clipboard. It never opens a terminal.
 
-## 14. State, config and locking
+## 14. btp run
+
+Watching stays the core. `btp run` is an optional layer that agents use by default and that people can opt into: everything above works without it, and a server started through it keeps running if the app or the watcher quits. It is not a process manager: no daemon, no restart on crash, nothing kept running after `btp run` itself is gone apart from what the child does on its own.
+
+**Command.** `btp run [--free | --reroute | --no-check] [--new] -- <cmd>` runs `<cmd>` as a normal child in the current folder with the current environment. Exit codes: the child's code when it ran, 0 when an existing server was reused, 3 for a port conflict btp did not resolve (nothing is started, and `ask` without a terminal), 2 for a usage error, and 126 or 127 when the command cannot be run or found, like a shell. btp's own lines go to stderr, each starting with `btp: `, so they do not mix with the server's output and an agent can find them.
+
+**Recognition.** btp acts only on a command it recognises as starting a dev server: a serving subcommand of a known tool (`dev`, `start`, `serve`, `preview` and the like, `npm run dev` through the package.json script behind it), never a build command. The tool is named by the program word only: the first word (after `npx`, `bunx` or `pnpx`), or the script `node`, `bun` or `deno` runs (`node node_modules/.bin/next dev`, `node node_modules/vite/bin/vite.js`); a path to `node_modules/.bin/<tool>` counts as `<tool>`. The same goes for the first word of a package.json script. A tool named by an argument is not a dev server: `ls node_modules/.bin/vite`, `git add node_modules/.bin/vite` or `npx rimraf node_modules/.bin/vite` run untouched, and the hook stays silent on them. Any other command, and any command btp cannot understand, runs untouched, exactly as without btp: same output, exit code and signals (it is still logged and linked). Inside a `btp run` (the child has `BTP_RUN_ACTIVE=1`), a nested `btp run` runs its command untouched.
+
+**The port.** The intended port is, in order: a port flag in the command (`--port`, `-p`, `--port=`), the port set by the package.json script behind it, the `PORT` environment variable, the framework's default. `PORT` (inherited, or set inline in a script) counts only for a framework that reads it: Next.js, Nuxt and `remix-serve`; Vite (so SvelteKit and `remix vite:dev`), Astro, wrangler, Expo, Storybook and Eleventy ignore it, so for them it is the default. Every recognised framework has a default. The one exception: a port flag whose value is not a number (`vite --port $PORT` in a script, `--port=$PORT`) leaves the port unknown, and the command runs untouched, as with `--no-check` (no check, no reuse, no rewrite; still logged and linked).
+
+**Reuse.** A server already runs "the same command" when its working directory equals the current one, it is in the same worktree, and it has the same command key: the framework plus the resolved command words with their port arguments removed, so `vite` and `vite --host` differ. Leading `VAR=1` assignments are ignored only inside a package.json script; a direct `cross-env X=1 next dev` is not recognised. A command btp does not recognise is never reused: it runs untouched. Two apps of one monorepo differ by folder and are never confused. `btp run` never reuses itself or one of its own ancestors. `--new` skips reuse.
+
+- For an agent: print the address (`btp: storefront already running on http://localhost:3000 (...), reusing it`) and exit 0. Nothing is started.
+- In a terminal: print who runs it and follow its log live if it has one; Ctrl-C stops following and leaves the server running; `r` asks `Stop <tool> on :<port> and start it here? [y/N]`; `y` stops it (the same rules as the app's Stop: an excluded server cannot be stopped) and starts the command here, Return, Escape or any other key keeps it and goes on following. A stop that fails says why (excluded, or btp may not signal it, or a stop or restart of it is under way).
+
+**Agent or person.** btp acts as for an agent (no prompt, no following) when it descends from an agent session, unless both stdin and stderr are terminals, or when it is a background job of its terminal (`btp run ... &` in an interactive shell: not the terminal's foreground process group, so it never prompts or changes the terminal's mode). The prompt and log following exist only in a terminal outside any agent session; in agent mode `ask` exits 3.
+
+**Port taken.** The setting `port_conflict` decides, and the flags override it for one run (`--reroute` beats `--free`; `--no-check` skips the check and reuse). `btp run` reads `config.toml` for this itself; a broken config prints a warning and acts as with the defaults for rerouting, but never frees anything (as `--reroute`):
+
+- `free_idle` (default): if the holder may be freed (below), btp stops it with `kill_tree` (section 7) with the reason `port_conflict`, and starts on that port. Otherwise it reroutes.
+- `ask`: in a terminal, btp asks `Port 3000 is used by admin (...). [k]ill it, [o]ther port, [c]ancel?` (kill is offered only for a holder that may be freed). Without a TTY it starts nothing and exits 3 with a message telling the agent to ask the user and rerun with `--free` or `--reroute`.
+- `reroute`: never stops anything, always picks another port.
+
+`--free` only ever frees what `free_idle` would free; it never widens what can be stopped.
+
+**What may be freed.** Only while a watcher runs (the app or `btp watch` holds `watch.lock`), because only its passes keep a server's idle clock fresh: without one, the idle time counts from the last pass, however old, so nothing is freed and the port is rerouted around (or the command blocked) instead. Then, only a tracked server whose session is dead and which has been idle for at least `min(10 min, dead_session_idle_s)`, and none of: Keep or `note --keep`, a running Postpone, another live session in its worktree (section 5, trigger 3), an exclusion, in use. An observed server (section 9) or a holder btp does not know is never freed. A live session's server is never freed, idle or not. The checks run again right before the kill, like every kill. Freeing is recorded in the kill history as `port_conflict`.
+
+**Rerouting.** The new port is the first free one above the intended port, at most 100 tries; a port is skipped when any listener holds it (tracked, observed or unknown holders) or it answers on a loopback connect. btp passes it the way the framework reads it (`--port N`, `-p N` or `PORT=N`; after `--` for `npm run`, `pnpm` and `bun`, while `yarn` gets the flag appended directly). Not reroutable, so exit 3 with who holds the port and nothing started: a package.json script that sets the port, for every framework except Next.js, and any script with an inline `PORT=`, Next.js included. btp also exits 3 when it finds no free port. It never starts a command it knows will crash. A command of a framework btp does not know is not recognised and runs untouched.
+
+**Output.** One line per decision, for example `btp: storefront on http://localhost:3001 (3000 is used by admin)`, `btp: freed :3000 (storefront, session ended 40 min ago, idle 25 min)`, `btp: port 3000 is used by postgres. Ask the user, then rerun with --reroute.` (exit 3). A bug of btp before the start never stops the command: it runs as it is, after one line saying the check was skipped.
+
+**Linking.** At start, `btp run` records a pending link keyed on its own process (pid and start time) and the session it descends from. Any listener whose ancestry reaches that process is linked to the session, including a server started with `&` or `nohup` inside it, and including when `btp run` was backgrounded and reparented. No environment is read, so the rule of section 3 is unchanged. A `btp run` outside any agent session links nothing: its servers are observed servers.
+
+**Process and signals.** When stdout is a terminal, the child runs on a pty, so it keeps its colors and its interactive behavior; the terminal then gets the child's stdout and stderr merged, unless stderr is redirected elsewhere. Otherwise it is piped. Each signal (Ctrl-C, SIGTERM, SIGHUP) is forwarded to the child once. A child that dies from a signal makes `btp run` re-raise it. After the child exits, the output already buffered is delivered in full, then `btp run` waits at most 500 ms for the end of the stream: a lingering background process never keeps it from returning.
+
+**Logs.** The output of the child (stdout and stderr, interleaved) is also written to `<data dir>/logs/run/<pid>-<start>.log`, mode 0600 because it may hold tokens. A log is capped at about 5 MB: beyond that the oldest half is dropped and the newest kept. A log is deleted once its server is no longer running and its last write is more than 24 hours old (checked by `btp run`, `btp logs` and the watcher). It is never sent anywhere.
+
+`btp logs <port|name> [-f] [--errors] [-n N]` prints the log of a tracked or observed server started through `btp run` (the log is found through a launcher above the listener, such as `npm` above `node`). `-n` limits to the last N lines (default 200). `-f` follows. `--errors` keeps only the lines that look like errors (`error`, `failed`, `exception`, stack frames, `EADDRINUSE`, framework messages) with 2 lines of context (with `-f`, the matching lines alone, without context). `btp list --json` has `has_logs` per server.
+
+**Check before Claude Code starts a server.** The plugin's PreToolUse hook on the Bash tool (section 16) runs `btp hook pre-bash`, which applies the same port rule without `btp run` and never rewrites the command. It acts only when the command clearly starts a dev server; it stays silent on anything else, including heredocs, comments, subshells and quoted text. When the same command already serves that folder (the `btp run` reuse rule), it denies the command and points the agent at the running copy's address instead of a second copy. Otherwise it frees a holder only under `port_conflict = free_idle`, when the holder may be freed, and then lets the command run. Under `ask` it denies with the advice plus "Ask the user before freeing it." when the holder could be freed; under `reroute` it never frees. Otherwise it denies the command with a message for the agent (who holds the port, rerun as `btp run -- <cmd>` or use the first free port above it, the one `btp run` would pick; for a command whose port btp cannot change, start it on a free port or ask the user, without suggesting `btp run`). It only frees, and never denies, when `BTP_SHELL_WRAP=1` is set, because the wrapper will reroute the command (see the shell setup below). On any internal error, an unreadable config or `port_check_hook = false`, it exits 0 and prints nothing: it never blocks the agent because of btp. When it frees a port it waits for the kill (up to `kill_grace_s`); the hook timeout covers that.
+
+**Shell setup (opt-in).** `btp shell-init zsh|bash` prints shell functions; the user adds `eval "$(btp shell-init zsh)"` to their rc file. btp never edits an rc file. The functions wrap `npm`, `pnpm`, `yarn`, `bun`, `npx` and the bare framework commands (`next`, `vite`, `astro`, `wrangler`, `expo`...), call `btp run` only when the command starts a known dev server, and send everything else straight to the real command. A user alias wins. A user function defined before the eval line is replaced by the wrapper; one defined after it wins. `BTP_RUN=0` turns the wrapping off for one command. The snippet exports `BTP_SHELL_WRAP=1` into the shell, so a Claude Code started from a wrapped shell has a hook that only frees and never blocks: its dev commands are rerouted by the wrapper.
+
+**Not covered.** A server that daemonizes itself away from `btp run` is not linked. See section 17 for the other gaps.
+
+## 15. State, config and locking
 
 Everything lives in `~/Library/Application Support/balance-ton-port/` (overridable with `BTP_DATA_DIR`):
 
@@ -163,17 +208,22 @@ Everything lives in `~/Library/Application Support/balance-ton-port/` (overridab
 | `state.lock` | Exclusive lock held while `state.json` is read and rewritten |
 | `kills.log` | One JSON line per kill |
 | `logs/` | Output of restarted servers, one file per restart (mode 0600, the 20 most recent kept) |
+| `logs/run/` | Output of servers started through `btp run`, `<pid>-<start>.log` (mode 0600, about 5 MB each, deleted 24 h after the server stopped) |
 | `watch.lock` | Held by the single watcher, with its name inside |
 
 `state.json` is written through a temp file and a rename. A corrupt file is moved to `state.json.corrupt` and the state starts empty; any other read error is returned so the state is never overwritten blindly.
+
+Besides the numeric keys, `port_conflict` (`free_idle`, `ask` or `reroute`, default `free_idle`) and `port_check_hook` (`true` or `false`, default `true`) belong to section 14; the app's Settings has a "Port conflicts" choice and a switch for them.
 
 Config minimums: 60 s for `dead_session_idle_s` and `alert_after_s`, 1 s for `kill_grace_s` and `scan_interval_s`. `btp config set` and Settings refuse lower values; values read from the file are raised to the minimum with a note on stderr, printed once per change of the file. Saves are atomic, and the last writer wins. A file that does not parse never silently becomes the defaults: a running watcher keeps its last valid config (a fresh start uses the defaults), the app shows the error, and `btp config` refuses to read or write until it is fixed.
 
 **One watcher.** Only the holder of `watch.lock` runs killing passes. The app tries to take it on every pass; while `btp watch` holds it, the app only observes (links, activity and forgets are still recorded, no kill, no alert) and shows the list read-only, but its manual Kill button still works. `btp watch` refuses to start while the app holds the lock. `btp list`, `btp kill` and `btp sweep` work without any watcher: they run the same pass (link, observe, forget) on demand.
 
-## 15. Claude Code plugin and session end
+## 16. Claude Code plugin and session end
 
-The plugin (`plugin/`) has two hooks, an install command and the agent skill.
+The plugin (`plugin/`) has three hooks (PreToolUse, SessionStart, SessionEnd), an install command and the agent skill.
+
+**PreToolUse.** `hooks/pre-bash.sh` runs `btp hook pre-bash` on every Bash tool call, as described in section 14: it frees a freeable holder of a dev server's port or denies the command with advice, and stays silent on everything else. `port_check_hook = false` turns it off. Installing the plugin is the opt-in; btp edits no Claude Code settings.
 
 **Session end never stops anything.** The SessionEnd hook runs `btp session-end` in a detached child (Claude Code gives the hook about 1.5 s and shows nothing it prints, so the hook prints nothing and always exits 0). The session process is the hook's parent. With "Exit and stop tasks", Claude Code stops its own background tasks before the hook runs, so the hook finds no server. With "Move to background and exit", the servers are still alive: a server alive at that moment is one the user chose to keep. `btp session-end` records them as one ended-session group, with the process identity of the session so the link survives, and posts one notification ("Session ended: N servers kept running: ... Stopped after 20 min unused, once no session works in that folder"). "Move to background" leaves a live background session in the same folder, so its servers are kept while it runs. Nothing is posted when no server was kept. The app posts it on its next pass when it holds the watch lock; otherwise `btp session-end` posts it with `osascript` and marks the group delivered under the state lock, so it is never shown twice. `clear` and `resume` reasons do nothing: the process lives on.
 
@@ -190,12 +240,16 @@ The plugin (`plugin/`) has two hooks, an install command and the agent skill.
 **Known gaps.**
 - No hook runs when Claude Code crashes or is killed hard, so nothing is recorded; the normal rules take over.
 - A server reparented to launchd before the hook runs is left to the normal rules.
-- A server started with `&` or `nohup` is reparented at once, so it is never linked to the session and never tracked.
+- A server started with `&` or `nohup` outside `btp run` is reparented at once, so it is never linked to the session and never tracked. Started through `btp run` (section 14), it is linked.
 
-## 16. Known limitations
+## 17. Known limitations
 
 - A Claude Code process with no session file in a watched dir (a `CLAUDE_CONFIG_DIR` whose `sessions/` folder is shared with another dir, an older Claude Code) is ignored: its servers are never tracked, so never killed, and never cleaned up either.
-- A server started in the background (`cmd &`) inside one shell command is reparented to launchd before the first scan and is not tracked, for Codex as for Claude Code. More generally, anything started and orphaned between two scans is missed.
+- A server started in the background (`cmd &`, `nohup`) inside one shell command, not through `btp run`, is reparented to launchd before the first scan and is not tracked, for Codex as for Claude Code. More generally, anything started and orphaned between two scans is missed. Through `btp run` it is linked (section 14), except a server that daemonizes itself away from `btp run`.
+- A port set in a package.json script is not reroutable (exit 3) for any framework except Next.js, and an inline `PORT=` in a script never is, Next.js included.
+- In a terminal, `btp run` merges the child's stdout and stderr (pty) unless stderr is redirected elsewhere.
+- The port check applies to commands btp recognises as starting a dev server; any other command runs untouched. So does a recognised command whose port flag btp cannot read (`--port $PORT` in a script).
+- With no watcher running (neither the app nor `btp watch`), `btp run` and the hook never free a port: they reroute around the holder, or block when the port cannot change.
 - Codex desktop app is not supported: its `codex` processes are never sessions, so its servers are never tracked.
 - A live Codex session's servers are alerted on port idle only (its session idle time is unknown, see section 2), like a busy Claude Code session's; session-end cleanup, the offer after `/clear` and the grouped notification are Claude Code only.
 - A Codex session without a lock or a rollout yet has an empty conversation id.
@@ -206,24 +260,25 @@ The plugin (`plugin/`) has two hooks, an install command and the agent skill.
 - Port activity is sampled once per pass. A short request that opens and closes between two passes is not seen, so a server used only by brief, rare requests can look idle.
 - The shared-worktree rule compares worktree roots only (see section 5).
 - A `btp watch` older than 0.3 ignores Postpone (it still stops on the usual countdown) and, when it rewrites `state.json`, drops the state 0.3 adds (postpones, pending restarts, `restarted_from` records, session folders). Run one version of `btp` and the app.
+- Mixing 0.4 and 0.5: a 0.4 app that saves Settings drops `port_conflict` and `port_check_hook` from `config.toml`, so they go back to their defaults (`free_idle`, hook on). A 0.4 watcher that rewrites `state.json` drops `pending_runs`: the link is lost, so a server started through `btp run` becomes an observed one, which is never killed by it.
 - The kill log grows without bound, and the same kill can occasionally be recorded twice.
 - macOS only (the Homebrew formula too). The platform layer is behind a trait so that a Linux implementation (`/proc`) can follow.
 
-## 17. Architecture
+## 18. Architecture
 
 ```
 crates/btp-core   Rust library: platform layer, sessions, linking, decide, kill, state, config
-crates/btp-cli    the `btp` binary (clap)
+crates/btp-cli    the `btp` binary (clap): `run`, `logs`, `hook`, `shell_init` for section 14
 crates/btp-ffi    UniFFI wrapper around the core for Swift
 app/              SwiftUI menu bar app (XcodeGen project)
 plugin/           the Claude Code plugin: hooks, install script, the agent skill (plugin/skills/)
 ```
 
-- `btp-core`: `platform` (a `Platform` trait; the macOS implementation uses libproc and sysctl for listening sockets, process info, ancestry, descendants and per-socket TCP states, plus `kill(2)`), `sessions` (session files and config dir discovery), `agents` (one module per agent: process recognition, live sessions and metadata for `claude` and `codex`, the rollout line 1 reader), `worktree`, `decide` (pure decision logic, unit-tested with fake clocks and fake process tables), `watcher` (link, refresh, observe, execute, the watch lock), `history` (samples, events, leaks), `observed`, `probe` (title and favicon), `restart`, `state`, `config`, and `labels`/`display` for readable names (`Expo (Metro)`, `repo › worktree`).
+- `btp-core`: `platform` (a `Platform` trait; the macOS implementation uses libproc and sysctl for listening sockets, process info, ancestry, descendants and per-socket TCP states, plus `kill(2)`), `sessions` (session files and config dir discovery), `agents` (one module per agent: process recognition, live sessions and metadata for `claude` and `codex`, the rollout line 1 reader), `worktree`, `decide` (pure decision logic, unit-tested with fake clocks and fake process tables), `watcher` (link, refresh, observe, execute, the watch lock; `watcher/for_run` for the port holder, free-for-run and reuse queries and the run links), `run` (`command`: recognition of dev commands and port rewriting; `conflict`: the port conflict decision), `runlog` (run logs, size cap, cleanup, error filter), `history` (samples, events, leaks), `observed`, `probe` (title and favicon), `restart`, `state`, `config`, and `labels`/`display` for readable names (`Expo (Metro)`, `repo › worktree`).
 - `btp-ffi`: a `Core` object exposing `tick`, `observe`, `kill_port`, `kill_server(pid, start_time)`, `mark_alerted`, `keep`, `postpone`, `ignore_alert`, `mark_leak_notified`, `history`, `events`, `icon`, `processes`, `resume_command`, `restart`, `stop_observed`, `discovered_claude_dirs`, `config`/`set_config`, `claim_session_ended`, `unclaim_session_ended`, `stop_session_ended`, `keep_session_ended`, `recent_kills` and `acquire_watch`. `scripts/build-xcframework.sh` builds a universal static library, packs it as `BtpCore.xcframework` and generates the Swift bindings.
 - The app: `MenuBarExtra` in window style, `LSUIElement` (no Dock icon), launch at login through `SMAppService`, notifications with actions through `UNUserNotificationCenter`. It runs one pass at a time on a background queue and schedules the next one `scan_interval_s` after the previous one finished. One process, no daemon to install. macOS 14 or later.
 
-## 18. Release pipeline
+## 19. Release pipeline
 
 CI runs fmt, clippy, the Rust tests and the Swift tests on every push and pull request. A `v*` tag runs the release workflow: it checks that the tag matches the CLI and app versions, builds a universal `btp` and app, signs them with a Developer ID, notarizes and staples the app, packs it into `BalanceTonPort-<v>.dmg` (signed, notarized and stapled too), and publishes a GitHub release with the CLI tarball, the dmg, their `.sha256` files and the Homebrew formula and cask filled with the version and checksums; a tag with a hyphen is a prerelease, and nothing is published unless every step passed.
 

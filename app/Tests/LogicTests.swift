@@ -28,7 +28,7 @@ private func server(
         managed: true, excluded: false, framework: nil, title: toolLabel, hasIcon: false,
         branch: nil, rssBytes: 0, cpuPct: 0, growthBytes: 0, health: "green", inUse: false,
         statusText: "idle 0 min", status: StatusFfi(kind: "idle", minutes: 0, agentLabel: "", reason: nil), card: nil, leakKind: nil, canRestart: false, postponed: false,
-        uptimeMs: 0, processCount: 1
+        uptimeMs: 0, processCount: 1, hasLogs: false
     )
 }
 
@@ -70,7 +70,8 @@ final class SettingsDraftTests: XCTestCase {
     private let config = ConfigFfi(
         deadSessionIdleS: 1200, alertAfterS: 1800, killGraceS: 5, scanIntervalS: 5,
         claudeConfigDirs: ["/Users/me/.claude"], excludeCommands: ["mcp"], excludePorts: [5432],
-        leakMemoryMb: 4096, leakGrowthMb: 300
+        leakMemoryMb: 4096, leakGrowthMb: 300,
+        portConflict: "ask", portCheckHook: false
     )
 
     func testConversions() {
@@ -97,6 +98,20 @@ final class SettingsDraftTests: XCTestCase {
         d.alertAfterMin = 1
         XCTAssertEqual(d.ffi.alertAfterS, 60)
         XCTAssertEqual(d.ffi.deadSessionIdleS, 90)
+    }
+
+    func testPortConflictDraftRoundTrip() {
+        var c = config
+        c.portConflict = "reroute"
+        c.portCheckHook = true
+        var d = SettingsDraft(c)
+        XCTAssertEqual(d.ffi.portConflict, "reroute")
+        XCTAssertTrue(d.ffi.portCheckHook)
+        d.portConflict = "ask"
+        d.portCheckHook = false
+        XCTAssertEqual(d.ffi.portConflict, "ask")
+        XCTAssertFalse(d.ffi.portCheckHook)
+        XCTAssertEqual(SettingsDraft(config).ffi, config)
     }
 
     func testValidation() {

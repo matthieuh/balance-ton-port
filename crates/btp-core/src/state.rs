@@ -34,6 +34,23 @@ pub struct State {
     /// process is gone, or after a day).
     #[serde(default)]
     pub pending_restarts: Vec<PendingRestart>,
+    /// `btp run` processes and the session each descends from, so a
+    /// server started through one links to that session even once `btp
+    /// run` is reparented (dropped once the process is gone, or after a
+    /// day).
+    #[serde(default)]
+    pub pending_runs: Vec<PendingRun>,
+}
+
+/// A `btp run` process (pid and start time) and the live session it
+/// descended from when it registered (pid and Claude-format start time).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingRun {
+    pub run_pid: i32,
+    pub run_start: u64,
+    pub session_pid: i32,
+    pub session_proc_start: String,
+    pub at_ms: u64,
 }
 
 /// One server named in a session-ended group.
@@ -389,6 +406,14 @@ mod tests {
     }
 
     #[test]
+    fn kill_reason_roundtrip() {
+        let json = serde_json::to_value(KillReason::PortConflict).unwrap();
+        assert_eq!(json, serde_json::json!({"kind": "port_conflict"}));
+        let back: KillReason = serde_json::from_value(json).unwrap();
+        assert_eq!(back, KillReason::PortConflict);
+    }
+
+    #[test]
     fn unknown_reason_kind_decodes_as_other() {
         let r: KillReason =
             serde_json::from_str(r#"{"kind": "made_up_later", "extra": 3}"#).unwrap();
@@ -428,6 +453,34 @@ mod tests {
         assert!(!servers[0].asked_stale);
         assert!(servers[0].kept);
         assert_eq!(kills[0].reason, KillReason::Manual);
+    }
+
+    #[test]
+    fn old_state_without_pending_runs_loads() {
+        let d = tempfile::tempdir().unwrap();
+        fs::write(
+            d.path().join("state.json"),
+            r#"{"servers": [], "pending_restarts": []}"#,
+        )
+        .unwrap();
+        let runs = with_state(d.path(), |s| s.pending_runs.clone()).unwrap();
+        assert!(!d.path().join("state.json.corrupt").exists());
+        assert!(runs.is_empty());
+    }
+
+    #[test]
+    fn pending_runs_round_trip() {
+        let d = tempfile::tempdir().unwrap();
+        let run = PendingRun {
+            run_pid: 60,
+            run_start: 7,
+            session_pid: 20,
+            session_proc_start: "x".into(),
+            at_ms: 42,
+        };
+        with_state(d.path(), |s| s.pending_runs.push(run.clone())).unwrap();
+        let runs = with_state(d.path(), |s| s.pending_runs.clone()).unwrap();
+        assert_eq!(runs, vec![run]);
     }
 
     #[test]

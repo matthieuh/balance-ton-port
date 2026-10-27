@@ -27,6 +27,7 @@ struct GeneralPane: View {
             NotificationsSection()
             if let binding = Binding($draft) {
                 DelaysSection(draft: binding)
+                PortConflictSection(draft: binding)
                 Section {
                     if discovered.isEmpty {
                         Text(verbatim: language.tr("None")).foregroundStyle(.secondary)
@@ -216,6 +217,24 @@ private struct DelaysSection: View {
                     value: secondsText(draft.scanIntervalSec, bundle: language.bundle, locale: language.locale)
                 )
             }
+        }
+    }
+}
+
+/// What happens when an agent starts a server on a port that is taken, and
+/// the Claude Code hook that checks the port before the server starts.
+private struct PortConflictSection: View {
+    @EnvironmentObject private var language: LanguageModel
+    @Binding var draft: SettingsDraft
+
+    var body: some View {
+        Section {
+            Picker(language.tr("Port conflicts"), selection: $draft.portConflict) {
+                Text(verbatim: language.tr("Free idle agent servers")).tag("free_idle")
+                Text(verbatim: language.tr("Ask me")).tag("ask")
+                Text(verbatim: language.tr("Never kill, always use another port")).tag("reroute")
+            }
+            Toggle(language.tr("Check ports before Claude Code starts a server"), isOn: $draft.portCheckHook)
         }
     }
 }

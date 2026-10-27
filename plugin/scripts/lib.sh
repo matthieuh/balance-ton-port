@@ -1,10 +1,10 @@
 # shellcheck shell=bash
 # Shared by the plugin's hooks and install script. Sourced, never run.
 
-# The first btp that ships the commands the hooks call (`session-end`,
-# `stale`, `note`, `recent`). See RELEASING.md before changing it.
+# The first btp that ships the commands the hooks and the skill use
+# (`session-end`, `stale`, `note`, `recent`, `hook pre-bash`, `run`, `logs`). See RELEASING.md before changing it.
 # BTP_PLUGIN_MIN_VERSION overrides it (for testing a dev build).
-BTP_MIN_VERSION="0.3.0"
+BTP_MIN_VERSION="0.5.0"
 BTP_MIN="${BTP_PLUGIN_MIN_VERSION:-$BTP_MIN_VERSION}"
 
 # shellcheck disable=SC2034 # used by install-btp.sh and session-start.sh

@@ -5,7 +5,7 @@
 uniffi::setup_scaffolding!();
 
 use btp_core::agents::AgentKind;
-use btp_core::config::{data_dir, read_config, save_config, Config};
+use btp_core::config::{data_dir, read_config, save_config, Config, PortConflict};
 use btp_core::display::{
     card_reason, format_idle, free_is_low, server_state, session_ended_body, started_label,
     status_text, status_text_observed, usage_line, NeedsYou, SuggestedAction, ACTIVE_WINDOW_MS,
@@ -237,6 +237,8 @@ pub struct ServerViewFfi {
     pub uptime_ms: u64,
     /// Processes in its tree (`processes` lists them).
     pub process_count: u32,
+    /// `btp run` kept its output (`btp logs`).
+    pub has_logs: bool,
 }
 
 /// What a pass reads about a server beyond its row: memory, page, git and
@@ -490,6 +492,10 @@ pub struct ConfigFfi {
     pub leak_memory_mb: u64,
     /// A server growing by more than this (MB) in 10 minutes leaks.
     pub leak_growth_mb: u64,
+    /// `free_idle`, `ask` or `reroute`.
+    pub port_conflict: String,
+    /// Whether the agent hook checks a port before a server command starts.
+    pub port_check_hook: bool,
 }
 
 /// One server a session end left running.
@@ -554,6 +560,7 @@ pub fn reason_label(r: &KillReason) -> String {
         }
         KillReason::Manual => "manual".to_string(),
         KillReason::SessionEnded => "session ended".to_string(),
+        KillReason::PortConflict => "freed for a new server".to_string(),
         KillReason::Other => "other".to_string(),
     }
 }
@@ -564,6 +571,7 @@ fn reason_kind(r: &KillReason) -> &'static str {
         KillReason::DeadSessionIdle { .. } => "dead_session_idle",
         KillReason::Manual => "manual",
         KillReason::SessionEnded => "session_ended",
+        KillReason::PortConflict => "port_conflict",
         KillReason::Other => "other",
     }
 }
@@ -632,13 +640,21 @@ impl ServerViewFfi {
             postponed: v.postponed_until_ms.is_some_and(|u| u > now_ms),
             uptime_ms: now_ms.saturating_sub(v.started_ms),
             process_count: l.process_count,
+            has_logs: v.has_logs,
         }
     }
 
     /// An observed server `o` (no agent), with `l`, as the menu shows it
     /// at `now_ms`: a connection is open on it when `in_use`, and it has
     /// been unused for `idle_ms`.
-    pub fn observed(o: &ObservedServer, l: &Live, in_use: bool, idle_ms: u64, now_ms: u64) -> Self {
+    pub fn observed(
+        o: &ObservedServer,
+        l: &Live,
+        in_use: bool,
+        idle_ms: u64,
+        now_ms: u64,
+        has_logs: bool,
+    ) -> Self {
         let worktree = o.cwd.as_deref().map(worktree_root);
         let tool = tool_label(&o.command);
         // Process start times are Unix microseconds.
@@ -690,6 +706,7 @@ impl ServerViewFfi {
             postponed: false,
             uptime_ms: now_ms.saturating_sub(started_ms),
             process_count: l.process_count,
+            has_logs,
         }
     }
 }
@@ -800,7 +817,10 @@ fn report_ffi<P: Platform>(w: &mut Watcher<P>, t: &TickReport, now_ms: u64) -> T
             now_ms,
         );
         let (in_use, idle_ms) = observed_use(w, o, now_ms);
-        servers.push(ServerViewFfi::observed(o, &l, in_use, idle_ms, now_ms));
+        let has_logs = btp_core::runlog::log_key_of(w.platform(), w.data_dir(), o.key).is_some();
+        servers.push(ServerViewFfi::observed(
+            o, &l, in_use, idle_ms, now_ms, has_logs,
+        ));
     }
     let dev = servers.iter().map(|s| s.rss_bytes).sum();
     let machine = w.platform().machine_memory();
@@ -843,6 +863,8 @@ impl From<Config> for ConfigFfi {
             exclude_ports: c.exclude_ports,
             leak_memory_mb: c.leak_memory_mb,
             leak_growth_mb: c.leak_growth_mb,
+            port_conflict: c.port_conflict.as_str().to_string(),
+            port_check_hook: c.port_check_hook,
         }
     }
 }
@@ -863,6 +885,9 @@ impl From<ConfigFfi> for Config {
             exclude_ports: c.exclude_ports,
             leak_memory_mb: c.leak_memory_mb,
             leak_growth_mb: c.leak_growth_mb,
+            // An unknown value (a newer app) falls back to the default.
+            port_conflict: PortConflict::parse(&c.port_conflict).unwrap_or_default(),
+            port_check_hook: c.port_check_hook,
         }
     }
 }
@@ -1324,10 +1349,17 @@ mod tests {
             postponed_until_ms: None,
             note_reason: None,
             kept_by_user: false,
+            has_logs: false,
         };
         let f = ServerViewFfi::tracked(&v, &Live::default(), 0);
         assert_eq!(f.agent, "claude_code");
         assert_eq!(f.agent_label, "Claude");
+        assert!(!f.has_logs);
+        let logged = ServerView {
+            has_logs: true,
+            ..v
+        };
+        assert!(ServerViewFfi::tracked(&logged, &Live::default(), 0).has_logs);
     }
 
     #[test]
@@ -1354,6 +1386,7 @@ mod tests {
             postponed_until_ms: None,
             note_reason: None,
             kept_by_user: false,
+            has_logs: false,
         };
         let f = ServerViewFfi::tracked(&v, &Live::default(), 4 * 60_000);
         assert_eq!((f.pid, f.start_time, f.port), (42, 7, 5173));
@@ -1389,6 +1422,7 @@ mod tests {
             postponed_until_ms: Some(10_000),
             note_reason: None,
             kept_by_user: false,
+            has_logs: false,
         }
     }
 
@@ -1519,7 +1553,7 @@ mod tests {
             can_restart: true,
             ..Live::default()
         };
-        let f = ServerViewFfi::observed(&o, &l, false, 5 * 60_000, 62_000);
+        let f = ServerViewFfi::observed(&o, &l, false, 5 * 60_000, 62_000, false);
         assert!(!f.managed);
         assert_eq!((f.agent.as_str(), f.agent_label.as_str()), ("", "no agent"));
         assert_eq!(f.session_name, "");
@@ -1530,7 +1564,7 @@ mod tests {
         assert_eq!(f.started_ms, 2_000);
         assert_eq!(f.uptime_ms, 60_000);
         assert!(f.can_restart);
-        let in_use = ServerViewFfi::observed(&o, &l, true, 0, 62_000);
+        let in_use = ServerViewFfi::observed(&o, &l, true, 0, 62_000, false);
         assert_eq!(
             (in_use.status_text.as_str(), in_use.in_use),
             ("in use", true)
@@ -1539,7 +1573,7 @@ mod tests {
             excluded: true,
             ..o
         };
-        let f = ServerViewFfi::observed(&excluded, &l, false, 0, 62_000);
+        let f = ServerViewFfi::observed(&excluded, &l, false, 0, 62_000, false);
         assert!(f.excluded);
         assert_eq!(f.status_text, "excluded");
         assert!(!f.can_restart, "an excluded server never restarts");
@@ -1966,6 +2000,12 @@ mod tests {
         let mut c = core.config().unwrap();
         assert_eq!(c.dead_session_idle_s, 1200);
         assert_eq!((c.leak_memory_mb, c.leak_growth_mb), (2048, 500));
+        assert_eq!(
+            (c.port_conflict.as_str(), c.port_check_hook),
+            ("free_idle", true)
+        );
+        c.port_conflict = "reroute".into();
+        c.port_check_hook = false;
         c.alert_after_s = 60;
         c.claude_config_dirs = vec!["/tmp/claude-x".into()];
         c.leak_memory_mb = 4096;
@@ -1976,6 +2016,8 @@ mod tests {
         assert_eq!(saved.alert_after_s, 60);
         // The app's save keeps the leak thresholds it was given.
         assert_eq!((saved.leak_memory_mb, saved.leak_growth_mb), (4096, 300));
+        assert_eq!(saved.port_conflict, PortConflict::Reroute);
+        assert!(!saved.port_check_hook);
     }
 
     #[test]
@@ -2307,7 +2349,7 @@ mod tests {
             excluded: false,
         };
         let observed = |o: &ObservedServer, in_use, idle_ms| {
-            ServerViewFfi::observed(o, &Live::default(), in_use, idle_ms, 0).status
+            ServerViewFfi::observed(o, &Live::default(), in_use, idle_ms, 0, false).status
         };
         let s = observed(&o, false, 5 * 60_000);
         assert_eq!((s.kind.as_str(), s.minutes), ("idle", 5));
@@ -2386,6 +2428,7 @@ mod tests {
             (KillReason::WorktreeDeleted, "worktree_deleted"),
             (KillReason::Manual, "manual"),
             (KillReason::SessionEnded, "session_ended"),
+            (KillReason::PortConflict, "port_conflict"),
             (KillReason::Other, "other"),
         ];
         for (reason, kind) in kinds {

@@ -1,6 +1,11 @@
 //! `btp`: list, kill and sweep the dev servers left behind by Claude Code
 //! sessions. Exit codes: 0 success, 1 user error / nothing matched / lock
-//! held, 2 internal error.
+//! held, 2 internal error. `btp run` has its own (see `run`).
+
+mod hook;
+mod logs;
+mod run;
+mod shell_init;
 
 use btp_core::config::{data_dir, effective_claude_dirs, read_config, save_config};
 use btp_core::display::format_idle as ago;
@@ -77,6 +82,37 @@ enum Cmd {
     /// Claude Code SessionEnd hook: record the servers the quitting session
     /// leaves running (never stops any). Prints nothing and always exits 0.
     SessionEnd(SessionEndArgs),
+    /// Start a dev server after checking its port: reuse the same server
+    /// running here, free or reroute around a taken port, and keep its logs
+    Run(run::RunArgs),
+    /// Show the output of a server started through `btp run`
+    Logs(logs::LogsArgs),
+    /// Print shell functions that run dev server commands through `btp run`.
+    /// Add `eval "$(btp shell-init zsh)"` to ~/.zshrc (or the bash line to
+    /// ~/.bashrc); btp never edits your rc files. `BTP_RUN=0` turns the
+    /// wrapping off for one command.
+    ShellInit {
+        /// zsh or bash
+        shell: String,
+    },
+    /// Exit 0 when the command starts a known dev server here, 1 otherwise
+    /// (internal)
+    #[command(name = "_is-dev", hide = true)]
+    IsDev {
+        #[arg(
+            required = true,
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "CMD"
+        )]
+        argv: Vec<String>,
+    },
+    /// Claude Code hooks of the plugin (internal)
+    #[command(hide = true)]
+    Hook {
+        #[command(subcommand)]
+        hook: HookCmd,
+    },
     /// Detached waiter of `session-end`: applies the dead-session rule to
     /// that session's servers when no watcher runs (internal)
     #[command(name = "_sweep-later", hide = true)]
@@ -88,6 +124,14 @@ enum Cmd {
         #[arg(long)]
         at: u64,
     },
+}
+
+#[derive(Subcommand)]
+enum HookCmd {
+    /// PreToolUse on Bash: check the port of a dev server start. Prints
+    /// nothing and exits 0, except to deny the command.
+    #[command(name = "pre-bash")]
+    PreBash,
 }
 
 #[derive(Args)]
@@ -190,12 +234,22 @@ fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(c) => c,
         // The SessionEnd hook never fails Claude Code's shutdown.
+        Err(_) if std::env::args().nth(1).as_deref() == Some("hook") => {
+            return ExitCode::SUCCESS;
+        }
         Err(e) if std::env::args().nth(1).as_deref() == Some("session-end") => {
             eprintln!("btp: session-end: {}", e.kind());
             return ExitCode::SUCCESS;
         }
         Err(e) => {
-            let code = if e.use_stderr() { 1 } else { 0 };
+            // `btp run` exits with its command's code, so its usage errors
+            // take 2, the code the design gives them.
+            let usage = if std::env::args().nth(1).as_deref() == Some("run") {
+                2
+            } else {
+                1
+            };
+            let code = if e.use_stderr() { usage } else { 0 };
             let _ = e.print();
             return ExitCode::from(code);
         }
@@ -214,6 +268,22 @@ fn main() -> ExitCode {
 }
 
 fn run(cmd: Cmd) -> Result<u8, Failure> {
+    // Fast paths: no data dir, no state.
+    match &cmd {
+        Cmd::IsDev { argv } => return Ok(shell_init::is_dev(argv)),
+        Cmd::ShellInit { shell } => {
+            return match shell_init::snippet(shell) {
+                Some(text) => {
+                    print!("{text}");
+                    Ok(0)
+                }
+                None => Err(Failure::Internal(format!(
+                    "unknown shell {shell:?}, use zsh or bash"
+                ))),
+            };
+        }
+        _ => {}
+    }
     let dir = data_dir();
     match cmd {
         Cmd::List { json } => {
@@ -327,6 +397,12 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
             Ok(0)
         }
         Cmd::Watch => watch(dir),
+        Cmd::Run(a) => Ok(run::run(a)),
+        Cmd::Logs(a) => logs::run(&dir, a),
+        Cmd::ShellInit { .. } | Cmd::IsDev { .. } => unreachable!("handled above"),
+        Cmd::Hook {
+            hook: HookCmd::PreBash,
+        } => Ok(hook::pre_bash()),
         Cmd::SessionEnd(a) => {
             // Any internal error or panic still exits 0.
             let notify = notifier();
@@ -816,6 +892,7 @@ fn describe_kill(r: &KillRecord) -> String {
         }
         KillReason::Manual => "manual".to_string(),
         KillReason::SessionEnded => "session ended".to_string(),
+        KillReason::PortConflict => "freed for a new server".to_string(),
         KillReason::Other => "other".to_string(),
     };
     format!(
@@ -877,6 +954,7 @@ fn saved_view(s: &TrackedServer, now_ms: u64) -> ServerView {
             .filter(|n| n.keep)
             .map(|n| n.reason.clone().unwrap_or_default()),
         kept_by_user: s.kept,
+        has_logs: false,
     }
 }
 
@@ -950,6 +1028,7 @@ mod tests {
             postponed_until_ms: None,
             note_reason: None,
             kept_by_user: false,
+            has_logs: false,
         }
     }
 
@@ -1117,12 +1196,13 @@ mod tests {
             &[
                 rec(5173, KillReason::SessionEnded, now - 12 * 60_000),
                 rec(3000, KillReason::Manual, now - 2 * 3_600_000),
+                rec(4000, KillReason::PortConflict, now - 60_000),
             ],
             now,
         );
         assert_eq!(
             text,
-            "12 min ago  :5173 Vite (app) [session ended]\n2 h ago  :3000 Vite (app) [manual]\n"
+            "12 min ago  :5173 Vite (app) [session ended]\n2 h ago  :3000 Vite (app) [manual]\n1 min ago  :4000 Vite (app) [freed for a new server]\n"
         );
         assert_eq!(render_recent(&[], now), "no kills yet\n");
     }

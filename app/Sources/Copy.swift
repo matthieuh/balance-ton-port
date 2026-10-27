@@ -235,6 +235,7 @@ func killReasonText(
         return L("dead session + idle \(durationText(ms: r.idleMs, bundle: bundle, locale: locale))", bundle, locale)
     case "manual": return L("manual", bundle, locale)
     case "session_ended": return L("session ended", bundle, locale)
+    case "port_conflict": return L("freed for a new server", bundle, locale)
     default: return L("other", bundle, locale)
     }
 }

@@ -31,7 +31,7 @@ private func row(
         sessionAlive: true, idleMs: idleMs, killInMs: nil, state: "active", managed: true, excluded: false,
         framework: nil, title: toolLabel, hasIcon: false, branch: nil, rssBytes: 0, cpuPct: 0, growthBytes: 0,
         health: "green", inUse: false, statusText: "", status: status, card: nil, leakKind: nil,
-        canRestart: false, postponed: false, uptimeMs: 0, processCount: 1
+        canRestart: false, postponed: false, uptimeMs: 0, processCount: 1, hasLogs: false
     )
 }
 
@@ -147,6 +147,13 @@ final class CopyTests: XCTestCase {
         XCTAssertTrue(french.contains("34"))
         XCTAssertEqual(french, "inactif depuis 34 minutes")
         XCTAssertEqual(statusText(status("in_use"), bundle: fr, locale: locale), "in use", "a missing key falls back to its English key")
+    }
+
+    func testPortConflictReasonCopy() throws {
+        let record = KillRecordFfi(port: 1, command: "", toolLabel: "", worktree: "", worktreeName: "", reason: "", reasonKind: "port_conflict", idleMs: 0, atMs: 0)
+        XCTAssertEqual(killReasonText(record), "freed for a new server")
+        let fr = try frenchBundle(["freed for a new server": "libéré pour un nouveau serveur"])
+        XCTAssertEqual(killReasonText(record, bundle: fr, locale: Locale(identifier: "fr")), "libéré pour un nouveau serveur")
     }
 
     func testMemoryLabelUsesLocaleDecimal() {
