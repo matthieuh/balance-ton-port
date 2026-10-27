@@ -8,6 +8,7 @@ Port from `--port N`, `--port=N` or `-p N`, else `PORT`, else 8000. Prints
 """
 import http.server
 import os
+import socketserver
 import sys
 import threading
 
@@ -36,9 +37,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+class Server(http.server.HTTPServer):
+    # HTTPServer.server_bind looks the host up in DNS (getfqdn), which can
+    # hang for seconds on a CI runner; the name is never used here.
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = "localhost", self.server_address[1]
+
+
 def main():
     port = port_from(sys.argv[1:])
-    server = http.server.HTTPServer(("127.0.0.1", port), Handler)
+    server = Server(("127.0.0.1", port), Handler)
     print(f"serve.py listening on {port} pid {os.getpid()}", flush=True)
     after = os.environ.get("SERVE_EXIT_AFTER")
     if after:
