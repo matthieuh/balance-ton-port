@@ -33,7 +33,7 @@ struct NeedsYouCard: View {
                     .foregroundStyle(tint.opacity(scheme == .dark ? 0.85 : 1))
                     .lineLimit(2)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                actionPill(tint: tint)
+                if cardShowsAction(card) { actionPill(tint: tint) }
                 MoreMenu(server: server)
             }
             .padding(.leading, cardIndent)

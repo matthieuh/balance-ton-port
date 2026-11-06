@@ -5,6 +5,7 @@ use crate::agents::AgentKind;
 use crate::history::{Leak, LeakCause, MB};
 use crate::model::ServerKey;
 use crate::observed::ObservedServer;
+use crate::ports::PortLevel;
 use crate::state::SessionEndedGroup;
 use crate::watcher::ServerView;
 use std::collections::{HashMap, HashSet};
@@ -116,6 +117,23 @@ pub enum NeedsYou {
         idle_ms: u64,
         agent: AgentKind,
     },
+    /// The machine is running out of outgoing ports. On a server, it is the
+    /// one listening on the port that holds the most of them; standalone
+    /// (`TickReport::port_card`) otherwise, with `port` 0 when no port stands
+    /// out (the gauge only).
+    PortStorm {
+        level: PortLevel,
+        /// Sockets held toward `port`.
+        sockets: u32,
+        port: u16,
+        /// Share of the outgoing port range in use.
+        used_pct: u32,
+        /// The process opening most of them, when one does.
+        client_pid: Option<i32>,
+        client_name: Option<String>,
+        /// The server's command or port is excluded: never stoppable.
+        excluded: bool,
+    },
 }
 
 /// The one action a card suggests.
@@ -132,7 +150,9 @@ impl NeedsYou {
         match self {
             NeedsYou::Leak { .. } => SuggestedAction::Restart,
             NeedsYou::AboutToStop { .. } => SuggestedAction::Postpone,
-            NeedsYou::SessionEndedOpen | NeedsYou::IdleAlert { .. } => SuggestedAction::Stop,
+            NeedsYou::SessionEndedOpen
+            | NeedsYou::IdleAlert { .. }
+            | NeedsYou::PortStorm { .. } => SuggestedAction::Stop,
         }
     }
 }
@@ -181,27 +201,47 @@ pub fn needs_you(
 /// (`needs_you`), then observed servers, which only ever show a leak.
 /// `leaks` holds the leak each card shows, `ended_open` the servers still
 /// open after their session ended, `idle_alerts` the servers whose idle
-/// alert card shows.
+/// alert card shows. `storm` is the port storm card and the server it sits
+/// on: it replaces any other card of that server, a kept one included.
 pub fn needs_you_cards(
     servers: &[ServerView],
     observed: &[ObservedServer],
     leaks: &HashMap<ServerKey, Leak>,
     ended_open: &HashSet<ServerKey>,
     idle_alerts: &HashSet<ServerKey>,
+    storm: Option<&(ServerKey, NeedsYou)>,
 ) -> Vec<(ServerKey, NeedsYou)> {
+    let storm_on = |key: ServerKey| storm.filter(|(k, _)| *k == key).map(|(_, n)| n.clone());
     let tracked = servers.iter().filter_map(|v| {
-        let n = needs_you(
-            v,
-            leaks.get(&v.key).copied(),
-            ended_open.contains(&v.key),
-            idle_alerts.contains(&v.key),
-        );
+        let n = storm_on(v.key).or_else(|| {
+            needs_you(
+                v,
+                leaks.get(&v.key).copied(),
+                ended_open.contains(&v.key),
+                idle_alerts.contains(&v.key),
+            )
+        });
         n.map(|n| (v.key, n))
     });
-    let observed = observed
-        .iter()
-        .filter_map(|o| leaks.get(&o.key).map(|&l| (o.key, NeedsYou::from(l))));
+    let observed = observed.iter().filter_map(|o| {
+        storm_on(o.key)
+            .or_else(|| leaks.get(&o.key).map(|&l| NeedsYou::from(l)))
+            .map(|n| (o.key, n))
+    });
     tracked.chain(observed).collect()
+}
+
+/// `16,296`: a count with `,` between thousands.
+pub fn thousands(n: u32) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// The one-sentence reason on a card.
@@ -222,6 +262,33 @@ pub fn card_reason(n: &NeedsYou) -> String {
         NeedsYou::SessionEndedOpen => "Session ended, still open in a browser".to_string(),
         NeedsYou::IdleAlert { idle_ms, agent } => {
             format!("{} session idle {}", agent.label(), format_idle(*idle_ms))
+        }
+        NeedsYou::PortStorm {
+            level,
+            sockets,
+            port,
+            used_pct,
+            client_pid,
+            client_name,
+            ..
+        } => {
+            let head = match level {
+                PortLevel::Warning => "Ports nearly full: ",
+                PortLevel::Critical => "Ports full, new connections will fail: ",
+            };
+            if *port == 0 {
+                return format!("{head}{used_pct}% of outgoing ports in use");
+            }
+            let from = match (client_name, client_pid) {
+                (Some(name), Some(pid)) => format!("{name} (pid {pid})"),
+                (Some(name), None) => name.clone(),
+                (None, Some(pid)) => format!("pid {pid}"),
+                (None, None) => "several apps".to_string(),
+            };
+            format!(
+                "{head}{} dead connections to :{port} from {from}",
+                thousands(*sockets)
+            )
         }
     }
 }
@@ -447,7 +514,7 @@ mod tests {
         };
         let leaks = HashMap::from([(key(2), size_leak(mb(3000))), (key(9), size_leak(mb(3000)))]);
         let idle = HashSet::from([key(8)]);
-        let cards = needs_you_cards(&[a, b], &[o(8), o(9)], &leaks, &HashSet::new(), &idle);
+        let cards = needs_you_cards(&[a, b], &[o(8), o(9)], &leaks, &HashSet::new(), &idle, None);
         assert_eq!(
             cards,
             vec![
@@ -627,6 +694,64 @@ mod tests {
         for s in all {
             assert!(!s.contains('\u{2014}'), "{s}");
         }
+    }
+
+    fn storm(
+        level: PortLevel,
+        port: u16,
+        client_pid: Option<i32>,
+        client_name: Option<&str>,
+    ) -> NeedsYou {
+        NeedsYou::PortStorm {
+            level,
+            sockets: 16296,
+            port,
+            used_pct: 62,
+            client_pid,
+            client_name: client_name.map(str::to_string),
+            excluded: false,
+        }
+    }
+
+    #[test]
+    fn port_storm_reasons() {
+        let w = PortLevel::Warning;
+        let reasons = [
+            card_reason(&storm(w, 8081, Some(52310), Some("ExampleApp"))),
+            card_reason(&storm(w, 8081, None, None)),
+            card_reason(&storm(w, 8081, Some(52310), None)),
+            card_reason(&storm(
+                PortLevel::Critical,
+                8081,
+                Some(52310),
+                Some("ExampleApp"),
+            )),
+            card_reason(&storm(w, 0, None, None)),
+            card_reason(&storm(PortLevel::Critical, 0, None, None)),
+        ];
+        assert_eq!(
+            reasons,
+            [
+                "Ports nearly full: 16,296 dead connections to :8081 from ExampleApp (pid 52310)",
+                "Ports nearly full: 16,296 dead connections to :8081 from several apps",
+                "Ports nearly full: 16,296 dead connections to :8081 from pid 52310",
+                "Ports full, new connections will fail: 16,296 dead connections to :8081 from ExampleApp (pid 52310)",
+                "Ports nearly full: 62% of outgoing ports in use",
+                "Ports full, new connections will fail: 62% of outgoing ports in use",
+            ]
+        );
+        assert_eq!(
+            storm(w, 8081, None, None).suggested_action(),
+            SuggestedAction::Stop
+        );
+    }
+
+    #[test]
+    fn thousands_separator() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1000), "1,000");
+        assert_eq!(thousands(1_234_567), "1,234,567");
     }
 
     #[test]

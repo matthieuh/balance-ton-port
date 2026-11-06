@@ -7,6 +7,7 @@ pub mod labels;
 pub mod model;
 pub mod observed;
 pub mod platform;
+pub mod ports;
 pub mod probe;
 pub mod restart;
 pub mod run;

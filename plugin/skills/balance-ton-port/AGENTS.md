@@ -28,6 +28,8 @@ Without `btp run` (older btp), run `btp list --json` and read the `servers` arra
 
 Run `btp logs <port> --errors` before guessing (`btp logs <port>` for the last 200 lines, `-n N`, `-f`).
 
+If `btp list --json` shows `port_pressure.in_use` at or above half of `port_pressure.range_size` (or `btp list` prints a `ports nearly full` or `ports full` line), tell the user which process is flooding which port and do not start another server until it drops.
+
 ### Tell btp your intent
 
 - `btp note <port> --keep "<why>"` for a server you start for the user to look at (a preview, a demo).

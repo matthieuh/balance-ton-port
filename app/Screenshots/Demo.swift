@@ -54,6 +54,27 @@ enum Demo {
         quiet(pid: 41_009, port: 11_434, title: "ollama", rss: 64 * mb),
     ]
 
+    /// A port storm card: `sockets` dead connections to `port` (0: no port
+    /// stands out) from a made-up client.
+    static func storm(port: UInt16, level: String = "warning", action: String = "stop") -> CardFfi {
+        CardFfi(
+            kind: "port_storm", reason: "", action: action, rssBytes: 0, growthBytes: 0, inMs: 0, idleMs: 0,
+            portLevel: level, port: port, sockets: 14_212, clientPid: 52_310, clientName: "ExampleApp",
+            usedPct: 87
+        )
+    }
+
+    /// The menu while the mobile server's port is flooded: the alert is that
+    /// server's card.
+    static var stormOnServer: [ServerViewFfi] {
+        servers.map { s in
+            guard s.port == 8081 else { return s }
+            var v = s
+            v.card = storm(port: 8081)
+            return v
+        }
+    }
+
     static let memory = MemoryBarFfi(
         devBytes: servers.reduce(0) { $0 + $1.rssBytes }, appsBytes: 15_200 * mb,
         freeBytes: 12_100 * mb, totalBytes: 32_768 * mb, line: "", freeLow: false

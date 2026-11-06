@@ -277,4 +277,58 @@ final class CopyTests: XCTestCase {
             XCTAssertNotNil(strings[key], key)
         }
     }
+
+    @MainActor
+    func testPortStormReason() throws {
+        func storm(level: String = "warning", port: UInt16 = 8081, pid: Int32? = 52_310, name: String? = "ExampleApp") -> CardFfi {
+            CardFfi(
+                kind: "port_storm", reason: "", action: "stop", rssBytes: 0, growthBytes: 0, inMs: 0, idleMs: 0,
+                portLevel: level, port: port, sockets: 16_296, clientPid: pid, clientName: name, usedPct: 62
+            )
+        }
+        XCTAssertEqual(cardReason(storm()), "Ports nearly full: 16,296 dead connections to :8081 from ExampleApp (pid 52310)")
+        XCTAssertEqual(cardReason(storm(pid: nil, name: nil)), "Ports nearly full: 16,296 dead connections to :8081 from several apps")
+        XCTAssertEqual(cardReason(storm(pid: 12, name: nil)), "Ports nearly full: 16,296 dead connections to :8081 from pid 12")
+        XCTAssertEqual(
+            cardReason(storm(level: "critical")),
+            "Ports full, new connections will fail: 16,296 dead connections to :8081 from ExampleApp (pid 52310)"
+        )
+        XCTAssertEqual(cardReason(storm(port: 0)), "Ports nearly full: 62% of outgoing ports in use")
+        XCTAssertEqual(portNotificationBody(storm()), "16,296 dead connections to :8081 from ExampleApp (pid 52310)")
+        XCTAssertEqual(
+            portNotificationBody(storm(level: "critical")),
+            "New connections will fail: 16,296 dead connections to :8081 from ExampleApp (pid 52310)"
+        )
+        XCTAssertEqual(portNotificationBody(storm(port: 0)), "62% of outgoing ports in use")
+        XCTAssertEqual(portNotificationBody(storm(level: "critical", port: 0)), "New connections will fail: 62% of outgoing ports in use")
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "btp-copy-\(UUID().uuidString)"))
+        let model = LanguageModel(defaults: defaults, base: Bundle(for: CopyTests.self))
+        model.choice = .fr
+        XCTAssertEqual(
+            cardReason(storm(), bundle: model.bundle, locale: model.locale),
+            "Ports presque saturés\u{00A0}: 16\u{202F}296 connexions mortes vers :8081 depuis ExampleApp (pid 52310)"
+        )
+        XCTAssertEqual(
+            cardReason(storm(pid: nil, name: nil), bundle: model.bundle, locale: model.locale),
+            "Ports presque saturés\u{00A0}: 16\u{202F}296 connexions mortes vers :8081 depuis plusieurs apps"
+        )
+        XCTAssertEqual(
+            portNotificationBody(storm(), bundle: model.bundle, locale: model.locale),
+            "16\u{202F}296 connexions mortes vers :8081 depuis ExampleApp (pid 52310)"
+        )
+    }
+
+    func testPortStormTitleFollowsTheLevel() {
+        XCTAssertEqual(portStormTitle(level: "critical"), "Ports full")
+        XCTAssertEqual(portStormTitle(level: "warning"), "Ports nearly full")
+        XCTAssertEqual(portStormTitle(level: ""), "Ports nearly full")
+        XCTAssertEqual(
+            menuBarAccessibilityLabel(needsYou: 1, pressure: .normal, portLevel: "critical"),
+            "Balance ton port, 1 server needs you, outgoing ports full"
+        )
+        XCTAssertEqual(
+            menuBarAccessibilityLabel(needsYou: 0, pressure: .normal, portLevel: "warning"),
+            "Balance ton port, outgoing ports nearly full"
+        )
+    }
 }

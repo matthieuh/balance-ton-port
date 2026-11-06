@@ -8,6 +8,9 @@ use std::path::PathBuf;
 mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::MacOs;
+// The parser is pure so its tests run on every OS; only macOS calls it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod pcblist;
 
 /// A process listening on a TCP port (IPv4 or IPv6, reported once).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -46,6 +49,41 @@ pub struct MachineMemory {
     /// As Activity Monitor's "Memory Used": app memory (internal minus
     /// purgeable) + wired + compressed.
     pub used_bytes: u64,
+}
+
+/// Pressure on the ephemeral TCP port range.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PortPressure {
+    /// Number of ports in the ephemeral range.
+    pub range_size: u32,
+    /// Ports of the range held by a socket.
+    pub in_use: u32,
+    /// Of those, sockets in TIME_WAIT.
+    pub time_wait: u32,
+    /// The destination holding the most sockets, if any.
+    pub top: Option<StormTarget>,
+}
+
+impl PortPressure {
+    /// Share of the range in use, rounded down and at most 100; 0 for an empty
+    /// range.
+    pub fn used_pct(&self) -> u32 {
+        if self.range_size == 0 {
+            return 0;
+        }
+        (u64::from(self.in_use) * 100 / u64::from(self.range_size)).min(100) as u32
+    }
+}
+
+/// The destination that holds the most ephemeral ports, and who opens them.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StormTarget {
+    pub port: u16,
+    /// The destination is on this machine.
+    pub local: bool,
+    pub sockets: u32,
+    pub client_pid: Option<i32>,
+    pub client_name: Option<String>,
 }
 
 pub trait Platform {
@@ -91,6 +129,10 @@ pub trait Platform {
     fn port_answers(&self, port: u16) -> bool {
         let _ = port;
         false
+    }
+    /// Pressure on the ephemeral port range, `None` when it cannot be read.
+    fn port_pressure(&self) -> Option<PortPressure> {
+        None
     }
 }
 
@@ -153,7 +195,9 @@ pub use fake::FakePlatform;
 
 #[cfg(any(test, feature = "fake"))]
 mod fake {
-    use super::{format_proc_start, Listener, MachineMemory, Platform, ProcInfo, ProcResources};
+    use super::{
+        format_proc_start, Listener, MachineMemory, Platform, PortPressure, ProcInfo, ProcResources,
+    };
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -176,6 +220,7 @@ mod fake {
         established_from: Vec<(i32, u16, i32, u32)>,
         /// Ports held by a listener `listeners` does not list.
         foreign_ports: HashSet<u16>,
+        port_pressure: Option<PortPressure>,
     }
 
     /// In-memory platform for tests. SIGTERM and SIGKILL remove a process
@@ -226,6 +271,10 @@ mod fake {
 
         pub fn set_established(&self, pid: i32, port: u16, n: u32) {
             self.st().established.insert((pid, port), n);
+        }
+
+        pub fn set_port_pressure(&self, p: Option<PortPressure>) {
+            self.st().port_pressure = p;
         }
 
         pub fn ignore_sigterm(&self, pid: i32) {
@@ -426,6 +475,10 @@ mod fake {
             st.foreign_ports.contains(&port) || st.listeners.iter().any(|l| l.port == port)
         }
 
+        fn port_pressure(&self) -> Option<PortPressure> {
+            self.st().port_pressure.clone()
+        }
+
         fn pids_named(&self, name: &str) -> Vec<i32> {
             let st = self.st();
             st.procs
@@ -566,6 +619,36 @@ mod tests {
         assert_eq!(f.exe_path(30), None);
         f.set_exe(30, "/usr/bin/bun");
         assert_eq!(f.exe_path(30), Some(PathBuf::from("/usr/bin/bun")));
+    }
+
+    #[test]
+    fn used_pct_rounds_down() {
+        let p = PortPressure {
+            range_size: 16384,
+            in_use: 16296,
+            time_wait: 0,
+            top: None,
+        };
+        assert_eq!(p.used_pct(), 99);
+        let empty = PortPressure {
+            range_size: 0,
+            in_use: 5,
+            time_wait: 0,
+            top: None,
+        };
+        assert_eq!(empty.used_pct(), 0);
+        // Sockets can outnumber a narrowed range: never above 100.
+        let over = PortPressure {
+            range_size: 100,
+            in_use: 250,
+            time_wait: 0,
+            top: None,
+        };
+        assert_eq!(over.used_pct(), 100);
+        let f = FakePlatform::new();
+        assert_eq!(f.port_pressure(), None);
+        f.set_port_pressure(Some(p.clone()));
+        assert_eq!(f.port_pressure(), Some(p));
     }
 
     #[test]

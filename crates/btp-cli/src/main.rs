@@ -7,12 +7,15 @@ mod logs;
 mod run;
 mod shell_init;
 
+use btp_core::config::Config;
 use btp_core::config::{data_dir, effective_claude_dirs, read_config, save_config};
 use btp_core::display::format_idle as ago;
-use btp_core::display::{format_idle, name_list, server_state as state_label, session_ended_body};
+use btp_core::display::{
+    format_idle, name_list, server_state as state_label, session_ended_body, thousands,
+};
 use btp_core::labels::{location_label, tool_label};
 use btp_core::model::{KillReason, KillTarget, ServerKey, TrackedServer};
-use btp_core::platform::{MacOs, Platform};
+use btp_core::platform::{MacOs, Platform, PortPressure};
 use btp_core::state::{is_read_only_error, read_state_readonly, KillRecord, SessionEndedGroup};
 use btp_core::watcher::{
     acquire_watch_lock, now_ms, NoteCmd, NoteOutcome, OwnKillOutcome, ServerView, TickReport,
@@ -209,6 +212,37 @@ struct ServerOut<'a> {
 struct ListOutput<'a> {
     servers: Vec<ServerOut<'a>>,
     recent_kills: &'a [KillRecord],
+    /// The machine-wide outgoing port usage, `null` when the platform
+    /// reports none (or in the read-only fallback, where nothing was read).
+    port_pressure: Option<&'a PortPressure>,
+}
+
+/// The stderr line of `btp list` when the port alert is shown: the share of
+/// outgoing ports in use reached the warning threshold.
+fn pressure_warning(p: &PortPressure, cfg: &Config) -> Option<String> {
+    let pct = p.used_pct();
+    if u64::from(pct) < cfg.port_pressure_warn_pct {
+        return None;
+    }
+    let head = if u64::from(pct) >= cfg.port_pressure_critical_pct {
+        format!("btp: ports full ({pct}%), new connections will fail")
+    } else {
+        format!("btp: ports nearly full ({pct}%)")
+    };
+    let Some(top) = p.top.as_ref().filter(|t| t.port != 0) else {
+        return Some(head);
+    };
+    let from = match (&top.client_name, top.client_pid) {
+        (Some(name), Some(pid)) => format!("{name} (pid {pid})"),
+        (Some(name), None) => name.clone(),
+        (None, Some(pid)) => format!("pid {pid}"),
+        (None, None) => "several apps".to_string(),
+    };
+    Some(format!(
+        "{head}: {} dead connections to :{} from {from}",
+        thousands(top.sockets),
+        top.port
+    ))
 }
 
 enum Failure {
@@ -291,10 +325,15 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
                 .observe(now_ms())
                 .and_then(|report| {
                     let kills = btp_core::state::with_state(&dir, |s| s.recent_kills.clone())?;
-                    Ok((report.servers, report.config_error, kills))
+                    Ok((
+                        report.servers,
+                        report.config_error,
+                        kills,
+                        report.port_pressure,
+                    ))
                 });
             let mut probed = true;
-            let (servers, config_error, kills) = match pass {
+            let (servers, config_error, kills, pressure) = match pass {
                 Ok(all) => all,
                 Err(e) if is_read_only_error(&e) => {
                     let saved = read_state_readonly(&dir)?;
@@ -304,11 +343,17 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
                     probed = false;
                     let now = now_ms();
                     let servers = saved.servers.iter().map(|s| saved_view(s, now)).collect();
-                    (servers, None, saved.recent_kills)
+                    (servers, None, saved.recent_kills, None)
                 }
                 Err(e) => return Err(e.into()),
             };
             warn_config(config_error.as_deref());
+            if let Some(line) = pressure
+                .as_ref()
+                .and_then(|p| pressure_warning(p, &read_config(&dir).unwrap_or_default()))
+            {
+                eprintln!("{line}");
+            }
             if json {
                 let out = ListOutput {
                     servers: servers
@@ -320,6 +365,7 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
                         })
                         .collect(),
                     recent_kills: &kills,
+                    port_pressure: pressure.as_ref(),
                 };
                 println!(
                     "{}",
@@ -515,6 +561,7 @@ fn run(cmd: Cmd) -> Result<u8, Failure> {
                 }
                 ConfigCmd::Set { key, value } => {
                     cfg.set(&key, &value).map_err(Failure::User)?;
+                    cfg.validate().map_err(Failure::User)?;
                     save_config(&dir, &cfg)?;
                     println!("{key} = {value}");
                 }
@@ -1004,6 +1051,79 @@ mod tests {
     use super::*;
     use btp_core::agents::AgentKind;
     use btp_core::model::ServerKey;
+    use btp_core::platform::StormTarget;
+
+    fn pressure(in_use: u32, top: Option<StormTarget>) -> PortPressure {
+        PortPressure {
+            range_size: 16384,
+            in_use,
+            time_wait: in_use,
+            top,
+        }
+    }
+
+    fn flood() -> StormTarget {
+        StormTarget {
+            port: 8081,
+            local: true,
+            sockets: 16296,
+            client_pid: Some(52310),
+            client_name: Some("ExampleApp".into()),
+        }
+    }
+
+    #[test]
+    fn list_json_has_port_pressure() {
+        let p = pressure(16296, Some(flood()));
+        let out = ListOutput {
+            servers: vec![],
+            recent_kills: &[],
+            port_pressure: Some(&p),
+        };
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(
+            json.contains(r#""port_pressure":{"range_size":16384,"in_use":16296,"#),
+            "{json}"
+        );
+        let none = ListOutput {
+            servers: vec![],
+            recent_kills: &[],
+            port_pressure: None,
+        };
+        let json = serde_json::to_string(&none).unwrap();
+        assert!(json.contains(r#""port_pressure":null"#), "{json}");
+    }
+
+    #[test]
+    fn list_warns_on_pressure() {
+        let cfg = Config::default();
+        // Warning: below the critical level.
+        assert_eq!(
+            pressure_warning(&pressure(10214, Some(flood())), &cfg).as_deref(),
+            Some("btp: ports nearly full (62%): 16,296 dead connections to :8081 from ExampleApp (pid 52310)")
+        );
+        // Critical: the line says new connections will fail.
+        assert_eq!(
+            pressure_warning(&pressure(16296, Some(flood())), &cfg).as_deref(),
+            Some("btp: ports full (99%), new connections will fail: 16,296 dead connections to :8081 from ExampleApp (pid 52310)")
+        );
+        assert_eq!(
+            pressure_warning(&pressure(16296, None), &cfg).as_deref(),
+            Some("btp: ports full (99%), new connections will fail")
+        );
+        // Just below critical (85%): still the warning wording.
+        assert_eq!(
+            pressure_warning(&pressure(16384 * 84 / 100 + 1, None), &cfg).as_deref(),
+            Some("btp: ports nearly full (84%)")
+        );
+        // Calm: nothing.
+        assert_eq!(pressure_warning(&pressure(3000, Some(flood())), &cfg), None);
+        // No known flood: the share alone.
+        assert_eq!(
+            pressure_warning(&pressure(9000, None), &cfg).as_deref(),
+            Some("btp: ports nearly full (54%)")
+        );
+    }
 
     fn view(port: u16, alive: bool, idle_ms: u64) -> ServerView {
         ServerView {

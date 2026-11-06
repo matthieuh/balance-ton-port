@@ -9,11 +9,13 @@ struct MenuBarLabel: View {
     @EnvironmentObject private var language: LanguageModel
 
     var body: some View {
-        let needsYou = menuSections(model.servers).needsYou.count
+        // The standalone port storm card counts like a server's card.
+        let needsYou = menuSections(model.servers).needsYou.count + (model.portCard == nil ? 0 : 1)
         let label = menuBarAccessibilityLabel(
-            needsYou: needsYou, pressure: memory.pressure, bundle: language.bundle, locale: language.locale
+            needsYou: needsYou, pressure: memory.pressure, portLevel: model.portLevel,
+            bundle: language.bundle, locale: language.locale
         )
-        Image(nsImage: menuBarImage(menuBarStatus(needsYou: needsYou, pressure: memory.pressure)))
+        Image(nsImage: menuBarImage(menuBarStatus(needsYou: needsYou, pressure: memory.pressure, portLevel: model.portLevel)))
             .accessibilityLabel(Text(verbatim: label))
             .help(label)
     }
