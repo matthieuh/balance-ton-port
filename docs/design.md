@@ -126,7 +126,7 @@ macOS hands out outgoing TCP ports from one machine-wide range (`net.inet.ip.por
 
 **CLI.** `btp list --json` has a `port_pressure` object (`range_size`, `in_use`, `time_wait`, `top`), `null` when the platform reports none. `btp list` prints one line on stderr when usage is at or above the warning threshold, for example `btp: ports nearly full (62%): 10,214 dead connections to :8081 from node (pid 4120)`. The skill tells agents to tell the user which process floods which port, and not to start another server until it drops.
 
-**Limits.** Sockets the kernel keeps in TIME_WAIT cannot be freed: stopping the client or the server only stops new ones, and the ports come back as TIME_WAIT ends. The layout of `pcblist_n` is not a public ABI. The reader checks the record kinds and refuses a layout it does not know: port pressure is then off, with one note on stderr, and nothing else changes.
+**Limits.** Sockets the kernel keeps in TIME_WAIT cannot be freed: stopping the client or the server only stops new ones, and the ports come back as TIME_WAIT ends. The layout of `pcblist_n` is not a public ABI. The reader checks the record kinds and refuses a layout it does not know: port pressure is then off, with one note on stderr, and nothing else changes. Since macOS 27 the kernel lists another process's sockets only to a process allowed to see them: the menu bar app is, a bare `btp` run from a terminal usually is not. The reader notices (the list holds far fewer sockets than its header counts) and falls back to the gauge alone, with `pcbcount` as `in_use` (an upper bound) and no top port, so `btp list` still warns but cannot name the port or the client.
 
 ## 10. Observed servers
 

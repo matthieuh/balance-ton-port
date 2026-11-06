@@ -145,6 +145,20 @@ fn sock(inp: &[u8], so: &[u8], tcp: &[u8]) -> Option<Sock> {
     })
 }
 
+/// `xinpgen.xig_count` of the list's header: the TCP sockets of the whole
+/// machine, even when the kernel leaves most of them out of the list.
+pub(crate) fn header_count(buf: &[u8]) -> Option<u32> {
+    u32_at(buf, 4)
+}
+
+/// True when the list holds far fewer sockets than its header counts. Since
+/// macOS 27 the kernel shows a process only its own sockets unless the
+/// process may see the others (the menu bar app may, a bare `btp` run from a
+/// terminal may not), so an empty list must not read as "no pressure".
+pub(crate) fn looks_filtered(header_count: u32, listed: usize) -> bool {
+    (listed as u64) * 2 < u64::from(header_count)
+}
+
 /// Ports in `first..=last`, 0 when inverted.
 pub(crate) fn range_size(first: u16, last: u16) -> u32 {
     if last >= first {
@@ -218,6 +232,25 @@ pub(crate) fn aggregate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filtered_list_is_told_apart() {
+        // The fixture is a whole list: its header count matches.
+        let socks = parse_pcblist_n(FIXTURE).unwrap();
+        let count = header_count(FIXTURE).unwrap();
+        assert!(
+            !looks_filtered(count, socks.len()),
+            "{count} vs {}",
+            socks.len()
+        );
+        // macOS 27 to a process without the right: header says 6,469, the
+        // list holds only this process's sockets (or none).
+        assert!(looks_filtered(6469, 0));
+        assert!(looks_filtered(6469, 20));
+        // A few sockets created or gone between the header and the walk.
+        assert!(!looks_filtered(6469, 6400));
+        assert!(!looks_filtered(0, 0));
+    }
 
     const FIXTURE: &[u8] = include_bytes!("../../tests/fixtures/pcblist_n.bin");
     /// Port of the listener the fixture's 300 client sockets connected to.

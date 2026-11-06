@@ -5,7 +5,7 @@
 //! Processes we may not inspect (other users, permission denied, gone
 //! between two calls) are skipped silently.
 
-use super::pcblist::{aggregate, parse_pcblist_n, range_size};
+use super::pcblist::{aggregate, header_count, looks_filtered, parse_pcblist_n, range_size};
 use super::{
     format_proc_start, Listener, MachineMemory, Platform, PortPressure, ProcInfo, ProcResources,
 };
@@ -586,7 +586,19 @@ fn proc_name(pid: i32) -> Option<String> {
 }
 
 /// Port pressure from the full socket list.
-fn full_port_pressure(first: u16, last: u16) -> Option<PortPressure> {
+/// The gauge alone from the machine-wide count: what the pre-check and a
+/// filtered list can tell. `in_use` is an upper bound (it counts every TCP
+/// socket); there is no top port.
+fn gauge_only(range_size: u32, count: u32) -> PortPressure {
+    PortPressure {
+        range_size,
+        in_use: count,
+        time_wait: 0,
+        top: None,
+    }
+}
+
+fn full_port_pressure(first: u16, last: u16, count: u32) -> Option<PortPressure> {
     let buf = pcblist_n()?;
     let Some(socks) = parse_pcblist_n(&buf) else {
         static WARNED: Once = Once::new();
@@ -598,6 +610,9 @@ fn full_port_pressure(first: u16, last: u16) -> Option<PortPressure> {
         });
         return None;
     };
+    if looks_filtered(header_count(&buf)?, socks.len()) {
+        return Some(gauge_only(range_size(first, last), count));
+    }
     let own = own_addresses();
     Some(aggregate(
         &socks,
@@ -834,14 +849,9 @@ impl Platform for MacOs {
         let count = u32::try_from(sysctl_int(c"net.inet.tcp.pcbcount")?).ok()?;
         let size = range_size(first, last);
         if skip_full_list(count, size) {
-            return Some(PortPressure {
-                range_size: size,
-                in_use: count,
-                time_wait: 0,
-                top: None,
-            });
+            return Some(gauge_only(size, count));
         }
-        full_port_pressure(first, last)
+        full_port_pressure(first, last, count)
     }
 
     fn pids_named(&self, name: &str) -> Vec<i32> {
@@ -934,8 +944,16 @@ mod tests {
             .iter()
             .all(|s| s.last_pid == me && is_loopback(&s.remote_addr)));
         let (first, last) = port_range().expect("port range");
-        let p = full_port_pressure(first, last).expect("pressure");
-        assert!(p.time_wait >= 50 && p.in_use >= p.time_wait);
+        let p = full_port_pressure(first, last, 7).expect("pressure");
+        let buf = pcblist_n().unwrap();
+        let listed = parse_pcblist_n(&buf).unwrap().len();
+        if looks_filtered(header_count(&buf).unwrap(), listed) {
+            // macOS 27 shows this test only its own sockets: the gauge
+            // falls back to the machine-wide count, with no top port.
+            assert_eq!((p.in_use, p.time_wait, p.top), (7, 0, None));
+        } else {
+            assert!(p.time_wait >= 50 && p.in_use >= p.time_wait);
+        }
     }
 
     #[test]
