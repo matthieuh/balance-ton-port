@@ -16,7 +16,10 @@ use crate::history::{AlertKind, EventKind, History, LeakAlerts, ProcId, ServerEv
 use crate::labels::{location_label, session_display_name, tool_label};
 use crate::model::{Action, KillReason, KillTarget, Note, Observation, ServerKey, TrackedServer};
 use crate::observed::{observed_servers_cached, ObservedServer, SystemCache};
-use crate::platform::{ancestry, format_proc_start, Listener, Platform, ProcInfo, ProcResources};
+use crate::platform::{
+    ancestry, format_proc_start, Listener, Platform, PortPressure, ProcInfo, ProcResources,
+};
+use crate::ports::{PortAlert, PortLevel, PORT_HYSTERESIS_PCT};
 use crate::probe::{PageMeta, ProbeCache, ProbeOutcome};
 use crate::restart::{
     pending_for, pending_holds, plan_restart, relinked, CommandSpawner, InFlight, InFlightGuard,
@@ -105,9 +108,53 @@ pub struct TickReport {
     /// `servers` order, then observed ones (a leak only). Always empty for
     /// `sweep`.
     pub needs_you: Vec<(ServerKey, NeedsYou)>,
+    /// The machine-wide outgoing port usage, read on every pass but `sweep`.
+    pub port_pressure: Option<PortPressure>,
+    /// The port storm card when no listed server holds the port (a
+    /// `NeedsYou::PortStorm` with no server), else `None`. On a server, the
+    /// card is in `needs_you`.
+    pub port_card: Option<NeedsYou>,
+    /// The port storm is due a notification, on every pass until
+    /// `mark_port_notified`. Always false for `sweep`.
+    pub port_due: bool,
     /// Set while `config.toml` cannot be read or parsed (the pass then ran
     /// on the last valid config, or the defaults if there never was one).
     pub config_error: Option<String>,
+}
+
+/// The port storm card at `level`, and the listed server it sits on: the
+/// one (tracked first, then observed) listening on the top port when that
+/// port is on this machine, else `None` (a standalone card, `port` 0 when no
+/// port stands out).
+fn storm_card(
+    level: PortLevel,
+    p: Option<&PortPressure>,
+    servers: &[ServerView],
+    observed: &[ObservedServer],
+) -> (Option<ServerKey>, NeedsYou) {
+    let top = p.and_then(|p| p.top.as_ref());
+    let holder = top.filter(|t| t.local).and_then(|t| {
+        servers
+            .iter()
+            .find(|v| v.ports.contains(&t.port))
+            .map(|v| (v.key, false))
+            .or_else(|| {
+                observed
+                    .iter()
+                    .find(|o| o.ports.contains(&t.port))
+                    .map(|o| (o.key, o.excluded))
+            })
+    });
+    let card = NeedsYou::PortStorm {
+        level,
+        sockets: top.map_or(0, |t| t.sockets),
+        port: top.map_or(0, |t| t.port),
+        used_pct: p.map_or(0, PortPressure::used_pct),
+        client_pid: top.and_then(|t| t.client_pid),
+        client_name: top.and_then(|t| t.client_name.clone()),
+        excluded: holder.is_some_and(|(_, excluded)| excluded),
+    };
+    (holder.map(|(key, _)| key), card)
 }
 
 /// Two notes of rows folded into one server: the cautious side wins (keep
@@ -645,6 +692,11 @@ pub struct Watcher<P: Platform> {
     idle_ignored: HashSet<ServerKey>,
     /// The cards of the last `tick` or `observe`, for `ignore_alert`.
     last_cards: HashMap<ServerKey, NeedsYou>,
+    /// The machine-wide port exhaustion alert, in memory only.
+    port_alert: PortAlert,
+    /// The last port pressure at or above the alert's clear line: the card
+    /// keeps showing it (and its server) while the clear timer runs.
+    port_seen: Option<PortPressure>,
     /// Starts a restart's process.
     spawner: Arc<dyn Spawner>,
     /// How long a restart waits for the port to be free, and how often it
@@ -677,6 +729,8 @@ impl<P: Platform> Watcher<P> {
             leaks: LeakAlerts::default(),
             idle_ignored: HashSet::new(),
             last_cards: HashMap::new(),
+            port_alert: PortAlert::default(),
+            port_seen: None,
             spawner: Arc::new(CommandSpawner),
             restart_wait: (Duration::from_secs(5), Duration::from_millis(100)),
             restart_check: RestartCheck::default(),
@@ -1129,12 +1183,25 @@ impl<P: Platform> Watcher<P> {
         self.leaks.mark_notified(key);
     }
 
+    /// Records that the port storm notification went out: no more until
+    /// the alert clears, or once more when it turns critical.
+    pub fn mark_port_notified(&mut self) {
+        self.port_alert.mark_notified();
+    }
+
+    /// "Ignore this alert" on the standalone port storm card: hidden, and
+    /// no notification, until the alert clears or turns critical.
+    pub fn ignore_port_alert(&mut self) {
+        self.port_alert.ignore();
+    }
+
     /// "Ignore this alert": dismisses the alert of the card the last pass
     /// showed for this server, and only that one. A leak card stays away
     /// until memory grows another 500 MB (or the leak ends for 10 min and
     /// comes back); an idle alert card until the idle period ends and a new
-    /// one starts. Any other card (about to stop, session ended but open)
-    /// is not an alert: `false`, nothing changes.
+    /// one starts; a port storm card like `ignore_port_alert`. Any other
+    /// card (about to stop, session ended but open) is not an alert:
+    /// `false`, nothing changes.
     pub fn ignore_alert(&mut self, key: ServerKey) -> bool {
         match self.last_cards.get(&key) {
             Some(NeedsYou::Leak { .. }) => {
@@ -1143,6 +1210,9 @@ impl<P: Platform> Watcher<P> {
             }
             Some(NeedsYou::IdleAlert { .. }) => {
                 self.idle_ignored.insert(key);
+            }
+            Some(NeedsYou::PortStorm { .. }) => {
+                self.port_alert.ignore();
             }
             _ => return false,
         }
@@ -1514,6 +1584,9 @@ impl<P: Platform> Watcher<P> {
             })?;
         let mut feeds = feeds;
         self.settle_run_logs(&mut report, now_ms);
+        if mode != Mode::Sweep {
+            report.port_pressure = self.platform.port_pressure();
+        }
         if !self.observed {
             // The CLI: no observed servers, history, leaks, cards or probes.
             return self.finish(report, to_kill, mode, &scan.cfg, now_ms);
@@ -1564,12 +1637,44 @@ impl<P: Platform> Watcher<P> {
                 .chain(idle_holds)
                 .filter(|k| !self.idle_ignored.contains(k))
                 .collect();
+            let port = self
+                .port_alert
+                .update(report.port_pressure.as_ref(), &scan.cfg, now_ms);
+            report.port_due = port.notify;
+            let clear_line = scan
+                .cfg
+                .port_pressure_warn_pct
+                .saturating_sub(PORT_HYSTERESIS_PCT);
+            if let Some(p) = report
+                .port_pressure
+                .as_ref()
+                .filter(|p| u64::from(p.used_pct()) >= clear_line)
+            {
+                self.port_seen = Some(p.clone());
+            }
+            let storm = port.shown.map(|level| {
+                storm_card(
+                    level,
+                    self.port_seen.as_ref(),
+                    &report.servers,
+                    &report.observed,
+                )
+            });
+            let on_server = match storm {
+                Some((Some(key), card)) => Some((key, card)),
+                Some((None, card)) => {
+                    report.port_card = Some(card);
+                    None
+                }
+                None => None,
+            };
             report.needs_you = needs_you_cards(
                 &report.servers,
                 &report.observed,
                 &leaks.shown,
                 &ended_open,
                 &idle_alerts,
+                on_server.as_ref(),
             );
             report.leaks = leaks.due;
             self.last_cards = report.needs_you.iter().cloned().collect();
@@ -1612,7 +1717,21 @@ impl<P: Platform> Watcher<P> {
         report.killed = killed;
         report.servers.retain(|v| !gone.contains(&v.key));
         report.leaks.retain(|k| !gone.contains(k));
-        report.needs_you.retain(|(k, _)| !gone.contains(k));
+        // The server holding the storm's port was just stopped: the card
+        // stands alone.
+        let mut storm_gone = None;
+        report.needs_you.retain(|(k, n)| {
+            if !gone.contains(k) {
+                return true;
+            }
+            if matches!(n, NeedsYou::PortStorm { .. }) {
+                storm_gone = Some(n.clone());
+            }
+            false
+        });
+        if storm_gone.is_some() {
+            report.port_card = storm_gone;
+        }
         Ok(report)
     }
 
@@ -1854,7 +1973,7 @@ mod tests {
     use super::*;
     use crate::config::save_config;
     use crate::model::KillReason;
-    use crate::platform::{ancestry, format_proc_start, FakePlatform};
+    use crate::platform::{ancestry, format_proc_start, FakePlatform, StormTarget};
     use crate::sessions::{read_sessions, SessionStatus};
     use crate::state::with_state;
     use std::fs;
@@ -4652,5 +4771,254 @@ mod tests {
         f.p().spawn(60, 1, START + 99 * SEC, "other", "/tmp");
         f.w.tick(T0 + MIN).unwrap();
         assert!(state_runs(&f).is_empty());
+    }
+
+    /// 99% of a 16384-port range in use, the top port `port` on this machine,
+    /// opened by ExampleApp (pid 52310).
+    fn storm_pressure(port: u16) -> PortPressure {
+        PortPressure {
+            range_size: 16384,
+            in_use: 16296,
+            time_wait: 16296,
+            top: Some(StormTarget {
+                port,
+                local: true,
+                sockets: 16296,
+                client_pid: Some(52310),
+                client_name: Some("ExampleApp".into()),
+            }),
+        }
+    }
+
+    fn calm_pressure() -> PortPressure {
+        PortPressure {
+            range_size: 16384,
+            in_use: 100,
+            time_wait: 0,
+            top: None,
+        }
+    }
+
+    fn is_storm(n: Option<NeedsYou>) -> bool {
+        matches!(n, Some(NeedsYou::PortStorm { .. }))
+    }
+
+    fn any_storm(r: &TickReport) -> bool {
+        r.port_card.is_some()
+            || r.needs_you
+                .iter()
+                .any(|(_, n)| matches!(n, NeedsYou::PortStorm { .. }))
+    }
+
+    #[test]
+    fn storm_attaches_to_tracked_server() {
+        let mut f = fx();
+        // The tree also listens on 8081, beside its primary port 3000.
+        f.p().add_listener(30, 8081);
+        f.p().set_port_pressure(Some(storm_pressure(8081)));
+        let r = f.w.tick(T0).unwrap();
+        assert_eq!(r.port_pressure, Some(storm_pressure(8081)));
+        assert_eq!(
+            card(&r, key30()),
+            Some(NeedsYou::PortStorm {
+                level: PortLevel::Critical,
+                sockets: 16296,
+                port: 8081,
+                used_pct: 99,
+                client_pid: Some(52310),
+                client_name: Some("ExampleApp".into()),
+                excluded: false,
+            })
+        );
+        assert_eq!(r.port_card, None);
+        assert!(r.port_due);
+        // Due on every pass until delivered, then the card stays.
+        assert!(f.w.tick(T0 + 1000).unwrap().port_due);
+        f.w.mark_port_notified();
+        let r = f.w.tick(T0 + 2000).unwrap();
+        assert!(!r.port_due);
+        assert!(is_storm(card(&r, key30())));
+        // A kept server still shows it.
+        f.w.keep(key30()).unwrap();
+        assert!(is_storm(card(&f.w.tick(T0 + 3000).unwrap(), key30())));
+    }
+
+    #[test]
+    fn storm_replaces_leak_card() {
+        let mut f = fx();
+        f.p().add_listener(30, 8081);
+        f.p().set_resources(30, 3000 * MB, 0);
+        f.p().set_port_pressure(Some(storm_pressure(8081)));
+        let r = f.w.tick(T0).unwrap();
+        assert!(is_storm(card(&r, key30())));
+        assert_eq!(r.needs_you.len(), 1);
+        // Below the clear line: the storm holds for 60 s, then the leak is back.
+        f.p().set_port_pressure(Some(calm_pressure()));
+        assert!(is_storm(card(&f.w.tick(T0 + MIN).unwrap(), key30())));
+        let r = f.w.tick(T0 + 2 * MIN).unwrap();
+        assert!(matches!(card(&r, key30()), Some(NeedsYou::Leak { .. })));
+        assert!(!any_storm(&r));
+    }
+
+    #[test]
+    fn storm_on_excluded_server_has_no_stop() {
+        let mut f = fx();
+        f.p()
+            .spawn(50, 10, START + 50 * SEC, "postgres -D /db", "/w");
+        f.p().set_exe(50, "/opt/homebrew/bin/postgres");
+        f.p().add_listener(50, 5432);
+        f.p().set_port_pressure(Some(storm_pressure(5432)));
+        let r = f.w.tick(T0).unwrap();
+        assert!(r.observed[0].excluded);
+        assert!(matches!(
+            card(&r, key50()),
+            Some(NeedsYou::PortStorm {
+                port: 5432,
+                excluded: true,
+                ..
+            })
+        ));
+        assert_eq!(r.port_card, None);
+    }
+
+    #[test]
+    fn no_attach_without_top() {
+        let mut f = fx();
+        f.p().set_port_pressure(Some(PortPressure {
+            range_size: 16384,
+            in_use: 9831,
+            time_wait: 9000,
+            top: None,
+        }));
+        let r = f.w.tick(T0).unwrap();
+        assert_eq!(
+            r.port_card,
+            Some(NeedsYou::PortStorm {
+                level: PortLevel::Warning,
+                sockets: 0,
+                port: 0,
+                used_pct: 60,
+                client_pid: None,
+                client_name: None,
+                excluded: false,
+            })
+        );
+        assert!(r.needs_you.is_empty());
+        assert!(r.port_due);
+    }
+
+    #[test]
+    fn standalone_when_no_listed_server() {
+        let mut f = fx();
+        f.p().set_port_pressure(Some(storm_pressure(9999)));
+        let r = f.w.tick(T0).unwrap();
+        assert!(r.needs_you.is_empty());
+        assert!(matches!(
+            r.port_card,
+            Some(NeedsYou::PortStorm {
+                port: 9999,
+                sockets: 16296,
+                excluded: false,
+                ..
+            })
+        ));
+        // A remote destination on a listed server's port is not that server.
+        let mut remote = storm_pressure(3000);
+        remote.top.as_mut().unwrap().local = false;
+        f.p().set_port_pressure(Some(remote));
+        let r = f.w.tick(T0 + 1000).unwrap();
+        assert!(r.needs_you.is_empty());
+        assert!(matches!(
+            r.port_card,
+            Some(NeedsYou::PortStorm { port: 3000, .. })
+        ));
+        // The standalone card's Ignore hides it until the alert clears.
+        f.w.ignore_port_alert();
+        let r = f.w.tick(T0 + 2000).unwrap();
+        assert!(!any_storm(&r) && !r.port_due);
+    }
+
+    #[test]
+    fn storm_follows_port_to_new_server() {
+        let mut f = fx();
+        f.p().spawn(50, 10, START + 50 * SEC, "next dev", "/w");
+        f.p().set_exe(50, NODE);
+        f.p().add_listener(50, 8081);
+        f.p().set_port_pressure(Some(storm_pressure(8081)));
+        let r = f.w.tick(T0).unwrap();
+        assert!(is_storm(card(&r, key50())));
+        f.w.mark_port_notified();
+        // Restarted under a new pid, same port.
+        f.p().remove_proc(50);
+        f.p().spawn(51, 10, START + 51 * SEC, "next dev", "/w");
+        f.p().set_exe(51, NODE);
+        f.p().add_listener(51, 8081);
+        let r = f.w.tick(T0 + 1000).unwrap();
+        let key51 = ServerKey {
+            pid: 51,
+            start_time: START + 51 * SEC,
+        };
+        assert!(is_storm(card(&r, key51)));
+        assert_eq!(card(&r, key50()), None);
+        assert!(!r.port_due);
+    }
+
+    #[test]
+    fn ignore_on_server_card_ignores_the_alert() {
+        let mut f = fx();
+        f.p().add_listener(30, 8081);
+        f.p().set_port_pressure(Some(storm_pressure(8081)));
+        f.w.tick(T0).unwrap();
+        assert!(f.w.ignore_alert(key30()));
+        let r = f.w.tick(T0 + 1000).unwrap();
+        assert!(!any_storm(&r) && !r.port_due);
+        // Clears after 60 s below the line, then a new storm shows again.
+        f.p().set_port_pressure(Some(calm_pressure()));
+        f.w.tick(T0 + MIN).unwrap();
+        assert!(!any_storm(&f.w.tick(T0 + 2 * MIN).unwrap()));
+        f.p().set_port_pressure(Some(storm_pressure(8081)));
+        let r = f.w.tick(T0 + 3 * MIN).unwrap();
+        assert!(is_storm(card(&r, key30())));
+        assert!(r.port_due);
+    }
+
+    #[test]
+    fn storm_stands_alone_once_its_server_is_stopped() {
+        let mut f = fx();
+        f.p().add_listener(30, 8081);
+        f.w.tick(T0).unwrap();
+        f.p().remove_proc(20);
+        f.p().set_port_pressure(Some(storm_pressure(8081)));
+        let r = f.w.tick(T0 + 20 * MIN).unwrap();
+        assert_eq!(r.killed.len(), 1);
+        assert!(r.needs_you.is_empty());
+        assert!(matches!(
+            r.port_card,
+            Some(NeedsYou::PortStorm { port: 8081, .. })
+        ));
+    }
+
+    #[test]
+    fn sweep_leaves_port_alert_alone() {
+        let mut f = fx();
+        f.p().set_port_pressure(Some(storm_pressure(9999)));
+        let r = f.w.sweep(T0).unwrap();
+        assert_eq!(r.port_pressure, None);
+        assert!(!any_storm(&r) && !r.port_due);
+        assert!(f.w.tick(T0 + 1000).unwrap().port_due);
+    }
+
+    #[test]
+    fn cli_pass_reports_pressure_without_cards() {
+        let mut f = fx();
+        f.w = std::mem::replace(
+            &mut f.w,
+            Watcher::new(FakePlatform::new(), f.data.path().to_path_buf()),
+        )
+        .with_observed(false);
+        f.p().set_port_pressure(Some(storm_pressure(9999)));
+        let r = f.w.tick(T0).unwrap();
+        assert_eq!(r.port_pressure, Some(storm_pressure(9999)));
+        assert!(!any_storm(&r) && !r.port_due);
     }
 }

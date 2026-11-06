@@ -39,6 +39,17 @@ final class CoreModel: ObservableObject {
     @Published private(set) var notificationPermission: NotificationPermission?
     /// Passes landed so far: an open detail refreshes on each.
     @Published private(set) var passesDone = 0
+    /// The port storm card when no listed server holds the flooded port
+    /// (a server holding it carries the card in its own row).
+    @Published private(set) var portCard: CardFfi?
+    /// `warning` or `critical` while a port storm card shows (on a server or
+    /// standalone), else empty: the pig's tint follows it.
+    @Published private(set) var portLevel = ""
+    /// The standalone card as the last pass reported it.
+    private var lastPortCard: CardFfi?
+    /// `passCount` when "Ignore this alert" hid the standalone card, until a
+    /// pass enqueued after it confirms (like `optimistic`).
+    private var portIgnoredSince: Int?
 
     private let core = Core()
     private let queue = DispatchQueue(label: "com.matthieuh.balancetonport.core", qos: .utility)
@@ -89,6 +100,9 @@ final class CoreModel: ObservableObject {
             case .server(.keep, let id): self.afterFirstPassDone { $0.keep(id) }
             case .server(.restart, let id): self.afterFirstPassDone { $0.restartFromNotification(id) }
             case .server(.ignoreAlert, let id): self.afterFirstPassDone { $0.ignoreAlert(id) }
+            case .portStorm(.stop, let id?): self.afterFirstPassDone { $0.stopFromNotification(id) }
+            case .portStorm(.stop, nil): break
+            case .portStorm(.ignore, let id): self.afterFirstPassDone { $0.ignorePortAlert(id) }
             case .sessionEnded(.stopNow, let id): self.stopSessionEnded(id)
             case .sessionEnded(.keep, let id): self.keepSessionEnded(id)
             }
@@ -113,10 +127,14 @@ final class CoreModel: ObservableObject {
     /// A model that never runs a pass or touches notifications, showing
     /// made-up servers as given: the README screenshots
     /// (`scripts/screenshots.sh`).
-    init(preview servers: [ServerViewFfi], memory: MemoryBarFfi, recentKills: [KillRecordFfi]) {
+    init(
+        preview servers: [ServerViewFfi], memory: MemoryBarFfi, recentKills: [KillRecordFfi], portCard: CardFfi? = nil
+    ) {
         self.servers = servers
         self.memory = memory
         self.recentKills = recentKills
+        self.portCard = portCard
+        portLevel = shownPortLevel(servers: servers, portCard: portCard)
         notificationPermission = .allowed(bannersOff: false)
     }
 
@@ -265,6 +283,20 @@ final class CoreModel: ObservableObject {
         restart(server)
     }
 
+    /// A port storm notification's Stop: the app is brought forward, so the
+    /// confirmation of a server no agent started shows on top.
+    private func stopFromNotification(_ id: ServerID) {
+        guard let server = lastPassServers.first(where: { $0.id == id }) else {
+            killNotice = missedKillNotice(
+                id, tracked: [], fromNotification: true, bundle: language.bundle, locale: language.locale
+            )
+            killNoticeAt = Date()
+            return
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        stop(server)
+    }
+
     private func runRestart(_ server: ServerViewFfi) {
         let id = server.id
         // Checked again here: a confirmation may have waited on screen.
@@ -350,6 +382,21 @@ final class CoreModel: ObservableObject {
         }
     }
 
+    /// "Ignore this alert" on the port storm, from the standalone card
+    /// (`id` nil) or its notification: the card goes at once, and no
+    /// notification comes back until the alert clears or turns critical.
+    func ignorePortAlert(_ id: ServerID? = nil) {
+        if let id {
+            applyOptimistic(id) { $0.card?.kind == "port_storm" ? alertIgnoredView($0) : $0 }
+        } else {
+            portIgnoredSince = passCount
+            publish()
+        }
+        Task {
+            try? await onCore { core in core.ignorePortAlert() }
+        }
+    }
+
     /// Shows the confirmation for a server no agent started, then runs
     /// `action` when the user agrees. Run from the main run loop, outside
     /// any main-queue job, so passes keep landing while the alert is up.
@@ -404,6 +451,12 @@ final class CoreModel: ObservableObject {
         servers = withHeldRestarts(lastPassServers, held: Array(restarts.values))
             .filter { killedByHand[$0.id] == nil }
             .map { optimistic[$0.id]?.apply($0) ?? $0 }
+        portCard = portIgnoredSince == nil ? lastPortCard : nil
+        let level = shownPortLevel(servers: servers, portCard: portCard)
+        if portAlertCleared(from: portLevel, to: level) {
+            notifier.removePortStorm()
+        }
+        portLevel = level
     }
 
     /// A session-ended notification's Stop now: stops each kept server of
@@ -485,7 +538,8 @@ final class CoreModel: ObservableObject {
                 return PassResult(
                     owner: owner, servers: report.servers, alerts: report.alerts,
                     kills: kills, scanIntervalS: scan, configError: report.configError,
-                    memory: report.memory, leaks: report.leaks
+                    memory: report.memory, leaks: report.leaks,
+                    portCard: report.portCard, portDue: report.portDue
                 )
             }
             watchedElsewhere = !result.owner
@@ -498,6 +552,8 @@ final class CoreModel: ObservableObject {
             lastPassServers = result.servers
             // This pass was enqueued after those actions: it shows them.
             optimistic = optimistic.filter { $0.value.since >= generation }
+            lastPortCard = result.portCard
+            if let since = portIgnoredSince, since < generation { portIgnoredSince = nil }
             for (id, restart) in restarts {
                 if releasesRestart(restart, generation: generation, now: now, servers: result.servers) {
                     restarts[id] = nil
@@ -544,6 +600,14 @@ final class CoreModel: ObservableObject {
                             core.markLeakNotified(pid: id.pid, startTime: id.startTime)
                         }
                     }
+                }
+            }
+            // One notification per port storm alert, posted read-only too
+            // (no other watcher notifies it); marked once added.
+            if let due = result.portDue {
+                let server = result.servers.first { $0.card?.kind == "port_storm" }
+                if await notifier.postPortStorm(due, server: server) {
+                    try await onCore { core in core.markPortNotified() }
                 }
             }
             await refreshNotificationPermission()
@@ -692,6 +756,8 @@ private struct PassResult: Sendable {
     let configError: String?
     let memory: MemoryBarFfi
     let leaks: [ServerViewFfi]
+    let portCard: CardFfi?
+    let portDue: CardFfi?
 }
 
 /// The detail's data fetched once per opened server (`CoreModel.detailOnce`).

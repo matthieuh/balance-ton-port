@@ -4,9 +4,11 @@ import SwiftUI
 // The menu's colors and icon tiles: pure, compiled into both the app and
 // BalanceTonPortTests.
 
-/// Leak and idle cards are amber; the session ended ones rose.
+/// Leak and idle cards are amber, a port storm too until it is critical
+/// (then red); the session ended ones rose.
 func cardTint(_ card: CardFfi) -> Color {
     switch card.kind {
+    case "port_storm": return card.portLevel == "critical" ? .red : .orange
     case "leak", "idle_alert": return .orange
     default: return .pink
     }
@@ -141,7 +143,8 @@ func dominantColors(_ png: Data, fallback: Color) -> [Color] {
 /// deeper shade on the light one, so it stays readable.
 func cardTextColor(_ card: CardFfi, dark: Bool) -> Color {
     switch card.kind {
-    case "leak", "idle_alert": return Color(hex: dark ? 0xE9B764 : 0x9A5B00)
+    case "port_storm" where card.portLevel != "critical", "leak", "idle_alert":
+        return Color(hex: dark ? 0xE9B764 : 0x9A5B00)
     default: return Color(hex: dark ? 0xFF9AA0 : 0xB4232F)
     }
 }

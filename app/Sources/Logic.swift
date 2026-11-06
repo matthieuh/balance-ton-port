@@ -14,6 +14,18 @@ extension ServerViewFfi {
     var id: ServerID { ServerID(pid: pid, startTime: startTime) }
 }
 
+extension CardFfi {
+    /// A card that is not a port storm: its port storm fields empty (the
+    /// tests and the README screenshots).
+    init(kind: String, reason: String, action: String, rssBytes: UInt64, growthBytes: Int64, inMs: UInt64, idleMs: UInt64) {
+        self.init(
+            kind: kind, reason: reason, action: action, rssBytes: rssBytes, growthBytes: growthBytes,
+            inMs: inMs, idleMs: idleMs, portLevel: "", port: 0, sockets: 0, clientPid: nil, clientName: nil,
+            usedPct: 0
+        )
+    }
+}
+
 // MARK: - Menu labels
 
 /// The menu panel's width and padding, and the indent of a card's second
@@ -96,8 +108,8 @@ private func memoryStep(_ s: ServerViewFfi) -> UInt64 {
     s.rssBytes / (64 * 1_048_576)
 }
 
-/// Cards: leak, session ended but open, about to stop, idle alert, then the
-/// biggest first. All good: the biggest first (in 64 MB steps); quiet
+/// Cards: port storm, leak, session ended but open, about to stop, idle
+/// alert, then the biggest first. All good: the biggest first (in 64 MB steps); quiet
 /// listeners go to Other ports, by port. The port (then the pid) breaks
 /// every tie, so rows do not swap between passes.
 func menuSections(_ servers: [ServerViewFfi], visibleAllGood: Int = allGoodVisibleRows) -> MenuSections {
@@ -119,12 +131,32 @@ func menuSections(_ servers: [ServerViewFfi], visibleAllGood: Int = allGoodVisib
 
 private func cardRank(_ kind: String?) -> Int {
     switch kind {
+    case "port_storm": return -1
     case "leak": return 0
     case "session_ended_open": return 1
     case "about_to_stop": return 2
     case "idle_alert": return 3
     default: return 4
     }
+}
+
+/// A card shows its pill unless it has no action (`none`: a port storm on
+/// an excluded server, or the standalone one).
+func cardShowsAction(_ card: CardFfi) -> Bool {
+    card.action != "none"
+}
+
+/// The level of the port storm card the menu shows (on a server or
+/// standalone), empty when there is none: the pig's tint follows it.
+func shownPortLevel(servers: [ServerViewFfi], portCard: CardFfi?) -> String {
+    let card = servers.lazy.compactMap(\.card).first { $0.kind == "port_storm" } ?? portCard
+    return card?.portLevel ?? ""
+}
+
+/// Whether the shown port level went from an alert back to none: the
+/// delivered notification is then stale and must be removed.
+func portAlertCleared(from old: String, to new: String) -> Bool {
+    !old.isEmpty && new.isEmpty
 }
 
 /// A card's pill is filled (amber) only for Restart, the fix for a leak.
@@ -258,10 +290,10 @@ struct MenuItem: Equatable, Sendable {
     let enabled: Bool
 }
 
-/// A card that is an alert, which "Ignore this alert" dismisses: a leak or
-/// an idle alert (the core refuses the others).
+/// A card that is an alert, which "Ignore this alert" dismisses: a leak, an
+/// idle alert or a port storm (the core refuses the others).
 func hasAlertCard(_ s: ServerViewFfi) -> Bool {
-    s.card?.kind == "leak" || s.card?.kind == "idle_alert"
+    ["leak", "idle_alert", "port_storm"].contains(s.card?.kind ?? "")
 }
 
 /// Stop is offered: not excluded, and no Restart of it running.
@@ -353,14 +385,14 @@ func postponedView(_ s: ServerViewFfi) -> ServerViewFfi {
     return v
 }
 
-/// The row right after Keep: no countdown, and only a leak or a session
-/// ended but open still shows a card.
+/// The row right after Keep: no countdown, and only a leak, a session
+/// ended but open or a port storm still shows a card.
 func keptView(_ s: ServerViewFfi) -> ServerViewFfi {
     var v = s
     v.killInMs = nil
     v.statusText = "kept by you"
     v.status = StatusFfi(kind: "kept_by_user", minutes: 0, agentLabel: "", reason: nil)
-    if v.card?.kind != "leak" && v.card?.kind != "session_ended_open" { v.card = nil }
+    if !["leak", "session_ended_open", "port_storm"].contains(v.card?.kind ?? "") { v.card = nil }
     return v
 }
 
@@ -392,19 +424,21 @@ func countdownTotalMs(_ s: ServerViewFfi, deadSessionIdleS: UInt64) -> UInt64 {
 }
 
 /// About to stop: Postpone 1 h, Stop now. Leak: Restart, Stop. Otherwise
-/// (in use included): Open, Stop.
+/// (a port storm and in use included): Open, Stop.
 func bottomButtons(_ s: ServerViewFfi) -> [DetailButton] {
     switch s.card?.kind {
     case "leak": return [.restart, .stop]
+    case "port_storm": return [.open, .stop]
     case "about_to_stop": return [.postpone, .stopNow]
     default: return [.open, .stop]
     }
 }
 
 /// The status card's own button: Postpone 1 h when about to stop, Restart
-/// for a leak.
+/// for a leak, Stop for a port storm the server can be stopped for.
 func statusCardAction(_ s: ServerViewFfi) -> DetailButton? {
     switch s.card?.kind {
+    case "port_storm": return s.card?.action == "stop" ? .stop : nil
     case "about_to_stop": return .postpone
     case "leak": return .restart
     default: return nil
@@ -576,6 +610,25 @@ func leakRequestID(_ id: ServerID) -> String {
     "leak-\(id.pid)-\(id.startTime)"
 }
 
+/// The port storm notification's identifier: one alert at a time, so a
+/// repeat replaces the earlier one.
+let portStormRequestID = "port-storm"
+
+/// What a port storm notification carries: the server it is on, when it is
+/// on one (its Stop finds it again).
+func portStormUserInfo(_ id: ServerID?) -> [String: Any] {
+    var info: [String: Any] = ["portStorm": true]
+    if let id { info.merge(notificationUserInfo(id)) { a, _ in a } }
+    return info
+}
+
+/// The port storm notification offers Stop when its card does (a server
+/// that is not excluded), else only Ignore.
+func portStormCategory(_ card: CardFfi, server: ServerViewFfi?) -> String {
+    card.action == "stop" && server != nil
+        ? NotificationIDs.portStormCategory : NotificationIDs.portStormIgnoreCategory
+}
+
 /// What a notification carries to find its server again. The start time is a
 /// string: property lists have no unsigned 64-bit integer.
 func notificationUserInfo(_ id: ServerID) -> [String: Any] {
@@ -643,6 +696,14 @@ enum NotificationAction: Sendable, Equatable {
     case ignoreAlert
 }
 
+/// The port storm notification's buttons.
+enum PortStormAction: Sendable, Equatable {
+    /// Stop the server holding the port (asks first for an observed one).
+    case stop
+    /// Ignore this alert until it clears or turns critical.
+    case ignore
+}
+
 /// The session-ended notification's buttons.
 enum SessionEndedAction: Sendable, Equatable {
     /// Stop every kept server of the session now.
@@ -656,6 +717,8 @@ enum NotificationIDs {
     static let idleCategory = "IDLE_SERVER"
     static let sessionEndedCategory = "SESSION_ENDED"
     static let leakCategory = "LEAK"
+    static let portStormCategory = "PORT_STORM"
+    static let portStormIgnoreCategory = "PORT_STORM_IGNORE"
     static let kill = "KILL"
     static let keep = "KEEP"
     static let stopNow = "STOP_NOW"
@@ -667,6 +730,8 @@ enum NotificationIDs {
 enum NotificationRoute: Equatable, Sendable {
     case server(NotificationAction, ServerID)
     case sessionEnded(SessionEndedAction, SessionEndedID)
+    /// The server holding the port, `nil` for the standalone card.
+    case portStorm(PortStormAction, ServerID?)
 }
 
 /// The route for a button press; `nil` for a tap on the body, a dismiss, the
@@ -677,6 +742,14 @@ func notificationRoute(actionIdentifier: String, userInfo info: [AnyHashable: An
         switch actionIdentifier {
         case NotificationIDs.stopNow: return .sessionEnded(.stopNow, group)
         case NotificationIDs.keep: return .sessionEnded(.keep, group)
+        default: return nil
+        }
+    }
+    if info["portStorm"] as? Bool == true {
+        let id = serverID(fromUserInfo: info)
+        switch actionIdentifier {
+        case NotificationIDs.kill: return id.map { .portStorm(.stop, $0) }
+        case NotificationIDs.ignore: return .portStorm(.ignore, id)
         default: return nil
         }
     }
@@ -817,6 +890,9 @@ struct SettingsDraft: Equatable, Sendable {
     /// switch of the General pane.
     var portConflict: String
     var portCheckHook: Bool
+    /// Port alert thresholds: no field in the form yet, saved back unchanged.
+    var portPressureWarnPct: UInt64
+    var portPressureCriticalPct: UInt64
 
     init(_ c: ConfigFfi) {
         deadSessionIdleS = c.deadSessionIdleS
@@ -830,6 +906,8 @@ struct SettingsDraft: Equatable, Sendable {
         leakGrowthMb = c.leakGrowthMb
         portConflict = c.portConflict
         portCheckHook = c.portCheckHook
+        portPressureWarnPct = c.portPressureWarnPct
+        portPressureCriticalPct = c.portPressureCriticalPct
     }
 
     var ffi: ConfigFfi {
@@ -844,7 +922,9 @@ struct SettingsDraft: Equatable, Sendable {
             leakMemoryMb: leakMemoryMb,
             leakGrowthMb: leakGrowthMb,
             portConflict: portConflict,
-            portCheckHook: portCheckHook
+            portCheckHook: portCheckHook,
+            portPressureWarnPct: portPressureWarnPct,
+            portPressureCriticalPct: portPressureCriticalPct
         )
     }
 
@@ -910,9 +990,10 @@ func addingPort(_ entry: String, to ports: [UInt16]) -> [UInt16]? {
     return ports + [port]
 }
 
-/// What the menu bar pig shows: red when memory pressure is critical, orange
-/// when it is at warning or servers need you, plain otherwise (`tint` nil).
-/// The count is the "Needs you" cards, capped at `9+`.
+/// What the menu bar pig shows: red when memory pressure or the port alert
+/// is critical, orange when either is at warning or servers need you, plain
+/// otherwise (`tint` nil). The count is the "Needs you" cards (the
+/// standalone port storm card included), capped at `9+`.
 enum StatusTint: Equatable, Sendable {
     case warning, critical
 }
@@ -922,13 +1003,15 @@ struct MenuBarStatus: Equatable, Sendable {
     let count: String?
 }
 
-func menuBarStatus(needsYou: Int, pressure: MemoryPressure) -> MenuBarStatus {
+func menuBarStatus(needsYou: Int, pressure: MemoryPressure, portLevel: String = "") -> MenuBarStatus {
     let count = needsYou <= 0 ? nil : needsYou > 9 ? "9+" : String(needsYou)
     let tint: StatusTint?
-    switch pressure {
-    case .critical: tint = .critical
-    case .warning: tint = .warning
-    case .normal: tint = needsYou > 0 ? .warning : nil
+    if pressure == .critical || portLevel == "critical" {
+        tint = .critical
+    } else if pressure == .warning || portLevel == "warning" || needsYou > 0 {
+        tint = .warning
+    } else {
+        tint = nil
     }
     return MenuBarStatus(tint: tint, count: count)
 }

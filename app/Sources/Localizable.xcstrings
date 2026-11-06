@@ -9806,6 +9806,474 @@
           }
         }
       }
+    },
+    "Ports nearly full: %@ dead connections to %@ from %@": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Ports fast voll: %@ tote Verbindungen zu %@ von %@"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ports nearly full: %@ dead connections to %@ from %@"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Puertos casi llenos: %@ conexiones muertas hacia %@ desde %@"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Ports presque saturés : %@ connexions mortes vers %@ depuis %@"
+          }
+        },
+        "he": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "הפורטים כמעט מלאים: %@ חיבורים מתים אל %@ מ-%@"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "ポートがほぼ満杯：%3$@ から %2$@ への切断済み接続 %1$@ 件"
+          }
+        },
+        "uk": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Порти майже вичерпано: %@ мертвих з’єднань до %@ від %@"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "端口即将耗尽：%3$@ 向 %2$@ 发起的 %1$@ 个失效连接"
+          }
+        }
+      }
+    },
+    "Ports full, new connections will fail: %@ dead connections to %@ from %@": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Ports voll, neue Verbindungen schlagen fehl: %@ tote Verbindungen zu %@ von %@"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ports full, new connections will fail: %@ dead connections to %@ from %@"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Puertos llenos, las nuevas conexiones fallarán: %@ conexiones muertas hacia %@ desde %@"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Ports saturés, les nouvelles connexions échoueront : %@ connexions mortes vers %@ depuis %@"
+          }
+        },
+        "he": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "הפורטים מלאים, חיבורים חדשים ייכשלו: %@ חיבורים מתים אל %@ מ-%@"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "ポートが満杯で新しい接続は失敗します：%3$@ から %2$@ への切断済み接続 %1$@ 件"
+          }
+        },
+        "uk": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Порти вичерпано, нові з’єднання не вдадуться: %@ мертвих з’єднань до %@ від %@"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "端口已耗尽，新连接将失败：%3$@ 向 %2$@ 发起的 %1$@ 个失效连接"
+          }
+        }
+      }
+    },
+    "Ports nearly full: %lld%% of outgoing ports in use": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Ports fast voll: %lld %% der ausgehenden Ports belegt"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ports nearly full: %lld%% of outgoing ports in use"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Puertos casi llenos: %lld %% de los puertos de salida en uso"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Ports presque saturés : %lld %% des ports sortants utilisés"
+          }
+        },
+        "he": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "הפורטים כמעט מלאים: %lld%% מהפורטים היוצאים בשימוש"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "ポートがほぼ満杯：送信ポートの %lld%% が使用中"
+          }
+        },
+        "uk": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Порти майже вичерпано: використано %lld%% вихідних портів"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "端口即将耗尽：已使用 %lld%% 的出站端口"
+          }
+        }
+      }
+    },
+    "Ports full, new connections will fail: %lld%% of outgoing ports in use": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Ports voll, neue Verbindungen schlagen fehl: %lld %% der ausgehenden Ports belegt"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ports full, new connections will fail: %lld%% of outgoing ports in use"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Puertos llenos, las nuevas conexiones fallarán: %lld %% de los puertos de salida en uso"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Ports saturés, les nouvelles connexions échoueront : %lld %% des ports sortants utilisés"
+          }
+        },
+        "he": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "הפורטים מלאים, חיבורים חדשים ייכשלו: %lld%% מהפורטים היוצאים בשימוש"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "ポートが満杯で新しい接続は失敗します：送信ポートの %lld%% が使用中"
+          }
+        },
+        "uk": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Порти вичерпано, нові з’єднання не вдадуться: використано %lld%% вихідних портів"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "端口已耗尽，新连接将失败：已使用 %lld%% 的出站端口"
+          }
+        }
+      }
+    },
+    "several apps": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "mehreren Apps"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "several apps"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "varias apps"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "plusieurs apps"
+          }
+        },
+        "he": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "כמה אפליקציות"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "複数のアプリ"
+          }
+        },
+        "uk": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "кількох застосунків"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "多个应用"
+          }
+        }
+      }
+    },
+    "Ports nearly full": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Ports fast voll"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ports nearly full"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Puertos casi llenos"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Ports presque saturés"
+          }
+        },
+        "he": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "הפורטים כמעט מלאים"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "ポートがほぼ満杯"
+          }
+        },
+        "uk": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Порти майже вичерпано"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "端口即将耗尽"
+          }
+        }
+      }
+    },
+    "outgoing ports nearly full": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "ausgehende Ports fast voll"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "outgoing ports nearly full"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "puertos de salida casi llenos"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "ports sortants presque saturés"
+          }
+        },
+        "he": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "הפורטים היוצאים כמעט מלאים"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "送信ポートがほぼ満杯"
+          }
+        },
+        "uk": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "вихідні порти майже вичерпано"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "出站端口即将耗尽"
+          }
+        }
+      }
+    },
+    "Ports full": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Ports voll"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ports full"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Puertos llenos"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Ports saturés"
+          }
+        },
+        "he": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "הפורטים מלאים"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "ポートが満杯"
+          }
+        },
+        "uk": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Порти вичерпано"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "端口已耗尽"
+          }
+        }
+      }
+    },
+    "outgoing ports full": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "ausgehende Ports voll"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "outgoing ports full"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "puertos de salida llenos"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "ports sortants saturés"
+          }
+        },
+        "he": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "הפורטים היוצאים מלאים"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "送信ポートが満杯"
+          }
+        },
+        "uk": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "вихідні порти вичерпано"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "出站端口已耗尽"
+          }
+        }
+      }
     }
   },
   "version": "1.0"

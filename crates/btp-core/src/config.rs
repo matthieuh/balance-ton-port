@@ -61,6 +61,10 @@ pub struct Config {
     pub port_conflict: PortConflict,
     /// Whether the agent hook checks a port before a server command starts.
     pub port_check_hook: bool,
+    /// Share (%) of the ephemeral port range in use that warns.
+    pub port_pressure_warn_pct: u64,
+    /// Share (%) of the ephemeral port range in use that is critical.
+    pub port_pressure_critical_pct: u64,
 }
 
 impl Default for Config {
@@ -87,6 +91,8 @@ impl Default for Config {
             leak_growth_mb: 500,
             port_conflict: PortConflict::default(),
             port_check_hook: true,
+            port_pressure_warn_pct: 50,
+            port_pressure_critical_pct: 85,
         }
     }
 }
@@ -131,6 +137,14 @@ pub const MIN_LEAK_MEMORY_MB: u64 = 100;
 /// Minimum for `leak_growth_mb`: below it ordinary churn would leak.
 pub const MIN_LEAK_GROWTH_MB: u64 = 50;
 
+/// Minimum for the two port pressure thresholds (%): below it the alert
+/// would fire on an ordinary machine.
+pub const MIN_PRESSURE_PCT: u64 = 20;
+/// Maximum for `port_pressure_warn_pct`.
+pub const MAX_WARN_PCT: u64 = 95;
+/// Maximum for `port_pressure_critical_pct`.
+pub const MAX_CRITICAL_PCT: u64 = 99;
+
 /// The minimum for a numeric key, `None` for an unknown key.
 fn minimum(key: &str) -> Option<u64> {
     match key {
@@ -138,8 +152,26 @@ fn minimum(key: &str) -> Option<u64> {
         "kill_grace_s" | "scan_interval_s" => Some(MIN_SECONDS_S),
         "leak_memory_mb" => Some(MIN_LEAK_MEMORY_MB),
         "leak_growth_mb" => Some(MIN_LEAK_GROWTH_MB),
+        "port_pressure_warn_pct" | "port_pressure_critical_pct" => Some(MIN_PRESSURE_PCT),
         _ => None,
     }
+}
+
+/// The maximum for a numeric key that has one.
+fn maximum(key: &str) -> Option<u64> {
+    match key {
+        "port_pressure_warn_pct" => Some(MAX_WARN_PCT),
+        "port_pressure_critical_pct" => Some(MAX_CRITICAL_PCT),
+        _ => None,
+    }
+}
+
+fn above_maximum(key: &str, value: u64, max: u64) -> String {
+    format!("{key} must be at most {max}, got {value}")
+}
+
+fn critical_not_above_warn(critical: u64, warn: u64) -> String {
+    format!("port_pressure_critical_pct must be above port_pressure_warn_pct, got {critical} and {warn}")
 }
 
 fn below_minimum(key: &str, value: u64, min: u64) -> String {
@@ -212,7 +244,7 @@ impl Config {
         std::time::Duration::from_secs(self.scan_interval_s.max(MIN_SECONDS_S))
     }
 
-    fn numeric_mut(&mut self) -> [(&'static str, &mut u64); 6] {
+    fn numeric_mut(&mut self) -> [(&'static str, &mut u64); 8] {
         [
             ("dead_session_idle_s", &mut self.dead_session_idle_s),
             ("alert_after_s", &mut self.alert_after_s),
@@ -220,6 +252,11 @@ impl Config {
             ("scan_interval_s", &mut self.scan_interval_s),
             ("leak_memory_mb", &mut self.leak_memory_mb),
             ("leak_growth_mb", &mut self.leak_growth_mb),
+            ("port_pressure_warn_pct", &mut self.port_pressure_warn_pct),
+            (
+                "port_pressure_critical_pct",
+                &mut self.port_pressure_critical_pct,
+            ),
         ]
     }
 
@@ -231,6 +268,17 @@ impl Config {
             if *v < min {
                 return Err(below_minimum(key, *v, min));
             }
+            if let Some(max) = maximum(key) {
+                if *v > max {
+                    return Err(above_maximum(key, *v, max));
+                }
+            }
+        }
+        if self.port_pressure_critical_pct <= self.port_pressure_warn_pct {
+            return Err(critical_not_above_warn(
+                self.port_pressure_critical_pct,
+                self.port_pressure_warn_pct,
+            ));
         }
         Ok(())
     }
@@ -244,6 +292,23 @@ impl Config {
                 notes.push(format!("{}, using {min}", below_minimum(key, *v, min)));
                 *v = min;
             }
+            if let Some(max) = maximum(key) {
+                if *v > max {
+                    notes.push(format!("{}, using {max}", above_maximum(key, *v, max)));
+                    *v = max;
+                }
+            }
+        }
+        if self.port_pressure_critical_pct <= self.port_pressure_warn_pct {
+            let raised = self.port_pressure_warn_pct + 1;
+            notes.push(format!(
+                "{}, using {raised}",
+                critical_not_above_warn(
+                    self.port_pressure_critical_pct,
+                    self.port_pressure_warn_pct
+                )
+            ));
+            self.port_pressure_critical_pct = raised;
         }
         notes
     }
@@ -279,6 +344,11 @@ impl Config {
             .map_err(|_| format!("{key} expects a non-negative integer, got {value:?}"))?;
         if v < min {
             return Err(below_minimum(key, v, min));
+        }
+        if let Some(max) = maximum(key) {
+            if v > max {
+                return Err(above_maximum(key, v, max));
+            }
         }
         for (k, field) in self.numeric_mut() {
             if k == key {
@@ -376,6 +446,50 @@ mod tests {
         }
         assert_eq!(c.dead_session_idle_s, 60);
         assert_eq!(c.kill_grace_s, 1);
+    }
+
+    #[test]
+    fn port_pressure_defaults_and_bounds() {
+        let mut c = Config::default();
+        assert_eq!(
+            (c.port_pressure_warn_pct, c.port_pressure_critical_pct),
+            (50, 85)
+        );
+        assert!(c
+            .set("port_pressure_warn_pct", "19")
+            .unwrap_err()
+            .contains("at least 20"));
+        assert!(c.set("port_pressure_warn_pct", "96").is_err());
+        assert!(c.set("port_pressure_critical_pct", "100").is_err());
+        c.set("port_pressure_warn_pct", "95").unwrap();
+        let bad = Config {
+            port_pressure_warn_pct: 85,
+            port_pressure_critical_pct: 85,
+            ..Config::default()
+        };
+        assert!(bad
+            .validate()
+            .unwrap_err()
+            .contains("port_pressure_critical_pct"));
+        let over = Config {
+            port_pressure_critical_pct: 100,
+            ..Config::default()
+        };
+        assert!(over.validate().is_err());
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("config.toml"),
+            "port_pressure_warn_pct = 10\n",
+        )
+        .unwrap();
+        assert_eq!(read_config(d.path()).unwrap().port_pressure_warn_pct, 20);
+        let mut crossed = Config {
+            port_pressure_warn_pct: 90,
+            port_pressure_critical_pct: 60,
+            ..Config::default()
+        };
+        assert_eq!(crossed.clamp().len(), 1);
+        assert_eq!(crossed.port_pressure_critical_pct, 91);
     }
 
     #[test]

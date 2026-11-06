@@ -127,10 +127,44 @@ func cardReason(
         )
     case "session_ended_open":
         return L("Session ended, still open in a browser", bundle, locale)
+    case "port_storm":
+        return portStormReason(card, bundle: bundle, locale: locale)
     default:
         let idle = durationText(ms: card.idleMs, bundle: bundle, locale: locale)
         return L("\(isolated(agentLabel, locale)) session idle \(idle)", bundle, locale)
     }
+}
+
+/// `Ports nearly full: 16,296 dead connections to :8081 from ExampleApp (pid
+/// 52310)`; `Ports full, new connections will fail: ...` when critical;
+/// `... from several apps` without a client; the gauge only
+/// (`62% of outgoing ports in use`) when no port stands out.
+private func portStormReason(_ card: CardFfi, bundle: Bundle, locale: Locale) -> String {
+    let critical = card.portLevel == "critical"
+    guard card.port != 0 else {
+        let pct = Int(card.usedPct)
+        return critical
+            ? L("Ports full, new connections will fail: \(pct)% of outgoing ports in use", bundle, locale)
+            : L("Ports nearly full: \(pct)% of outgoing ports in use", bundle, locale)
+    }
+    let count = isolated(Int(card.sockets).formatted(.number.locale(locale)), locale)
+    let port = isolated(portLabel(card.port), locale)
+    let from: String
+    switch (card.clientName, card.clientPid) {
+    case let (name?, pid?): from = isolated("\(name) (pid \(pid))", locale)
+    case let (name?, nil): from = isolated(name, locale)
+    case let (nil, pid?): from = isolated("pid \(pid)", locale)
+    case (nil, nil): from = L("several apps", bundle, locale)
+    }
+    return critical
+        ? L("Ports full, new connections will fail: \(count) dead connections to \(port) from \(from)", bundle, locale)
+        : L("Ports nearly full: \(count) dead connections to \(port) from \(from)", bundle, locale)
+}
+
+/// The standalone port storm card's title and the notification's: `Ports
+/// full` at `critical`, `Ports nearly full` otherwise.
+func portStormTitle(level: String, bundle: Bundle = copyBundle, locale: Locale = copyLocale) -> String {
+    level == "critical" ? L("Ports full", bundle, locale) : L("Ports nearly full", bundle, locale)
 }
 
 /// The pill on a card: `Restart`, `Postpone 1 h` or `Stop`.
@@ -315,13 +349,20 @@ func recentlyStoppedLabel(_ n: Int, bundle: Bundle = copyBundle, locale: Locale 
 }
 
 /// What VoiceOver reads on the menu bar pig: `Balance ton port, 3 servers
-/// need you, memory pressure high`.
+/// need you, memory pressure high, outgoing ports nearly full` (`outgoing
+/// ports full` at critical).
 func menuBarAccessibilityLabel(
-    needsYou: Int, pressure: MemoryPressure, bundle: Bundle = copyBundle, locale: Locale = copyLocale
+    needsYou: Int, pressure: MemoryPressure, portLevel: String = "",
+    bundle: Bundle = copyBundle, locale: Locale = copyLocale
 ) -> String {
     var parts = ["Balance ton port"]
     if needsYou > 0 { parts.append(L("\(needsYou) servers need you", bundle, locale)) }
     if pressure != .normal { parts.append(L("memory pressure high", bundle, locale)) }
+    if portLevel == "critical" {
+        parts.append(L("outgoing ports full", bundle, locale))
+    } else if !portLevel.isEmpty {
+        parts.append(L("outgoing ports nearly full", bundle, locale))
+    }
     return parts.joined(separator: ", ")
 }
 
@@ -446,6 +487,9 @@ extension DetailButton {
 /// session's state.
 func statusSentence(_ s: ServerViewFfi, bundle: Bundle = copyBundle, locale: Locale = copyLocale) -> String {
     let agent = isolated(s.agentLabel, locale)
+    if let card = s.card, card.kind == "port_storm" {
+        return cardReason(card, bundle: bundle, locale: locale) + "."
+    }
     if s.card?.kind == "leak" {
         if s.leakKind == "growth" {
             let grown = memoryLabel(UInt64(max(0, s.growthBytes)), locale: locale)
@@ -524,6 +568,11 @@ func leakNotificationBody(_ s: ServerViewFfi, bundle: Bundle = copyBundle, local
         return L("\(name) grew \(grown) in 10 min", bundle, locale)
     }
     return L("\(name) is using \(memoryLabel(s.rssBytes, locale: locale))", bundle, locale)
+}
+
+/// The port storm notification's body: the card's reason line.
+func portNotificationBody(_ card: CardFfi, bundle: Bundle = copyBundle, locale: Locale = copyLocale) -> String {
+    cardReason(card, bundle: bundle, locale: locale)
 }
 
 /// The session-ended notification: `Session ended: 2 servers kept running:

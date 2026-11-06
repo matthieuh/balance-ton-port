@@ -71,7 +71,8 @@ final class SettingsDraftTests: XCTestCase {
         deadSessionIdleS: 1200, alertAfterS: 1800, killGraceS: 5, scanIntervalS: 5,
         claudeConfigDirs: ["/Users/me/.claude"], excludeCommands: ["mcp"], excludePorts: [5432],
         leakMemoryMb: 4096, leakGrowthMb: 300,
-        portConflict: "ask", portCheckHook: false
+        portConflict: "ask", portCheckHook: false,
+        portPressureWarnPct: 40, portPressureCriticalPct: 90
     )
 
     func testConversions() {
@@ -1307,5 +1308,92 @@ final class MenuBarStatusTests: XCTestCase {
             menuBarAccessibilityLabel(needsYou: 3, pressure: .warning),
             "Balance ton port, 3 servers need you, memory pressure high"
         )
+    }
+}
+
+private func stormCard(level: String = "warning", action: String = "stop") -> CardFfi {
+    CardFfi(
+        kind: "port_storm", reason: "", action: action, rssBytes: 0, growthBytes: 0, inMs: 0, idleMs: 0,
+        portLevel: level, port: 8081, sockets: 16_296, clientPid: 52_310, clientName: "ExampleApp", usedPct: 62
+    )
+}
+
+final class PortStormTests: XCTestCase {
+    func testPortAlertClearedOnlyWhenLevelGoesEmpty() {
+        XCTAssertTrue(portAlertCleared(from: "warning", to: ""))
+        XCTAssertTrue(portAlertCleared(from: "critical", to: ""))
+        XCTAssertFalse(portAlertCleared(from: "", to: ""))
+        XCTAssertFalse(portAlertCleared(from: "", to: "warning"))
+        XCTAssertFalse(portAlertCleared(from: "warning", to: "critical"))
+    }
+
+    func testPortLevelTintsPig() {
+        XCTAssertEqual(menuBarStatus(needsYou: 0, pressure: .normal, portLevel: ""), MenuBarStatus(tint: nil, count: nil))
+        XCTAssertEqual(menuBarStatus(needsYou: 0, pressure: .normal, portLevel: "warning").tint, .warning)
+        XCTAssertEqual(menuBarStatus(needsYou: 0, pressure: .warning, portLevel: "critical").tint, .critical)
+        XCTAssertEqual(menuBarStatus(needsYou: 0, pressure: .critical, portLevel: "warning").tint, .critical)
+        // The standalone card counts like any other.
+        XCTAssertEqual(menuBarStatus(needsYou: 1, pressure: .normal, portLevel: "critical"), MenuBarStatus(tint: .critical, count: "1"))
+    }
+
+    func testPortStormSortsFirst() {
+        var storm = menuServer(port: 8081, rssMb: 10)
+        storm.card = stormCard()
+        let servers = [menuServer(port: 5173, card: "leak", action: "restart", rssMb: 900), storm]
+        XCTAssertEqual(menuSections(servers).needsYou.map(\.port), [8081, 5173])
+    }
+
+    func testKeptViewKeepsPortStorm() {
+        var s = menuServer(port: 8081)
+        s.card = stormCard()
+        XCTAssertEqual(keptView(s).card?.kind, "port_storm")
+    }
+
+    func testPortStormIsAnAlertCard() {
+        var s = menuServer(port: 8081)
+        s.card = stormCard()
+        XCTAssertTrue(hasAlertCard(s))
+        XCTAssertNil(alertIgnoredView(s).card)
+    }
+
+    func testCardWithoutActionShowsNoPill() {
+        XCTAssertTrue(cardShowsAction(stormCard()))
+        XCTAssertFalse(cardShowsAction(stormCard(action: "none")))
+        XCTAssertTrue(cardShowsAction(CardFfi(kind: "leak", reason: "", action: "restart")))
+    }
+
+    func testDetailOffersStopForAPortStorm() {
+        var s = menuServer(port: 8081)
+        s.card = stormCard()
+        XCTAssertEqual(statusCardAction(s), .stop)
+        XCTAssertEqual(bottomButtons(s), [.open, .stop])
+        s.card = stormCard(action: "none")
+        XCTAssertNil(statusCardAction(s))
+    }
+
+    func testShownPortLevel() {
+        var s = menuServer(port: 8081)
+        XCTAssertEqual(shownPortLevel(servers: [s], portCard: nil), "")
+        XCTAssertEqual(shownPortLevel(servers: [s], portCard: stormCard(level: "critical")), "critical")
+        s.card = stormCard(level: "warning")
+        XCTAssertEqual(shownPortLevel(servers: [menuServer(port: 3000), s], portCard: nil), "warning")
+    }
+
+    func testNotificationCategoryOffersStopOnlyWithAServer() {
+        let s = menuServer(port: 8081)
+        XCTAssertEqual(portStormCategory(stormCard(), server: s), NotificationIDs.portStormCategory)
+        XCTAssertEqual(portStormCategory(stormCard(), server: nil), NotificationIDs.portStormIgnoreCategory)
+        XCTAssertEqual(portStormCategory(stormCard(action: "none"), server: s), NotificationIDs.portStormIgnoreCategory)
+    }
+
+    func testPortStormNotificationRoutes() {
+        let id = ServerID(pid: 7, startTime: 9)
+        let onServer = portStormUserInfo(id) as [AnyHashable: Any]
+        let standalone = portStormUserInfo(nil) as [AnyHashable: Any]
+        XCTAssertEqual(notificationRoute(actionIdentifier: NotificationIDs.kill, userInfo: onServer), .portStorm(.stop, id))
+        XCTAssertEqual(notificationRoute(actionIdentifier: NotificationIDs.ignore, userInfo: onServer), .portStorm(.ignore, id))
+        XCTAssertEqual(notificationRoute(actionIdentifier: NotificationIDs.ignore, userInfo: standalone), .portStorm(.ignore, nil))
+        XCTAssertNil(notificationRoute(actionIdentifier: NotificationIDs.kill, userInfo: standalone))
+        XCTAssertNil(notificationRoute(actionIdentifier: UNNotificationDefaultActionIdentifier, userInfo: onServer))
     }
 }

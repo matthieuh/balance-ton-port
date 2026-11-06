@@ -651,3 +651,16 @@ fn zsh_snippet_executes() {
     let (_, out) = run("npm run dev", &[("BTP_RUN", "0")]);
     assert_eq!(out.trim(), "fake-npm args=run dev active=");
 }
+
+#[test]
+fn config_set_warn_above_critical_is_rejected() {
+    let (data, _e) = sandbox();
+    btp(&data)
+        .args(["config", "set", "port_pressure_warn_pct", "95"])
+        .assert()
+        .failure()
+        .code(1);
+    let out = btp(&data).args(["config", "get"]).assert().success();
+    let text = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(text.contains("port_pressure_warn_pct = 50"), "{text}");
+}

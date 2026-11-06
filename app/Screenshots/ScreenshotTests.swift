@@ -31,6 +31,27 @@ final class ScreenshotTests: XCTestCase {
                 )
             }
         }
+        // The port storm states, for a pull request rather than the README:
+        // only when `BTP_SCREENSHOTS_STATES` is set too.
+        if ProcessInfo.processInfo.environment["BTP_SCREENSHOTS_STATES"]?.isEmpty == false {
+            let states: [(String, CoreModel)] = [
+                ("port-storm-server", CoreModel(preview: Demo.stormOnServer, memory: Demo.memory, recentKills: [])),
+                ("port-storm-standalone", CoreModel(
+                    preview: Demo.servers, memory: Demo.memory, recentKills: [],
+                    portCard: Demo.storm(port: 9000, level: "critical", action: "none")
+                )),
+            ]
+            for (name, stateModel) in states {
+                try render(
+                    panel(MenuView(), dark: false), model: stateModel, language: languageModel(.en), dark: false,
+                    to: out.appendingPathComponent("\(name)-en-light.png")
+                )
+            }
+            try render(
+                PortStormPigs(), model: model, language: languageModel(.en), dark: false,
+                to: out.appendingPathComponent("port-storm-menubar.png")
+            )
+        }
         for dark in [false, true] {
             try render(
                 MenuBarStrip(dark: dark), model: model, language: languageModel(.en), dark: dark,
@@ -91,6 +112,20 @@ final class ScreenshotTests: XCTestCase {
         rep.size = size
         host.cacheDisplay(in: host.bounds, to: rep)
         try XCTUnwrap(rep.representation(using: .png, properties: [:])).write(to: url)
+    }
+}
+
+/// The pig with a port storm card: warning (orange) then critical (red).
+private struct PortStormPigs: View {
+    var body: some View {
+        HStack(spacing: 18) {
+            Image(nsImage: menuBarImage(menuBarStatus(needsYou: 1, pressure: .normal, portLevel: "warning")))
+            Image(nsImage: menuBarImage(menuBarStatus(needsYou: 1, pressure: .normal, portLevel: "critical")))
+        }
+        .padding(.horizontal, 14)
+        .frame(height: 30)
+        .background(Color(white: 0.93), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .padding(12)
     }
 }
 

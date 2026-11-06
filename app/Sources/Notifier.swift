@@ -5,7 +5,7 @@ import os
 
 private typealias IDs = NotificationIDs
 
-/// Posts the "idle server" alerts, the leaks and the "session ended" groups, and routes
+/// Posts the "idle server" alerts, the leaks, the port storm and the "session ended" groups, and routes
 /// their buttons back to the model. When notifications are not allowed,
 /// nothing is posted and `post` reports nothing delivered: the menu row says
 /// so and stays the way to act on the server.
@@ -43,7 +43,7 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
-    /// The three categories with their buttons in the chosen language.
+    /// The categories with their buttons in the chosen language.
     private func registerCategories() {
         let title = { (button: NotificationButtonTitle) in
             button.text(bundle: self.language.bundle, locale: self.language.locale)
@@ -55,6 +55,8 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         // app forward.
         let restart = UNNotificationAction(identifier: IDs.restart, title: title(.restart), options: [.foreground])
         let ignore = UNNotificationAction(identifier: IDs.ignore, title: title(.ignore), options: [])
+        // A port storm's Stop may ask first too (a server no agent started).
+        let stopStorm = UNNotificationAction(identifier: IDs.kill, title: title(.kill), options: [.foreground])
         center.setNotificationCategories([
             UNNotificationCategory(
                 identifier: IDs.idleCategory, actions: [kill, keep], intentIdentifiers: [], options: []
@@ -64,6 +66,12 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
             ),
             UNNotificationCategory(
                 identifier: IDs.leakCategory, actions: [restart, ignore], intentIdentifiers: [], options: []
+            ),
+            UNNotificationCategory(
+                identifier: IDs.portStormCategory, actions: [stopStorm, ignore], intentIdentifiers: [], options: []
+            ),
+            UNNotificationCategory(
+                identifier: IDs.portStormIgnoreCategory, actions: [ignore], intentIdentifiers: [], options: []
             ),
         ])
     }
@@ -155,6 +163,35 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
             }
         }
         return delivered
+    }
+
+    /// The port storm notification (the title follows the level: Ports nearly
+    /// full / Ports full; the body is the card's reason),
+    /// with Stop when the card offers it (`server` holds the port and is not
+    /// excluded) and Ignore. `true` once it was added; nothing is posted when
+    /// notifications are not allowed. A repeat replaces the earlier one.
+    func postPortStorm(_ card: CardFfi, server: ServerViewFfi?) async -> Bool {
+        guard await canPost() else { return false }
+        let content = UNMutableNotificationContent()
+        content.title = portStormTitle(level: card.portLevel, bundle: language.bundle, locale: language.locale)
+        content.body = portNotificationBody(card, bundle: language.bundle, locale: language.locale)
+        content.categoryIdentifier = portStormCategory(card, server: server)
+        content.sound = .default
+        content.userInfo = portStormUserInfo(server?.id)
+        let request = UNNotificationRequest(identifier: portStormRequestID, content: content, trigger: nil)
+        do {
+            try await center.add(request)
+            return true
+        } catch {
+            log.error("could not post: \(error.localizedDescription, privacy: .public)")
+            return false
+        }
+    }
+
+    /// Removes the delivered port storm notification, so a stale one cannot
+    /// act on a later alert (its Ignore would hide the new one).
+    func removePortStorm() {
+        center.removeDeliveredNotifications(withIdentifiers: [portStormRequestID])
     }
 
     /// One notification per ended session ("Session ended: 2 servers kept

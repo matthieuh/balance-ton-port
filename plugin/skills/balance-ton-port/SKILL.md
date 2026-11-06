@@ -36,6 +36,8 @@ If `btp run` does not exist, run `btp list --json` and read the `servers` array.
 
 Read the server's output before guessing: `btp logs <port> --errors` (only the error lines, with context). `btp logs <port>` shows the last 200 lines, `-n N` changes that, `-f` follows. It works for servers started through `btp run`; `has_logs` in `btp list --json` says which.
 
+If `btp list --json` shows `port_pressure.in_use` at or above half of `port_pressure.range_size` (or `btp list` prints a `ports nearly full` or `ports full` line), tell the user which process is flooding which port and do not start another server until it drops.
+
 ## Tell btp your intent
 
 When the session quits, btp stops nothing at once: the servers still running were kept on purpose, and each is stopped once unused for 20 minutes (the dead-session rule). Tell it what you meant a server for, right after you start it or once you are done with it:
@@ -62,7 +64,7 @@ Run `btp sweep`. It kills only the servers whose worktree was deleted, or whose 
 btp run -- npm run dev   # start a server: port check, reuse, logs (read the "btp:" line)
 btp logs 3000 --errors   # the server's error lines (add -f to follow, -n N for N lines)
 btp list                 # table of tracked servers
-btp list --json          # { "servers": [...], "recent_kills": [...] }
+btp list --json          # { "servers": [...], "recent_kills": [...], "port_pressure": {...} }
 btp kill 4322            # kill the tracked server on port 4322
 btp kill --pid 12345     # kill a tracked server by pid
 btp sweep --dry-run      # show what the automatic rules would kill

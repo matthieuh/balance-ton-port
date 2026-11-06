@@ -74,18 +74,24 @@ struct MenuView: View {
 
     @ViewBuilder private func sectionsView(_ sections: MenuSections) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            if sections.needsYou.isEmpty {
+            let cardCount = sections.needsYou.count + (model.portCard == nil ? 0 : 1)
+            if cardCount == 0 {
                 Label(nothingToDecideText(bundle: language.bundle, locale: language.locale), systemImage: "checkmark.circle.fill")
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(.green)
                     .padding(.bottom, 12)
             } else {
                 sectionHeader(
-                    sectionTitle(language.tr("Needs you"), count: sections.needsYou.count, locale: language.locale),
+                    sectionTitle(language.tr("Needs you"), count: cardCount, locale: language.locale),
                     color: needsYouColor(dark: scheme == .dark)
                 )
                     .padding(.bottom, 6)
                 VStack(spacing: 8) {
+                    // No listed server holds the flooded port: the alert
+                    // stands on its own, above the servers' cards.
+                    if let card = model.portCard {
+                        PortStormCard(card: card)
+                    }
                     ForEach(sections.needsYou, id: \.id) { server in
                         if let card = server.card {
                             NeedsYouCard(

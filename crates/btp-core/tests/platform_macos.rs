@@ -510,3 +510,55 @@ fn established_excluding_keeps_connections_from_other_processes() {
     assert_eq!(excluding, 1);
     assert_eq!(both, 0);
 }
+
+/// `net.inet.tcp.pcbcount`: TCP sockets on the whole machine.
+fn pcbcount() -> u32 {
+    let mut value: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>();
+    // SAFETY: pcbcount is an int; `value` and `len` describe exactly that.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"net.inet.tcp.pcbcount".as_ptr(),
+            (&mut value as *mut libc::c_int).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    assert_eq!(rc, 0);
+    value as u32
+}
+
+#[test]
+fn port_pressure_sees_time_wait() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut accepted = Vec::new();
+    for _ in 0..300 {
+        let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        accepted.push(listener.accept().unwrap().0);
+        // The client closes first, so its socket is the one in TIME_WAIT.
+        drop(client);
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    drop(accepted);
+    std::thread::sleep(Duration::from_millis(200));
+
+    let count = pcbcount();
+    let p = MacOs.port_pressure().expect("port pressure readable");
+    assert!(p.range_size > 0);
+    assert!(p.in_use > 0);
+    if count < 2000 {
+        // Pre-check: the full list is skipped on a quiet machine. The count
+        // was read separately, so nothing more is stable here.
+        return;
+    }
+    assert!(p.time_wait >= 300, "{p:?}");
+    // On a busy Mac other in-range sockets can keep our 300 under half of
+    // in_use, and then no top port is named: fine. A named one is ours.
+    if let Some(top) = p.top {
+        assert_eq!(top.port, port);
+        assert!(top.local);
+        assert_eq!(top.client_pid, Some(std::process::id() as i32));
+    }
+}

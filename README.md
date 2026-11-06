@@ -57,6 +57,7 @@ A case where one of these rules does not hold is a security issue: report it pri
 - **Details**: the page title and favicon (fetched over localhost on the server's own port only, never counted as use), a live preview when a browser is already connected to the server, the last 2 hours of memory and CPU with events, the process list, the session (the session chip copies `cd '<folder>' && claude --resume <id>` or `codex resume <id>`, and never opens a terminal), Restart and Postpone 1 h.
 - **Postpone 1 h** restarts the countdown for one hour from the click (a deleted worktree still stops at once).
 - **Restart** runs the original command again in its folder, with the environment read from the live process at that moment (never stored or logged). The server keeps its session, note, Keep and Postpone. It is refused when the folder is gone, the environment or the command line cannot be read, the port stays taken, an exclusion matches, a restart is already running, or the new process cannot be started (the server then stays stopped). Output goes to `logs/` in the data dir (mode 0600, 20 most recent kept).
+- **Ports nearly full**: when the share of outgoing ports in use on the machine reaches `port_pressure_warn_pct` (default 50), a card and a notification name the dead connections piling up, the port and the process opening them. Past `port_pressure_critical_pct` (default 85) it reads "Ports full": new connections fail on every app. When a listed server holds that port the card is on it, with Stop; otherwise it only offers Ignore. `btp list --json` has `port_pressure`, and `btp list` warns on stderr.
 - **Leak alerts**: a server above `leak_memory_mb` or growing more than `leak_growth_mb` in 10 minutes raises one notification per leak.
 
 ## How it decides
@@ -76,7 +77,7 @@ btp run -- npm run dev     # checks the port, reuses or reroutes, keeps the outp
 btp logs 3000 --errors     # the server's errors, when the page is blank
 ```
 
-`btp run` starts a dev server after settling its port: it reuses a server already running the same command in the folder, frees the port only when its holder is an idle server of an ended session (`port_conflict = "free_idle"`, the default), or picks another port. It prints the address as a `btp:` line on stderr and keeps the output until 24 hours after the server stopped (`btp logs`, mode 0600, never sent anywhere). Commands it does not recognise run untouched. The plugin's hook applies the same port check before Claude Code starts a server (`port_check_hook`). To wrap `npm run dev` and friends typed in a terminal, add `eval "$(btp shell-init zsh)"` to your rc file (opt-in; btp never edits it). See [docs/design.md](docs/design.md), section 14.
+`btp run` starts a dev server after settling its port: it reuses a server already running the same command in the folder, frees the port only when its holder is an idle server of an ended session (`port_conflict = "free_idle"`, the default), or picks another port. It prints the address as a `btp:` line on stderr and keeps the output until 24 hours after the server stopped (`btp logs`, mode 0600, never sent anywhere). Commands it does not recognise run untouched. The plugin's hook applies the same port check before Claude Code starts a server (`port_check_hook`). To wrap `npm run dev` and friends typed in a terminal, add `eval "$(btp shell-init zsh)"` to your rc file (opt-in; btp never edits it). See [docs/design.md](docs/design.md), section 15.
 
 ## Install
 
@@ -139,6 +140,8 @@ Only servers Balance ton port tracks can be killed; an unknown port or pid exits
 | `scan_interval_s` | 5 | Scan period (at least 1) |
 | `leak_memory_mb` | 2048 | A server above this much memory (MB) is flagged as a leak (at least 100) |
 | `leak_growth_mb` | 500 | A server growing by more than this (MB) in 10 minutes is flagged as a leak (at least 50) |
+| `port_pressure_warn_pct` | 50 | Share (%) of outgoing ports in use that raises the "Ports nearly full" alert (20 to 95) |
+| `port_pressure_critical_pct` | 85 | Share (%) at which it becomes "Ports full"; must be above the warning (20 to 99) |
 | `claude_config_dirs` | `[]` | Extra Claude config dirs only. `~/.claude`, `$CLAUDE_CONFIG_DIR` and every `~/.claude-*` with a `sessions/` folder are found automatically |
 | `exclude_commands` | `mcp`, `argent`, `postgres`, `redis-server`, `mysqld`, `mongod` | Never tracked or killed when the command line contains one of these (case-insensitive) |
 | `port_conflict` | `free_idle` | When `btp run` finds its port taken: `free_idle` (free an idle server of an ended session, else another port), `ask`, `reroute` (never kill) |

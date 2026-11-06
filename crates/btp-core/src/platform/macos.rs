@@ -5,7 +5,10 @@
 //! Processes we may not inspect (other users, permission denied, gone
 //! between two calls) are skipped silently.
 
-use super::{format_proc_start, Listener, MachineMemory, Platform, ProcInfo, ProcResources};
+use super::pcblist::{aggregate, parse_pcblist_n, range_size};
+use super::{
+    format_proc_start, Listener, MachineMemory, Platform, PortPressure, ProcInfo, ProcResources,
+};
 use libproc::bsd_info::BSDInfo;
 use libproc::file_info::{pidfdinfo, ListFDs, ProcFDType};
 use libproc::net_info::{SocketFDInfo, SocketInfoKind, TcpSIState, TcpSockInfo};
@@ -17,7 +20,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::os::raw::{c_char, c_int, c_void};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Once, OnceLock};
 use std::time::Duration;
 
 /// macOS platform, backed by libproc.
@@ -442,6 +445,169 @@ fn used_memory() -> Option<u64> {
     Some(pages * page)
 }
 
+/// An `int` sysctl read by name.
+fn sysctl_int(name: &CStr) -> Option<i32> {
+    let mut value: c_int = 0;
+    let mut len = std::mem::size_of::<c_int>();
+    // SAFETY: the named sysctls we read are ints; `value` and `len` describe
+    // exactly that, and the kernel writes at most `len` bytes.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            (&mut value as *mut c_int).cast::<c_void>(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && len == std::mem::size_of::<c_int>()).then_some(value)
+}
+
+/// Below this many TCP sockets on the whole machine the range cannot be
+/// under pressure: skip reading and parsing the full list.
+const PCB_PRECHECK: u32 = 2000;
+
+/// Lowest usage (percent) the pre-check still skips: the config minimum for
+/// `port_pressure_warn_pct` (20) minus the 10-point hysteresis.
+const PCB_PRECHECK_PCT: u64 = 10;
+
+/// Whether the machine-wide socket count alone rules pressure out: fewer
+/// than `PCB_PRECHECK` sockets and under `PCB_PRECHECK_PCT` of the range, so
+/// a narrowed range still gets the full list.
+fn skip_full_list(pcbcount: u32, range_size: u32) -> bool {
+    pcbcount < PCB_PRECHECK && u64::from(pcbcount) * 100 < u64::from(range_size) * PCB_PRECHECK_PCT
+}
+
+/// The ephemeral port range, `net.inet.ip.portrange.first..=last`.
+fn port_range() -> Option<(u16, u16)> {
+    let first = u16::try_from(sysctl_int(c"net.inet.ip.portrange.first")?).ok()?;
+    let last = u16::try_from(sysctl_int(c"net.inet.ip.portrange.last")?).ok()?;
+    Some((first, last))
+}
+
+/// Raw `net.inet.tcp.pcblist_n`, sized by a first call. The list may grow
+/// between the two calls: the kernel's size estimate leaves room for that,
+/// and a still-too-small buffer is retried.
+fn pcblist_n() -> Option<Vec<u8>> {
+    let name = c"net.inet.tcp.pcblist_n";
+    for _ in 0..3 {
+        let mut len = 0usize;
+        // SAFETY: a null buffer only asks for the size needed.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 || len == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; len + len / 8];
+        let mut len = buf.len();
+        // SAFETY: `buf` is `len` writable bytes; the kernel writes at most
+        // `len` bytes and updates `len` to the count written.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                buf.as_mut_ptr().cast::<c_void>(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc == 0 {
+            buf.truncate(len);
+            return Some(buf);
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOMEM) {
+            return None;
+        }
+    }
+    None
+}
+
+/// The Mac's own addresses (every interface), IPv4 as `::ffff:a.b.c.d`.
+fn own_addresses() -> Vec<[u8; 16]> {
+    let mut out = Vec::new();
+    let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills `ifap` with a list we free below.
+    if unsafe { libc::getifaddrs(&mut ifap) } != 0 {
+        return out;
+    }
+    let mut cur = ifap;
+    while !cur.is_null() {
+        // SAFETY: `cur` is a node of the list getifaddrs returned.
+        let ifa = unsafe { &*cur };
+        cur = ifa.ifa_next;
+        if ifa.ifa_addr.is_null() {
+            continue;
+        }
+        // SAFETY: a non-null ifa_addr points to a sockaddr whose sa_family
+        // tells its real type.
+        let family = c_int::from(unsafe { (*ifa.ifa_addr).sa_family });
+        if family == libc::AF_INET {
+            // SAFETY: AF_INET means a sockaddr_in.
+            let sin = unsafe { &*ifa.ifa_addr.cast::<libc::sockaddr_in>() };
+            let mut a = [0u8; 16];
+            a[10] = 0xff;
+            a[11] = 0xff;
+            a[12..].copy_from_slice(&sin.sin_addr.s_addr.to_ne_bytes());
+            out.push(a);
+        } else if family == libc::AF_INET6 {
+            // SAFETY: AF_INET6 means a sockaddr_in6.
+            let sin6 = unsafe { &*ifa.ifa_addr.cast::<libc::sockaddr_in6>() };
+            out.push(sin6.sin6_addr.s6_addr);
+        }
+    }
+    // SAFETY: `ifap` came from getifaddrs and is freed once.
+    unsafe { libc::freeifaddrs(ifap) };
+    out
+}
+
+/// Loopback, IPv4 (`::ffff:127.x.x.x`) or IPv6 (`::1`).
+fn is_loopback(a: &[u8; 16]) -> bool {
+    let v4_mapped = a[..10].iter().all(|&b| b == 0) && a[10] == 0xff && a[11] == 0xff;
+    (v4_mapped && a[12] == 127) || Ipv6Addr::from(*a) == Ipv6Addr::LOCALHOST
+}
+
+/// The process name (`pbi_name`, else `pbi_comm`), never the command line.
+fn proc_name(pid: i32) -> Option<String> {
+    let info = bsd_info(pid)?;
+    let name = c_name(&info.pbi_name);
+    let name = if name.is_empty() {
+        c_name(&info.pbi_comm)
+    } else {
+        name
+    };
+    (!name.is_empty()).then_some(name)
+}
+
+/// Port pressure from the full socket list.
+fn full_port_pressure(first: u16, last: u16) -> Option<PortPressure> {
+    let buf = pcblist_n()?;
+    let Some(socks) = parse_pcblist_n(&buf) else {
+        static WARNED: Once = Once::new();
+        WARNED.call_once(|| {
+            eprintln!(
+                "btp: net.inet.tcp.pcblist_n has a layout this version does not know; \
+                 port pressure is off"
+            );
+        });
+        return None;
+    };
+    let own = own_addresses();
+    Some(aggregate(
+        &socks,
+        first,
+        last,
+        |a| is_loopback(a) || own.contains(a),
+        proc_name,
+    ))
+}
+
 fn exe(pid: i32) -> Option<PathBuf> {
     if pid <= 0 {
         return None;
@@ -663,6 +829,21 @@ impl Platform for MacOs {
         .any(|ip| TcpStream::connect_timeout(&SocketAddr::new(ip, port), timeout).is_ok())
     }
 
+    fn port_pressure(&self) -> Option<PortPressure> {
+        let (first, last) = port_range()?;
+        let count = u32::try_from(sysctl_int(c"net.inet.tcp.pcbcount")?).ok()?;
+        let size = range_size(first, last);
+        if skip_full_list(count, size) {
+            return Some(PortPressure {
+                range_size: size,
+                in_use: count,
+                time_wait: 0,
+                top: None,
+            });
+        }
+        full_port_pressure(first, last)
+    }
+
     fn pids_named(&self, name: &str) -> Vec<i32> {
         // SAFETY: geteuid has no preconditions and cannot fail.
         let uid = unsafe { libc::geteuid() };
@@ -686,6 +867,17 @@ impl Platform for MacOs {
 mod tests {
     use super::*;
 
+    #[test]
+    fn precheck_skips_only_when_pressure_is_impossible() {
+        // Default range, few sockets: skip.
+        assert!(skip_full_list(900, 16384));
+        // Narrowed range: 900 sockets is 45%, read the list.
+        assert!(!skip_full_list(900, 2000));
+        // Many sockets: always read.
+        assert!(!skip_full_list(2500, 16384));
+    }
+    use crate::platform::pcblist::TcpState;
+
     /// A KERN_PROCARGS2 buffer laid out like the kernel does: argc, exec
     /// path, NUL terminator padded so the arguments start on an 8-byte
     /// boundary of the string area, the arguments, then the environment.
@@ -700,6 +892,68 @@ mod tests {
         }
         v.extend_from_slice(b"PATH=/bin\0SECRET_TOKEN=hunter2\0");
         v
+    }
+
+    /// Opens `n` loopback connections to a fresh listener and closes them
+    /// client first, so the client sockets stay in TIME_WAIT. Returns the
+    /// listener's port.
+    fn time_wait_storm(n: usize) -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let mut pairs = Vec::new();
+        for _ in 0..n {
+            let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let (a, _) = l.accept().unwrap();
+            pairs.push((c, a));
+        }
+        let (clients, accepted): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+        drop(clients);
+        std::thread::sleep(Duration::from_millis(100));
+        drop(accepted);
+        std::thread::sleep(Duration::from_millis(200));
+        port
+    }
+
+    #[test]
+    fn full_list_sees_this_process_time_wait() {
+        // The pre-check skips the full list on a quiet Mac: read it directly.
+        let port = time_wait_storm(50);
+        let socks = parse_pcblist_n(&pcblist_n().expect("pcblist_n readable"))
+            .expect("pcblist_n layout known");
+        let ours = socks
+            .iter()
+            .filter(|s| s.state == TcpState::TimeWait && s.remote_port == port)
+            .collect::<Vec<_>>();
+        assert!(
+            ours.len() >= 50,
+            "{} TIME_WAIT sockets to {port}",
+            ours.len()
+        );
+        let me = std::process::id() as i32;
+        assert!(ours
+            .iter()
+            .all(|s| s.last_pid == me && is_loopback(&s.remote_addr)));
+        let (first, last) = port_range().expect("port range");
+        let p = full_port_pressure(first, last).expect("pressure");
+        assert!(p.time_wait >= 50 && p.in_use >= p.time_wait);
+    }
+
+    #[test]
+    fn loopback_and_names() {
+        let mut v4 = [0u8; 16];
+        v4[10] = 0xff;
+        v4[11] = 0xff;
+        v4[12..].copy_from_slice(&[127, 0, 0, 1]);
+        assert!(is_loopback(&v4));
+        assert!(is_loopback(&Ipv6Addr::LOCALHOST.octets()));
+        v4[12] = 93;
+        assert!(!is_loopback(&v4));
+        assert!(own_addresses().iter().any(is_loopback));
+        let me = std::process::id() as i32;
+        // The test binary: `btp_core-<hash>`, not its command line.
+        let name = proc_name(me).expect("own name");
+        assert!(name.starts_with("btp_core"), "{name}");
+        assert_eq!(proc_name(-1), None);
     }
 
     #[test]

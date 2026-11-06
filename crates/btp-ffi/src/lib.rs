@@ -15,6 +15,7 @@ use btp_core::labels::{framework as framework_of, location_label, tool_label};
 use btp_core::model::{KillReason, KillTarget, ServerKey};
 use btp_core::observed::ObservedServer;
 use btp_core::platform::{MacOs, Platform};
+use btp_core::ports::PortLevel;
 use btp_core::probe::{probe_port, ProbeOutcome};
 use btp_core::restart::RestartBlocked;
 use btp_core::sessions::default_config_dirs;
@@ -51,7 +52,8 @@ pub struct CardFfi {
     pub kind: String,
     /// The one-sentence reason (`Growing fast: +600 MB in 10 min`).
     pub reason: String,
-    /// `restart`, `postpone` or `stop`.
+    /// `restart`, `postpone`, `stop` or `none` (a port storm card whose
+    /// server is excluded: nothing to stop).
     pub action: String,
     /// The memory a leak card is about (0 for any other card); the app words
     /// the reason itself, so it can translate it.
@@ -64,6 +66,19 @@ pub struct CardFfi {
     /// How long an idle-alert card's session has been idle, in milliseconds
     /// (0 for any other card).
     pub idle_ms: u64,
+    /// `warning` or `critical` for a port storm card, else empty.
+    pub port_level: String,
+    /// The destination port of a port storm card (0: no single port, or any
+    /// other card).
+    pub port: u16,
+    /// The dead connections of a port storm card (0 for any other card).
+    pub sockets: u32,
+    /// The process opening a port storm's connections, when known.
+    pub client_pid: Option<i32>,
+    pub client_name: Option<String>,
+    /// The share of outgoing ports in use of a port storm card (0 for any
+    /// other card).
+    pub used_pct: u32,
 }
 
 impl From<&NeedsYou> for CardFfi {
@@ -73,11 +88,15 @@ impl From<&NeedsYou> for CardFfi {
             NeedsYou::AboutToStop { .. } => "about_to_stop",
             NeedsYou::SessionEndedOpen => "session_ended_open",
             NeedsYou::IdleAlert { .. } => "idle_alert",
+            NeedsYou::PortStorm { .. } => "port_storm",
         };
-        let action = match n.suggested_action() {
-            SuggestedAction::Restart => "restart",
-            SuggestedAction::Postpone => "postpone",
-            SuggestedAction::Stop => "stop",
+        let action = match n {
+            NeedsYou::PortStorm { excluded: true, .. } => "none",
+            _ => match n.suggested_action() {
+                SuggestedAction::Restart => "restart",
+                SuggestedAction::Postpone => "postpone",
+                SuggestedAction::Stop => "stop",
+            },
         };
         let (mut rss_bytes, mut growth_bytes, mut in_ms, mut idle_ms) = (0, 0, 0, 0);
         match n {
@@ -88,9 +107,31 @@ impl From<&NeedsYou> for CardFfi {
             } => (rss_bytes, growth_bytes) = (*r, *g),
             NeedsYou::AboutToStop { in_ms: m } => in_ms = *m,
             NeedsYou::IdleAlert { idle_ms: m, .. } => idle_ms = *m,
-            NeedsYou::SessionEndedOpen => {}
+            NeedsYou::SessionEndedOpen | NeedsYou::PortStorm { .. } => {}
+        }
+        let (mut port_level, mut port, mut sockets, mut client_pid, mut client_name, mut used_pct) =
+            (String::new(), 0, 0, None, None, 0);
+        if let NeedsYou::PortStorm {
+            level,
+            sockets: sk,
+            port: p,
+            client_pid: pid,
+            client_name: name,
+            used_pct: pct,
+            ..
+        } = n
+        {
+            port_level = port_level_label(*level).to_string();
+            (port, sockets, client_pid, client_name, used_pct) =
+                (*p, *sk, *pid, name.clone(), *pct);
         }
         CardFfi {
+            port_level,
+            port,
+            sockets,
+            client_pid,
+            client_name,
+            used_pct,
             kind: kind.to_string(),
             reason: card_reason(n),
             action: action.to_string(),
@@ -99,6 +140,13 @@ impl From<&NeedsYou> for CardFfi {
             in_ms,
             idle_ms,
         }
+    }
+}
+
+fn port_level_label(l: PortLevel) -> &'static str {
+    match l {
+        PortLevel::Warning => "warning",
+        PortLevel::Critical => "critical",
     }
 }
 
@@ -352,6 +400,15 @@ pub struct TickReportFfi {
     /// Servers (tracked or observed) whose leak is due a notification,
     /// reported on every pass until `mark_leak_notified`.
     pub leaks: Vec<ServerViewFfi>,
+    /// The port storm card when no listed server holds the port (a server
+    /// holding it carries the card in its own row).
+    pub port_card: Option<CardFfi>,
+    /// The port storm card to notify (the attached server's, or the
+    /// standalone one), reported on every pass until `mark_port_notified`.
+    pub port_due: Option<CardFfi>,
+    /// `warning` or `critical` of the port storm card shown anywhere, empty
+    /// when no alert is shown.
+    pub port_level: String,
 }
 
 /// One memory and CPU sample of a server's tree.
@@ -496,6 +553,10 @@ pub struct ConfigFfi {
     pub port_conflict: String,
     /// Whether the agent hook checks a port before a server command starts.
     pub port_check_hook: bool,
+    /// Outgoing ports in use (percent) from which the port alert shows.
+    pub port_pressure_warn_pct: u64,
+    /// From which the port alert is critical.
+    pub port_pressure_critical_pct: u64,
 }
 
 /// One server a session end left running.
@@ -837,7 +898,29 @@ fn report_ffi<P: Platform>(w: &mut Watcher<P>, t: &TickReport, now_ms: u64) -> T
     };
     let alerts = rows(&mut t.alerts.iter().map(|v| v.key));
     let leaks = rows(&mut t.leaks.iter().copied());
+    let is_storm = |n: &&NeedsYou| matches!(n, NeedsYou::PortStorm { .. });
+    let server_storm = t.needs_you.iter().map(|(_, n)| n).find(is_storm);
+    let shown = server_storm.or(t.port_card.as_ref().filter(is_storm));
+    let port_level = match shown {
+        Some(NeedsYou::PortStorm { level, .. }) => port_level_label(*level).to_string(),
+        _ => String::new(),
+    };
+    // The standalone card has no server to stop: Ignore only.
+    let port_card = t.port_card.as_ref().map(|n| CardFfi {
+        action: "none".to_string(),
+        ..CardFfi::from(n)
+    });
+    let port_due = if !t.port_due {
+        None
+    } else if server_storm.is_none() && shown.is_some() {
+        port_card.clone()
+    } else {
+        shown.map(CardFfi::from)
+    };
     TickReportFfi {
+        port_card,
+        port_due,
+        port_level,
         servers,
         alerts,
         killed: t.killed.iter().map(Into::into).collect(),
@@ -865,6 +948,8 @@ impl From<Config> for ConfigFfi {
             leak_growth_mb: c.leak_growth_mb,
             port_conflict: c.port_conflict.as_str().to_string(),
             port_check_hook: c.port_check_hook,
+            port_pressure_warn_pct: c.port_pressure_warn_pct,
+            port_pressure_critical_pct: c.port_pressure_critical_pct,
         }
     }
 }
@@ -888,6 +973,8 @@ impl From<ConfigFfi> for Config {
             // An unknown value (a newer app) falls back to the default.
             port_conflict: PortConflict::parse(&c.port_conflict).unwrap_or_default(),
             port_check_hook: c.port_check_hook,
+            port_pressure_warn_pct: c.port_pressure_warn_pct,
+            port_pressure_critical_pct: c.port_pressure_critical_pct,
         }
     }
 }
@@ -1126,6 +1213,19 @@ impl Core {
     /// `leaks` on every pass until then.
     pub fn mark_leak_notified(&self, pid: i32, start_time: u64) {
         lock(&self.watcher).mark_leak_notified(ServerKey { pid, start_time });
+    }
+
+    /// Records that the port storm notification was added: no more until the
+    /// alert re-arms. `tick` reports a due storm in `port_due` on every pass
+    /// until then.
+    pub fn mark_port_notified(&self) {
+        lock(&self.watcher).mark_port_notified();
+    }
+
+    /// "Ignore this alert" on the port storm card: dismisses it until the
+    /// pressure drops and rises again.
+    pub fn ignore_port_alert(&self) {
+        lock(&self.watcher).ignore_port_alert();
     }
 
     /// Stops the server and starts it again with the same command, folder
@@ -1473,6 +1573,96 @@ mod tests {
                 "Codex session idle 40 min".into(),
                 "stop".into()
             )
+        );
+    }
+
+    fn storm(excluded: bool, level: PortLevel) -> NeedsYou {
+        NeedsYou::PortStorm {
+            level,
+            sockets: 16296,
+            port: 8081,
+            client_pid: Some(52310),
+            client_name: Some("ExampleApp".into()),
+            excluded,
+            used_pct: 99,
+        }
+    }
+
+    #[test]
+    fn port_storm_card_ffi() {
+        let c = CardFfi::from(&storm(false, PortLevel::Critical));
+        assert_eq!((c.kind.as_str(), c.action.as_str()), ("port_storm", "stop"));
+        assert_eq!(c.reason, card_reason(&storm(false, PortLevel::Critical)));
+        assert_eq!(
+            (c.port_level.as_str(), c.port, c.sockets, c.used_pct),
+            ("critical", 8081, 16296, 99)
+        );
+        assert_eq!(c.client_pid, Some(52310));
+        assert_eq!(c.client_name.as_deref(), Some("ExampleApp"));
+        assert_eq!((c.rss_bytes, c.in_ms, c.idle_ms), (0, 0, 0));
+        // An excluded server is never stopped: no action to offer.
+        let c = CardFfi::from(&storm(true, PortLevel::Warning));
+        assert_eq!(
+            (c.action.as_str(), c.port_level.as_str()),
+            ("none", "warning")
+        );
+        // Other cards leave the storm fields empty.
+        let o = CardFfi::from(&NeedsYou::SessionEndedOpen);
+        assert_eq!(
+            (o.port_level.as_str(), o.port, o.sockets, o.used_pct),
+            ("", 0, 0, 0)
+        );
+        assert_eq!((o.client_pid, o.client_name), (None, None));
+    }
+
+    #[test]
+    fn report_carries_the_port_storm() {
+        let d = tempfile::tempdir().unwrap();
+        let mut w = Watcher::new(MacOs, d.path().to_path_buf());
+        // Standalone card, due.
+        let t = TickReport {
+            port_card: Some(storm(false, PortLevel::Warning)),
+            port_due: true,
+            ..TickReport::default()
+        };
+        let r = report_ffi(&mut w, &t, 1_000);
+        assert_eq!(r.port_level, "warning");
+        assert_eq!(r.port_card.as_ref().map(|c| c.port), Some(8081));
+        assert_eq!(r.port_due, r.port_card);
+        // The standalone card has no server to stop.
+        assert_eq!(
+            r.port_card.as_ref().map(|c| c.action.as_str()),
+            Some("none")
+        );
+        // Shown but not due.
+        let t = TickReport {
+            port_due: false,
+            ..t
+        };
+        let r = report_ffi(&mut w, &t, 1_000);
+        assert_eq!((r.port_level.as_str(), r.port_due), ("warning", None));
+        // On a server: the standalone card is absent, the due card is the server's.
+        let key = ServerKey {
+            pid: 1,
+            start_time: 1,
+        };
+        let t = TickReport {
+            needs_you: vec![(key, storm(false, PortLevel::Critical))],
+            port_due: true,
+            ..TickReport::default()
+        };
+        let r = report_ffi(&mut w, &t, 1_000);
+        assert_eq!(r.port_card, None);
+        assert_eq!(r.port_level, "critical");
+        assert_eq!(
+            r.port_due.map(|c| (c.kind, c.action)),
+            Some(("port_storm".to_string(), "stop".to_string()))
+        );
+        // Nothing shown.
+        let r = report_ffi(&mut w, &TickReport::default(), 1_000);
+        assert_eq!(
+            (r.port_card, r.port_due, r.port_level.as_str()),
+            (None, None, "")
         );
     }
 
@@ -2010,8 +2200,22 @@ mod tests {
         c.claude_config_dirs = vec!["/tmp/claude-x".into()];
         c.leak_memory_mb = 4096;
         c.leak_growth_mb = 300;
+        assert_eq!(
+            (c.port_pressure_warn_pct, c.port_pressure_critical_pct),
+            (50, 85)
+        );
+        c.port_pressure_warn_pct = 40;
+        c.port_pressure_critical_pct = 90;
         core.set_config(c.clone()).unwrap();
         assert_eq!(core.config().unwrap(), c);
+        let on_disk = read_config(d.path()).unwrap();
+        assert_eq!(
+            (
+                on_disk.port_pressure_warn_pct,
+                on_disk.port_pressure_critical_pct
+            ),
+            (40, 90)
+        );
         let saved = read_config(d.path()).unwrap();
         assert_eq!(saved.alert_after_s, 60);
         // The app's save keeps the leak thresholds it was given.
