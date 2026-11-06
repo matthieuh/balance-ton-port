@@ -9859,6 +9859,58 @@
         }
       }
     },
+    "%@ dead connections to %@ from %@": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "%@ tote Verbindungen zu %@ von %@"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ dead connections to %@ from %@"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "%@ conexiones muertas hacia %@ desde %@"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "%@ connexions mortes vers %@ depuis %@"
+          }
+        },
+        "he": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "%@ חיבורים מתים אל %@ מ-%@"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "%3$@ から %2$@ への切断済み接続 %1$@ 件"
+          }
+        },
+        "uk": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "%@ мертвих з’єднань до %@ від %@"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "%3$@ 向 %2$@ 发起的 %1$@ 个失效连接"
+          }
+        }
+      }
+    },
     "Ports full, new connections will fail: %@ dead connections to %@ from %@": {
       "localizations": {
         "de": {
@@ -9907,6 +9959,58 @@
           "stringUnit": {
             "state": "needs_review",
             "value": "端口已耗尽，新连接将失败：%3$@ 向 %2$@ 发起的 %1$@ 个失效连接"
+          }
+        }
+      }
+    },
+    "New connections will fail: %@ dead connections to %@ from %@": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Neue Verbindungen schlagen fehl: %@ tote Verbindungen zu %@ von %@"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "New connections will fail: %@ dead connections to %@ from %@"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Las nuevas conexiones fallarán: %@ conexiones muertas hacia %@ desde %@"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Les nouvelles connexions échoueront : %@ connexions mortes vers %@ depuis %@"
+          }
+        },
+        "he": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "חיבורים חדשים ייכשלו: %@ חיבורים מתים אל %@ מ-%@"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "新しい接続は失敗します：%3$@ から %2$@ への切断済み接続 %1$@ 件"
+          }
+        },
+        "uk": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Нові з’єднання не вдадуться: %@ мертвих з’єднань до %@ від %@"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "新连接将失败：%3$@ 向 %2$@ 发起的 %1$@ 个失效连接"
           }
         }
       }
@@ -9963,6 +10067,58 @@
         }
       }
     },
+    "%lld%% of outgoing ports in use": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "%lld %% der ausgehenden Ports belegt"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%lld%% of outgoing ports in use"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "%lld %% de los puertos de salida en uso"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "%lld %% des ports sortants utilisés"
+          }
+        },
+        "he": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "%lld%% מהפורטים היוצאים בשימוש"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "送信ポートの %lld%% が使用中"
+          }
+        },
+        "uk": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Використано %lld%% вихідних портів"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "已使用 %lld%% 的出站端口"
+          }
+        }
+      }
+    },
     "Ports full, new connections will fail: %lld%% of outgoing ports in use": {
       "localizations": {
         "de": {
@@ -10011,6 +10167,58 @@
           "stringUnit": {
             "state": "needs_review",
             "value": "端口已耗尽，新连接将失败：已使用 %lld%% 的出站端口"
+          }
+        }
+      }
+    },
+    "New connections will fail: %lld%% of outgoing ports in use": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Neue Verbindungen schlagen fehl: %lld %% der ausgehenden Ports belegt"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "New connections will fail: %lld%% of outgoing ports in use"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Las nuevas conexiones fallarán: %lld %% de los puertos de salida en uso"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Les nouvelles connexions échoueront : %lld %% des ports sortants utilisés"
+          }
+        },
+        "he": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "חיבורים חדשים ייכשלו: %lld%% מהפורטים היוצאים בשימוש"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "新しい接続は失敗します：送信ポートの %lld%% が使用中"
+          }
+        },
+        "uk": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "Нові з’єднання не вдадуться: використано %lld%% вихідних портів"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "needs_review",
+            "value": "新连接将失败：已使用 %lld%% 的出站端口"
           }
         }
       }

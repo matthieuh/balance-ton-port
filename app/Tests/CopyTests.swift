@@ -294,7 +294,13 @@ final class CopyTests: XCTestCase {
             "Ports full, new connections will fail: 16,296 dead connections to :8081 from ExampleApp (pid 52310)"
         )
         XCTAssertEqual(cardReason(storm(port: 0)), "Ports nearly full: 62% of outgoing ports in use")
-        XCTAssertEqual(portNotificationBody(storm()), cardReason(storm()))
+        XCTAssertEqual(portNotificationBody(storm()), "16,296 dead connections to :8081 from ExampleApp (pid 52310)")
+        XCTAssertEqual(
+            portNotificationBody(storm(level: "critical")),
+            "New connections will fail: 16,296 dead connections to :8081 from ExampleApp (pid 52310)"
+        )
+        XCTAssertEqual(portNotificationBody(storm(port: 0)), "62% of outgoing ports in use")
+        XCTAssertEqual(portNotificationBody(storm(level: "critical", port: 0)), "New connections will fail: 62% of outgoing ports in use")
         let defaults = try XCTUnwrap(UserDefaults(suiteName: "btp-copy-\(UUID().uuidString)"))
         let model = LanguageModel(defaults: defaults, base: Bundle(for: CopyTests.self))
         model.choice = .fr
@@ -305,6 +311,10 @@ final class CopyTests: XCTestCase {
         XCTAssertEqual(
             cardReason(storm(pid: nil, name: nil), bundle: model.bundle, locale: model.locale),
             "Ports presque saturés\u{00A0}: 16\u{202F}296 connexions mortes vers :8081 depuis plusieurs apps"
+        )
+        XCTAssertEqual(
+            portNotificationBody(storm(), bundle: model.bundle, locale: model.locale),
+            "16\u{202F}296 connexions mortes vers :8081 depuis ExampleApp (pid 52310)"
         )
     }
 

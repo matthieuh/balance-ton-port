@@ -138,14 +138,20 @@ func cardReason(
 /// `Ports nearly full: 16,296 dead connections to :8081 from ExampleApp (pid
 /// 52310)`; `Ports full, new connections will fail: ...` when critical;
 /// `... from several apps` without a client; the gauge only
-/// (`62% of outgoing ports in use`) when no port stands out.
-private func portStormReason(_ card: CardFfi, bundle: Bundle, locale: Locale) -> String {
+/// (`62% of outgoing ports in use`) when no port stands out. With
+/// `titled: false` (the notification body, under the `Ports nearly full`
+/// title) the line drops that prefix: `16,296 dead connections to ...`, or
+/// `New connections will fail: ...` when critical.
+private func portStormReason(_ card: CardFfi, titled: Bool = true, bundle: Bundle, locale: Locale) -> String {
     let critical = card.portLevel == "critical"
     guard card.port != 0 else {
         let pct = Int(card.usedPct)
-        return critical
-            ? L("Ports full, new connections will fail: \(pct)% of outgoing ports in use", bundle, locale)
-            : L("Ports nearly full: \(pct)% of outgoing ports in use", bundle, locale)
+        switch (titled, critical) {
+        case (true, true): return L("Ports full, new connections will fail: \(pct)% of outgoing ports in use", bundle, locale)
+        case (true, false): return L("Ports nearly full: \(pct)% of outgoing ports in use", bundle, locale)
+        case (false, true): return L("New connections will fail: \(pct)% of outgoing ports in use", bundle, locale)
+        case (false, false): return L("\(pct)% of outgoing ports in use", bundle, locale)
+        }
     }
     let count = isolated(Int(card.sockets).formatted(.number.locale(locale)), locale)
     let port = isolated(portLabel(card.port), locale)
@@ -156,9 +162,12 @@ private func portStormReason(_ card: CardFfi, bundle: Bundle, locale: Locale) ->
     case let (nil, pid?): from = isolated("pid \(pid)", locale)
     case (nil, nil): from = L("several apps", bundle, locale)
     }
-    return critical
-        ? L("Ports full, new connections will fail: \(count) dead connections to \(port) from \(from)", bundle, locale)
-        : L("Ports nearly full: \(count) dead connections to \(port) from \(from)", bundle, locale)
+    switch (titled, critical) {
+    case (true, true): return L("Ports full, new connections will fail: \(count) dead connections to \(port) from \(from)", bundle, locale)
+    case (true, false): return L("Ports nearly full: \(count) dead connections to \(port) from \(from)", bundle, locale)
+    case (false, true): return L("New connections will fail: \(count) dead connections to \(port) from \(from)", bundle, locale)
+    case (false, false): return L("\(count) dead connections to \(port) from \(from)", bundle, locale)
+    }
 }
 
 /// The standalone port storm card's title and the notification's: `Ports
@@ -570,9 +579,10 @@ func leakNotificationBody(_ s: ServerViewFfi, bundle: Bundle = copyBundle, local
     return L("\(name) is using \(memoryLabel(s.rssBytes, locale: locale))", bundle, locale)
 }
 
-/// The port storm notification's body: the card's reason line.
+/// The port storm notification's body: the card's reason line without the
+/// `Ports nearly full` prefix, which the notification's title already says.
 func portNotificationBody(_ card: CardFfi, bundle: Bundle = copyBundle, locale: Locale = copyLocale) -> String {
-    cardReason(card, bundle: bundle, locale: locale)
+    portStormReason(card, titled: false, bundle: bundle, locale: locale)
 }
 
 /// The session-ended notification: `Session ended: 2 servers kept running:
