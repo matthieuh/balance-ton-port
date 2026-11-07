@@ -16,6 +16,9 @@ concurrency:
 
 jobs:
   release:
+    # Signing, notarization and Sparkle secrets live in this environment,
+    # which only v* tags can deploy to: no other workflow or branch sees them.
+    environment: release
     runs-on: macos-26
     env:
       MACOSX_DEPLOYMENT_TARGET: "14.0"
@@ -316,6 +319,7 @@ jobs:
     # Final releases only: a prerelease leaves the tap untouched.
     if: ${{ !contains(github.ref_name, '-') }}
     needs: release
+    environment: release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
