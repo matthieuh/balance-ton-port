@@ -6,8 +6,8 @@ license.workspace = true
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
-dirs = "5"
+toml = "1.1"
+dirs = "7"
 fs4 = { version = "1.1.0", features = ["sync"] }
 serde_json = "1.0.154"
 libc = "0.2.191"
